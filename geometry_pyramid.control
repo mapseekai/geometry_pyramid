@@ -1,0 +1,7 @@
+comment = 'Vector tile pyramid for geometry tables (Ganos-compatible API)'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/geometry_pyramid'
+relocatable = false
+superuser = false
+schema = 'public'
+requires = 'postgis'
