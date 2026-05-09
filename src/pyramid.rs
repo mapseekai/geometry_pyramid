@@ -1,11 +1,8 @@
 //! Top-level SQL surface for pyramid lifecycle management.
-//!
-//! These functions are the public API mirroring GanosBase. The current
-//! implementation is a scaffold: it validates arguments, parses config, and
-//! records pyramid metadata. Tile generation is implemented incrementally
-//! in follow-up work.
 
+use crate::build;
 use crate::config::PyramidConfig;
+use crate::storage;
 use pgrx::prelude::*;
 
 /// `ST_BuildPyramid(table, geom_column, fid_column, config_json) -> bool`
@@ -28,6 +25,17 @@ fn st_build_pyramid(
     let pyramid_name = cfg.name.clone().unwrap_or_else(|| table.to_string());
     validate_identifier(&pyramid_name)?;
 
+    if cfg.min_zoom > cfg.max_zoom {
+        return Err(format!(
+            "minZoom ({}) must be <= maxZoom ({})",
+            cfg.min_zoom, cfg.max_zoom
+        )
+        .into());
+    }
+    if cfg.max_zoom > 24 {
+        return Err(format!("maxZoom ({}) exceeds the supported limit of 24", cfg.max_zoom).into());
+    }
+
     Spi::run_with_args(
         "INSERT INTO geometry_pyramid_catalog \
          (pyramid_name, source_table, geom_column, fid_column, config) \
@@ -39,7 +47,7 @@ fn st_build_pyramid(
            config       = EXCLUDED.config, \
            built_at     = now()",
         &[
-            pyramid_name.into(),
+            pyramid_name.as_str().into(),
             table.into(),
             geom_column.into(),
             fid_column.into(),
@@ -47,13 +55,13 @@ fn st_build_pyramid(
         ],
     )?;
 
+    let total = build::build(&pyramid_name, table, geom_column, fid_column, &cfg)?;
     notice!(
-        "geometry_pyramid: registered pyramid '{}' over {}({}) (fid={}). \
-         Tile materialization is not yet implemented.",
+        "geometry_pyramid: pyramid '{}' built with {} tile(s) across z={}..={}",
         pyramid_name,
-        table,
-        geom_column,
-        fid_column
+        total,
+        cfg.min_zoom,
+        cfg.max_zoom
     );
     Ok(true)
 }
@@ -70,33 +78,65 @@ fn st_drop_pyramid(
         &[name.into()],
     )?
     .unwrap_or(0);
+    storage::drop_tile_table(name)?;
     Ok(removed > 0)
 }
 
 /// `ST_UpdatePyramid(name, where_clause) -> bool`
 ///
-/// Re-builds the subset of pyramid tiles whose source rows match
-/// `where_clause`. Pass `''` to refresh everything.
+/// Re-builds the pyramid identified by `name` using its previously
+/// registered configuration. `where_clause` is currently ignored — full
+/// rebuilds only — and is reserved for an incremental refresh path.
 #[pg_extern(name = "ST_UpdatePyramid")]
-fn st_update_pyramid(name: &str, _where_clause: &str) -> Result<bool, spi::Error> {
-    let exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM geometry_pyramid_catalog WHERE pyramid_name = $1)",
+fn st_update_pyramid(
+    name: &str,
+    _where_clause: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    validate_identifier(name)?;
+
+    // Pull catalog row as a single JSON blob to side-step pgrx's
+    // limited multi-column SPI accessors.
+    let row: Option<String> = Spi::get_one_with_args(
+        "SELECT json_build_object( \
+            'source_table', source_table, \
+            'geom_column',  geom_column, \
+            'fid_column',   fid_column, \
+            'config',       config \
+         )::text \
+         FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into()],
-    )?
-    .unwrap_or(false);
-    if !exists {
-        return Ok(false);
-    }
+    )?;
+    let Some(json) = row else { return Ok(false) };
+    let parsed: serde_json::Value = serde_json::from_str(&json)?;
+    let source_table = parsed["source_table"].as_str().unwrap_or("").to_string();
+    let geom_column = parsed["geom_column"].as_str().unwrap_or("").to_string();
+    let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
+    let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
+
+    let total = build::build(name, &source_table, &geom_column, &fid_column, &cfg)?;
     Spi::run_with_args(
         "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
         &[name.into()],
     )?;
+    notice!(
+        "geometry_pyramid: pyramid '{}' refreshed ({} tiles)",
+        name,
+        total
+    );
     Ok(true)
 }
 
-/// `ST_Pyramid(name) -> jsonb` -- returns metadata for a pyramid.
+/// `ST_Pyramid(name) -> jsonb` — metadata for a single pyramid, including
+/// tile count.
 #[pg_extern(name = "ST_Pyramid")]
 fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
+    let storage_table = storage::tile_table_name(name);
+    let tile_count = Spi::get_one::<i64>(&format!(
+        r#"SELECT count(*)::bigint FROM "{storage_table}""#
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
     let row: Option<String> = Spi::get_one_with_args(
         "SELECT jsonb_build_object( \
             'name', pyramid_name, \
@@ -104,21 +144,30 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
             'geom_column', geom_column, \
             'fid_column', fid_column, \
             'config', config, \
-            'built_at', built_at \
+            'built_at', built_at, \
+            'tile_count', $2::bigint \
          )::text \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
-        &[name.into()],
+        &[name.into(), tile_count.into()],
     )?;
     Ok(row
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(pgrx::JsonB))
 }
 
+// ST_Pyramids() is defined in sql/bootstrap.sql as a SQL function over the
+// catalog table — simpler and avoids pgrx's SRF return-shape constraints.
+
 /// Reject identifiers that contain anything other than letters, digits or
 /// underscores. SQL identifier injection guard for the dynamic SQL paths.
-fn validate_identifier(ident: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn validate_identifier(
+    ident: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if ident.is_empty() {
         return Err("identifier must not be empty".into());
+    }
+    if ident.len() > 50 {
+        return Err(format!("identifier too long: {ident}").into());
     }
     if !ident
         .chars()
