@@ -106,22 +106,24 @@ fn build_zoom_level(
     let (xmin_t, ymin_t, xmax_t, ymax_t) =
         bbox_to_tile_range(z, xmin_m, ymin_m, xmax_m, ymax_m);
 
-    // Build a single set-based INSERT: for every tile in range, aggregate
-    // intersecting source rows into one MVT blob. PostGIS does the
-    // projection, clipping, quantization, and MVT encoding.
-    let attrs_select = if cfg.attributes.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::new();
-        for col in &cfg.attributes {
-            // Reject hostile column names defensively.
-            if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                continue;
-            }
-            s.push_str(&format!(r#", src."{col}""#));
+    // Build the per-zoom thresholds: simplification tolerance (m), the
+    // minimum-feature size cut-offs (m² and m), and the point retention
+    // probability. These mirror tippecanoe's per-zoom strategies.
+    let simplify_tol_m = cfg.simplify_tol_m(z);
+    let (min_area_m2, min_len_m) = cfg.min_size_thresholds_m(z);
+    let drop_threshold = cfg.drop_threshold_at(z);
+
+    // Attribute projection — column names are revalidated defensively here
+    // because they ride along into the dynamic SQL string.
+    let mut attrs_inner = String::new();
+    let mut attrs_outer = String::new();
+    for col in &cfg.attributes {
+        if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
         }
-        s
-    };
+        attrs_inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
+        attrs_outer.push_str(&format!(r#", prep."{col}""#));
+    }
 
     let sql = format!(
         r#"INSERT INTO "{storage_table}" (z, x, y, mvt)
@@ -132,19 +134,45 @@ fn build_zoom_level(
            CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
            CROSS JOIN LATERAL (
               SELECT
-                 ST_AsMVTGeom(
-                    ST_Transform(src."{geom_column}", $8),
-                    ST_TileEnvelope($1, t.x, t.y),
-                    $3, $9, true
-                 ) AS geom,
-                 src."{fid_column}"::bigint AS fid
-                 {attrs_select}
-              FROM "{table}" src
-              WHERE src."{geom_column}" IS NOT NULL
-                AND ST_Intersects(
-                       src."{geom_column}",
-                       ST_Transform(ST_TileEnvelope($1, t.x, t.y), $10)
-                    )
+                 ST_AsMVTGeom(prep.gtile,
+                              ST_TileEnvelope($1, t.x, t.y),
+                              $3, $9, true) AS geom,
+                 prep.fid
+                 {attrs_outer}
+              FROM (
+                 SELECT
+                    -- Per-zoom simplification (skip points; they have no edges).
+                    CASE
+                       WHEN $11::float8 > 0
+                            AND GeometryType(src."{geom_column}") NOT IN ('POINT','MULTIPOINT')
+                          THEN ST_SimplifyPreserveTopology(
+                                 ST_Transform(src."{geom_column}", $8),
+                                 $11::float8)
+                       ELSE ST_Transform(src."{geom_column}", $8)
+                    END AS gtile,
+                    src."{fid_column}"::bigint AS fid
+                    {attrs_inner}
+                 FROM "{table}" src
+                 WHERE src."{geom_column}" IS NOT NULL
+                   AND ST_Intersects(
+                          src."{geom_column}",
+                          ST_Transform(ST_TileEnvelope($1, t.x, t.y), $10)
+                       )
+              ) prep
+              WHERE
+                 -- Polygon area cutoff (only applied when threshold > 0).
+                 ($12::float8 <= 0
+                  OR GeometryType(prep.gtile) NOT IN ('POLYGON','MULTIPOLYGON')
+                  OR ST_Area(prep.gtile) >= $12::float8)
+                 -- Line length cutoff (only applied when threshold > 0).
+                 AND ($13::float8 <= 0
+                      OR GeometryType(prep.gtile) NOT IN ('LINESTRING','MULTILINESTRING')
+                      OR ST_Length(prep.gtile) >= $13::float8)
+                 -- Tippecanoe-style deterministic point dropping.
+                 AND ($14::float8 >= 1.0
+                      OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
+                      OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
+                         / 1000000.0 < $14::float8)
            ) features
            WHERE features.geom IS NOT NULL
            GROUP BY t.x, t.y
@@ -165,6 +193,10 @@ fn build_zoom_level(
             cfg.tile_srs.into(),
             (cfg.tile_extend as i32).into(),
             cfg.source_srs.into(),
+            simplify_tol_m.into(),
+            min_area_m2.into(),
+            min_len_m.into(),
+            drop_threshold.into(),
         ],
     )?;
     let inserted_after = inserted_count(storage_table, z)?;

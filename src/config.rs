@@ -11,6 +11,15 @@ pub const DEFAULT_PARALLEL: u32 = 1;
 pub const DEFAULT_SOURCE_SRS: i32 = 4326;
 pub const DEFAULT_TILE_SRS: i32 = 3857;
 
+// Tippecanoe-inspired generation knobs.
+pub const DEFAULT_SIMPLIFY_PIXELS: f64 = 1.0;
+pub const DEFAULT_MIN_FEATURE_PIXELS: f64 = 0.0;
+pub const DEFAULT_DROP_RATE: f64 = 1.0;
+
+/// Web Mercator full span (m). Used to convert a zoom level + tile extent
+/// into a per-pixel ground distance for simplification / size filters.
+pub const WEBMERC_FULL_SPAN_M: f64 = 40_075_016.685_578_488;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     /// Optional pyramid name. Defaults to the source table name.
@@ -53,6 +62,63 @@ pub struct PyramidConfig {
     /// Optional list of attribute columns to include in MVT features.
     #[serde(default)]
     pub attributes: Vec<String>,
+
+    /// Simplification tolerance expressed in tile pixels (one MVT extent
+    /// unit = one pixel). Geometries are reduced via
+    /// `ST_SimplifyPreserveTopology` before MVT encoding. Tippecanoe's
+    /// default is ~1 px; set 0 to disable.
+    #[serde(default = "default_simplify_pixels", rename = "simplifyPixels")]
+    pub simplify_pixels: f64,
+
+    /// Minimum visual feature size in tile pixels. At each zoom, polygons
+    /// whose area `< (size_px)²` and lines whose length `< size_px` are
+    /// filtered out before MVT encoding. 0 disables.
+    #[serde(default = "default_min_feature_pixels", rename = "minFeatureSizePixels")]
+    pub min_feature_size_px: f64,
+
+    /// Tippecanoe-style point drop rate: at zoom z, retain
+    /// `dropRate^(maxZoom - z)` of POINT/MULTIPOINT features. 1.0 disables;
+    /// tippecanoe's default is 0.4 (≡ `-r2.5`).
+    #[serde(default = "default_drop_rate", rename = "dropRate")]
+    pub drop_rate: f64,
+}
+
+impl PyramidConfig {
+    /// Ground distance covered by one MVT pixel at zoom `z`, in metres.
+    /// Math is correct only when `tile_srs` is metre-based (Web Mercator).
+    pub fn pixel_size_m(&self, z: u8) -> f64 {
+        WEBMERC_FULL_SPAN_M / (self.tile_size as f64 * (1u64 << z) as f64)
+    }
+
+    /// Douglas–Peucker tolerance in metres at zoom `z`.
+    pub fn simplify_tol_m(&self, z: u8) -> f64 {
+        if self.simplify_pixels <= 0.0 {
+            0.0
+        } else {
+            self.simplify_pixels * self.pixel_size_m(z)
+        }
+    }
+
+    /// Minimum permissible polygon area (m²) and line length (m) at z.
+    /// Both 0 mean "no filter".
+    pub fn min_size_thresholds_m(&self, z: u8) -> (f64, f64) {
+        if self.min_feature_size_px <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            let side = self.min_feature_size_px * self.pixel_size_m(z);
+            (side * side, side)
+        }
+    }
+
+    /// Retention probability for POINT/MULTIPOINT features at zoom `z`.
+    /// Returns 1.0 when dropping is disabled or `z >= max_zoom`.
+    pub fn drop_threshold_at(&self, z: u8) -> f64 {
+        if self.drop_rate >= 1.0 || z >= self.max_zoom {
+            1.0
+        } else {
+            self.drop_rate.powi((self.max_zoom - z) as i32)
+        }
+    }
 }
 
 impl Default for PyramidConfig {
@@ -68,6 +134,9 @@ impl Default for PyramidConfig {
             parallel: DEFAULT_PARALLEL,
             sparse: true,
             attributes: Vec::new(),
+            simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
+            min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
+            drop_rate: DEFAULT_DROP_RATE,
         }
     }
 }
@@ -105,6 +174,15 @@ fn default_parallel() -> u32 {
 fn default_sparse() -> bool {
     true
 }
+fn default_simplify_pixels() -> f64 {
+    DEFAULT_SIMPLIFY_PIXELS
+}
+fn default_min_feature_pixels() -> f64 {
+    DEFAULT_MIN_FEATURE_PIXELS
+}
+fn default_drop_rate() -> f64 {
+    DEFAULT_DROP_RATE
+}
 
 #[cfg(test)]
 mod tests {
@@ -129,5 +207,41 @@ mod tests {
         assert_eq!(cfg.tile_size, 512);
         assert_eq!(cfg.max_zoom, 14);
         assert_eq!(cfg.parallel, 4);
+    }
+
+    #[test]
+    fn pixel_size_matches_web_mercator_math() {
+        // At z=10 with tileSize=4096 the ground sample distance should be
+        // ~9.55 m/px (40075016.685 / (4096 * 1024)).
+        let cfg = PyramidConfig::default();
+        let px = cfg.pixel_size_m(10);
+        assert!((px - 9.5546).abs() < 1e-3, "got {px}");
+    }
+
+    #[test]
+    fn drop_threshold_decays_per_zoom() {
+        let cfg = PyramidConfig {
+            drop_rate: 0.4,
+            max_zoom: 10,
+            ..PyramidConfig::default()
+        };
+        // maxZoom keeps everything; one step below halves to drop_rate.
+        assert!((cfg.drop_threshold_at(10) - 1.0).abs() < 1e-9);
+        assert!((cfg.drop_threshold_at(9) - 0.4).abs() < 1e-9);
+        assert!((cfg.drop_threshold_at(8) - 0.16).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drop_threshold_disabled_when_rate_one() {
+        let cfg = PyramidConfig::default(); // drop_rate = 1.0
+        assert!((cfg.drop_threshold_at(0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn min_size_thresholds_zero_when_disabled() {
+        let cfg = PyramidConfig::default(); // min_feature_size_px = 0
+        let (a, l) = cfg.min_size_thresholds_m(12);
+        assert_eq!(a, 0.0);
+        assert_eq!(l, 0.0);
     }
 }
