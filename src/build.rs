@@ -38,7 +38,7 @@ pub fn build(
 
     let mut total: i64 = 0;
     for z in cfg.min_zoom..=cfg.max_zoom {
-        let inserted = build_zoom_level(
+        let inserted = build_zoom_level_with_budget(
             pyramid_name,
             &storage_table,
             table,
@@ -52,14 +52,132 @@ pub fn build(
             ymax_m,
         )?;
         total += inserted;
-        notice!(
-            "geometry_pyramid: pyramid '{}' z={} -> {} tiles",
-            pyramid_name,
-            z,
-            inserted
-        );
     }
     Ok(total)
+}
+
+/// Tippecanoe-style `--drop-densest-as-needed` loop. Build the zoom once,
+/// then while any tile breaches the byte budget, wipe and rebuild with
+/// tighter knobs (more simplification, larger minimum-feature size, lower
+/// retention). Bounded by `max_tile_size_attempts`.
+#[allow(clippy::too_many_arguments)]
+fn build_zoom_level_with_budget(
+    pyramid_name: &str,
+    storage_table: &str,
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+    z: u8,
+    xmin_m: f64,
+    ymin_m: f64,
+    xmax_m: f64,
+    ymax_m: f64,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let pixel_m = cfg.pixel_size_m(z);
+    let mut knobs = ZoomKnobs::from_config(cfg, z);
+    let mut attempt: u32 = 0;
+
+    loop {
+        if attempt > 0 {
+            // Re-build cleanly: wipe this zoom's tiles before re-inserting,
+            // otherwise the (z,x,y) PK collides.
+            Spi::run_with_args(
+                &format!(r#"DELETE FROM "{storage_table}" WHERE z = $1"#),
+                &[(z as i32).into()],
+            )?;
+        }
+
+        let inserted = build_zoom_level(
+            pyramid_name,
+            storage_table,
+            table,
+            geom_column,
+            fid_column,
+            cfg,
+            z,
+            xmin_m,
+            ymin_m,
+            xmax_m,
+            ymax_m,
+            &knobs,
+        )?;
+        notice!(
+            "geometry_pyramid: pyramid '{}' z={} attempt={} -> {} tiles",
+            pyramid_name,
+            z,
+            attempt,
+            inserted
+        );
+
+        if cfg.tile_size_budget_bytes <= 0 || attempt >= cfg.max_tile_size_attempts {
+            return Ok(inserted);
+        }
+        let max_bytes = max_tile_bytes(storage_table, z)?;
+        if max_bytes <= cfg.tile_size_budget_bytes {
+            return Ok(inserted);
+        }
+
+        // Pressure factor = √(overage). Square-rooted so each retry is a
+        // measured tightening rather than a panic; the loop converges
+        // geometrically across attempts.
+        let factor = (max_bytes as f64 / cfg.tile_size_budget_bytes as f64)
+            .sqrt()
+            .max(1.05);
+        knobs.tighten(factor, pixel_m);
+        notice!(
+            "geometry_pyramid: pyramid '{}' z={} max_tile={} bytes > budget {} -> tighten x{:.2}",
+            pyramid_name,
+            z,
+            max_bytes,
+            cfg.tile_size_budget_bytes,
+            factor
+        );
+        attempt += 1;
+    }
+}
+
+/// Per-zoom tunable thresholds. Decoupled from `PyramidConfig` so the
+/// budget retry loop can ratchet them per attempt without mutating cfg.
+#[derive(Clone, Copy, Debug)]
+struct ZoomKnobs {
+    simplify_tol_m: f64,
+    min_area_m2: f64,
+    min_len_m: f64,
+    drop_threshold: f64,
+}
+
+impl ZoomKnobs {
+    fn from_config(cfg: &PyramidConfig, z: u8) -> Self {
+        let (a, l) = cfg.min_size_thresholds_m(z);
+        Self {
+            simplify_tol_m: cfg.simplify_tol_m(z),
+            min_area_m2: a,
+            min_len_m: l,
+            drop_threshold: cfg.drop_threshold_at(z),
+        }
+    }
+
+    /// Apply `factor > 1` worth of pressure. If a knob was disabled (0 or
+    /// 1.0), it is bootstrapped to a 1-pixel baseline so the next factor
+    /// has something to bite on.
+    fn tighten(&mut self, factor: f64, pixel_m: f64) {
+        self.simplify_tol_m = self.simplify_tol_m.max(pixel_m) * factor;
+        self.min_len_m = self.min_len_m.max(pixel_m) * factor;
+        self.min_area_m2 = self.min_len_m * self.min_len_m;
+        self.drop_threshold = (self.drop_threshold / factor).clamp(0.0, 1.0);
+    }
+}
+
+fn max_tile_bytes(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
+    Spi::get_one_with_args(
+        &format!(
+            r#"SELECT COALESCE(MAX(octet_length(mvt)), 0)::bigint
+               FROM "{storage_table}" WHERE z = $1"#
+        ),
+        &[(z as i32).into()],
+    )
+    .map(|opt: Option<i64>| opt.unwrap_or(0))
 }
 
 fn source_bbox(
@@ -102,16 +220,17 @@ fn build_zoom_level(
     ymin_m: f64,
     xmax_m: f64,
     ymax_m: f64,
+    knobs: &ZoomKnobs,
 ) -> Result<i64, spi::Error> {
     let (xmin_t, ymin_t, xmax_t, ymax_t) =
         bbox_to_tile_range(z, xmin_m, ymin_m, xmax_m, ymax_m);
 
-    // Build the per-zoom thresholds: simplification tolerance (m), the
-    // minimum-feature size cut-offs (m² and m), and the point retention
-    // probability. These mirror tippecanoe's per-zoom strategies.
-    let simplify_tol_m = cfg.simplify_tol_m(z);
-    let (min_area_m2, min_len_m) = cfg.min_size_thresholds_m(z);
-    let drop_threshold = cfg.drop_threshold_at(z);
+    // The four tippecanoe-style thresholds for this attempt. `cfg` is no
+    // longer the source of truth — the budget retry loop owns them.
+    let simplify_tol_m = knobs.simplify_tol_m;
+    let min_area_m2 = knobs.min_area_m2;
+    let min_len_m = knobs.min_len_m;
+    let drop_threshold = knobs.drop_threshold;
 
     // Attribute projection — column names are revalidated defensively here
     // because they ride along into the dynamic SQL string.
@@ -272,5 +391,42 @@ mod tests {
         let n: i64 = 1 << 5;
         assert!(r.0 >= 0 && r.2 <= n - 1);
         assert!(r.1 >= 0 && r.3 <= n - 1);
+    }
+
+    #[test]
+    fn tighten_bootstraps_disabled_knobs() {
+        // User had everything off (defaults): simplify_pixels=1.0 ON,
+        // min_feature_size_px=0 OFF, drop_rate=1.0 OFF. After one tighten
+        // round all three should exert pressure.
+        let cfg = PyramidConfig::default();
+        let mut knobs = ZoomKnobs::from_config(&cfg, 10);
+        let pixel_m = cfg.pixel_size_m(10);
+        let initial_tol = knobs.simplify_tol_m;
+        assert!((knobs.min_area_m2).abs() < 1e-9);
+        assert!((knobs.drop_threshold - 1.0).abs() < 1e-9);
+
+        knobs.tighten(2.0, pixel_m);
+
+        assert!(knobs.simplify_tol_m > initial_tol);
+        assert!(knobs.min_len_m >= pixel_m * 2.0 - 1e-9);
+        assert!(knobs.min_area_m2 > 0.0);
+        assert!(knobs.drop_threshold < 1.0 && knobs.drop_threshold > 0.0);
+    }
+
+    #[test]
+    fn tighten_geometric_per_attempt() {
+        let cfg = PyramidConfig::default();
+        let pixel_m = cfg.pixel_size_m(10);
+        let mut knobs = ZoomKnobs::from_config(&cfg, 10);
+        knobs.tighten(2.0, pixel_m);
+        let after_one = knobs.simplify_tol_m;
+        knobs.tighten(2.0, pixel_m);
+        // Second tighten should multiply again, not be capped.
+        assert!(
+            knobs.simplify_tol_m > after_one * 1.5,
+            "expected geometric growth, got {} -> {}",
+            after_one,
+            knobs.simplify_tol_m
+        );
     }
 }

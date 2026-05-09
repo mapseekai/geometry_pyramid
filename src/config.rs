@@ -15,6 +15,10 @@ pub const DEFAULT_TILE_SRS: i32 = 3857;
 pub const DEFAULT_SIMPLIFY_PIXELS: f64 = 1.0;
 pub const DEFAULT_MIN_FEATURE_PIXELS: f64 = 0.0;
 pub const DEFAULT_DROP_RATE: f64 = 1.0;
+/// Default per-tile budget. 0 = disabled (no retry loop). Set to e.g.
+/// `512000` to mimic tippecanoe's default ~500 KiB cap.
+pub const DEFAULT_TILE_SIZE_BUDGET_BYTES: i64 = 0;
+pub const DEFAULT_MAX_TILE_SIZE_ATTEMPTS: u32 = 5;
 
 /// Web Mercator full span (m). Used to convert a zoom level + tile extent
 /// into a per-pixel ground distance for simplification / size filters.
@@ -81,6 +85,18 @@ pub struct PyramidConfig {
     /// tippecanoe's default is 0.4 (≡ `-r2.5`).
     #[serde(default = "default_drop_rate", rename = "dropRate")]
     pub drop_rate: f64,
+
+    /// Per-tile MVT byte budget (`--drop-densest-as-needed` analogue). When
+    /// any tile at a zoom exceeds this size after the initial INSERT, the
+    /// zoom is wiped and rebuilt with tighter simplify / min-size / drop
+    /// knobs. 0 disables the retry loop.
+    #[serde(default = "default_tile_size_budget_bytes", rename = "tileSizeBudgetBytes")]
+    pub tile_size_budget_bytes: i64,
+
+    /// Cap on retry rounds per zoom when chasing the byte budget. The build
+    /// gives up and emits whatever it has after this many attempts.
+    #[serde(default = "default_max_tile_size_attempts", rename = "maxTileSizeAttempts")]
+    pub max_tile_size_attempts: u32,
 }
 
 impl PyramidConfig {
@@ -137,6 +153,8 @@ impl Default for PyramidConfig {
             simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
             min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
             drop_rate: DEFAULT_DROP_RATE,
+            tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
+            max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
         }
     }
 }
@@ -182,6 +200,12 @@ fn default_min_feature_pixels() -> f64 {
 }
 fn default_drop_rate() -> f64 {
     DEFAULT_DROP_RATE
+}
+fn default_tile_size_budget_bytes() -> i64 {
+    DEFAULT_TILE_SIZE_BUDGET_BYTES
+}
+fn default_max_tile_size_attempts() -> u32 {
+    DEFAULT_MAX_TILE_SIZE_ATTEMPTS
 }
 
 #[cfg(test)]

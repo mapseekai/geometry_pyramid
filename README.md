@@ -43,6 +43,8 @@ keys mirror Ganos:
 | `simplifyPixels` | `1.0` | DP tolerance in tile pixels (≈1 px ≈ tippecanoe default). 0 disables. |
 | `minFeatureSizePixels` | `0.0` | Drop polygons whose area `<` and lines `<` this many tile pixels. 0 disables. |
 | `dropRate` | `1.0` | Tippecanoe-style point retention: keep `dropRate^(maxZoom − z)`. 1.0 disables; 0.4 mimics `tippecanoe -r2.5`. |
+| `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
+| `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 
 ## Project layout
 
@@ -102,6 +104,7 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 5. **Deterministic point dropping** *(tippecanoe `-r`)* — `(abs(hashtextextended(fid, 0)) % 1 000 000) / 1 000 000 < dropRate^(maxZoom − z)`. Same fid → same decision across rebuilds.
 6. **Quantize to MVT grid** — `ST_AsMVTGeom(g, env, tileSize, tileExtend, true)` (clipping + integer quantization).
 7. **Encode + sparse-store** — `ST_AsMVT(...)` aggregated per `(x,y)`, only non-empty tiles inserted into `_gp_tiles_<name>`.
+8. **Tile-size budget retry** *(opt-in via `tileSizeBudgetBytes`)* — `MAX(octet_length(mvt))` for the zoom is compared to the budget; on overshoot, all four knobs are tightened by `factor = √(max/budget)` (simplify tolerance and min-size scaled up, retention scaled down, knobs that were "off" bootstrap to a 1-pixel baseline) and the zoom is wiped + rebuilt. Bounded by `maxTileSizeAttempts`.
 
 ## Roadmap
 
@@ -110,7 +113,7 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 3. ~~Build pipeline — zoom-major INSERT into per-pyramid storage tables.~~ ✅
 4. ~~Catalog views — `ST_Pyramids()`.~~ ✅
 5. ~~Tippecanoe-style strategies — per-zoom simplification, min feature size, point drop rate.~~ ✅
-6. **Tile-size budget** — `--drop-densest-as-needed` analogue: re-run a tile when `octet_length(mvt) > 500 KiB` with stricter thresholds.
+6. ~~Tile-size budget — `--drop-densest-as-needed` analogue with geometric tightening.~~ ✅
 7. **Coalesce-densest** — merge adjacent small polygons at low zoom (`ST_Union` / `ST_Buffer(0)`).
 8. **Parallelism** — honor `parallel` config; partition tile range across
    workers using PG bgworkers or client-side parallel `ST_BuildPyramid`
