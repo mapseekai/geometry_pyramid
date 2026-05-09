@@ -1,0 +1,4 @@
+# pgrx requires these linker flags so symbols are resolved at extension load time
+# (against the running Postgres backend), not at link time.
+[target.'cfg(target_os="macos")']
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]

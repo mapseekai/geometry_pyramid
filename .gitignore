@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.iml
+.idea/
+.vscode/
+Cargo.lock
+sql/geometry_pyramid--*.sql
+results/
+*.swp
