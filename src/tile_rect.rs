@@ -38,6 +38,7 @@ impl TileRect {
     /// Split into at most `parts` disjoint x-strips that exactly cover
     /// `self`. Degrades to one strip per column when `parts > width`.
     pub fn split_x(&self, parts: u32) -> Vec<TileRect> {
+        debug_assert!(self.xmin <= self.xmax, "TileRect invariant violated: xmin > xmax");
         let parts = (parts as i64).clamp(1, self.width());
         let base = self.width() / parts;
         let extra = self.width() % parts;
@@ -80,6 +81,12 @@ mod tests {
             WEBMERC_HALF_EXTENT - 1.0, WEBMERC_HALF_EXTENT - 1.0,
         );
         assert_eq!((r.xmin, r.ymin, r.xmax, r.ymax), (0, 0, 1, 1));
+        let exact = TileRect::from_bbox_m(
+            1,
+            -WEBMERC_HALF_EXTENT, -WEBMERC_HALF_EXTENT,
+            WEBMERC_HALF_EXTENT, WEBMERC_HALF_EXTENT,
+        );
+        assert_eq!((exact.xmin, exact.ymin, exact.xmax, exact.ymax), (0, 0, 1, 1));
     }
 
     #[test]
@@ -88,6 +95,8 @@ mod tests {
         let n: i64 = 1 << 5;
         assert!(r.xmin >= 0 && r.xmax <= n - 1);
         assert!(r.ymin >= 0 && r.ymax <= n - 1);
+        let r2 = TileRect::from_bbox_m(5, 1e9, 1e9, 2e9, 2e9);
+        assert_eq!((r2.xmin, r2.ymin, r2.xmax, r2.ymax), (31, 0, 31, 0));
     }
 
     #[test]
