@@ -76,6 +76,7 @@ pub fn build(
             cfg,
             &rect,
         )?;
+        crate::stats::upsert_zoom_stats(pyramid_name, &result)?;
         total += result.tiles;
     }
     Ok(total)

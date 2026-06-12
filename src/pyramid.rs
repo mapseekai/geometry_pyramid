@@ -79,6 +79,7 @@ fn st_drop_pyramid(
     )?
     .unwrap_or(0);
     storage::drop_tile_table(name)?;
+    crate::stats::delete_stats(name)?;
     Ok(removed > 0)
 }
 

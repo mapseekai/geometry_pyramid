@@ -11,6 +11,7 @@ use pgrx::prelude::*;
 mod build;
 mod config;
 mod pyramid;
+mod stats;
 mod storage;
 mod tile;
 mod tile_rect;
@@ -77,6 +78,43 @@ mod tests {
         let dropped = Spi::get_one::<bool>("SELECT ST_DropPyramid('_gp_smoke')").unwrap();
         assert_eq!(dropped, Some(true));
         Spi::run("DROP TABLE _gp_smoke").unwrap();
+    }
+
+    /// Stats rows must be written per zoom and removed on drop.
+    #[pg_test]
+    fn stats_written_per_zoom_and_cleaned_on_drop() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_stats_t (gid serial PRIMARY KEY, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO _gp_stats_t (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
+            .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_stats_t','geom','gid','{\"minZoom\":0,\"maxZoom\":3}')",
+        )
+        .unwrap();
+        let rows = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM geometry_pyramid_stats WHERE pyramid_name='_gp_stats_t'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows, 4, "expected one stats row per zoom 0..=3");
+        let ms = Spi::get_one::<i64>(
+            "SELECT min(build_ms)::bigint FROM geometry_pyramid_stats WHERE pyramid_name='_gp_stats_t'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ms >= 0);
+        Spi::run("SELECT ST_DropPyramid('_gp_stats_t')").unwrap();
+        let rows = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM geometry_pyramid_stats WHERE pyramid_name='_gp_stats_t'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows, 0, "drop must clean stats");
+        Spi::run("DROP TABLE _gp_stats_t").unwrap();
     }
 
     /// Tippecanoe-style point dropping must reduce feature counts at low
