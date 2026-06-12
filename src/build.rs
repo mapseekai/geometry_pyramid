@@ -110,7 +110,7 @@ fn build_zoom_level_with_budget(
             )?;
         }
 
-        let inserted = build_zoom_level(
+        build_zoom_level(
             pyramid_name,
             storage_table,
             table,
@@ -120,15 +120,15 @@ fn build_zoom_level_with_budget(
             rect,
             &knobs,
         )?;
+
+        let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         notice!(
             "geometry_pyramid: pyramid '{}' z={} attempt={} -> {} tiles",
             pyramid_name,
             z,
             attempt,
-            inserted
+            tiles
         );
-
-        let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         if cfg.tile_size_budget_bytes <= 0
             || attempt >= cfg.max_tile_size_attempts
             || max_tile_bytes <= cfg.tile_size_budget_bytes
