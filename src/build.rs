@@ -10,6 +10,37 @@ use crate::storage;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 
+/// Per-zoom build outcome, consumed by the stats layer.
+#[derive(Clone, Copy, Debug)]
+pub struct ZoomBuildResult {
+    pub z: u8,
+    pub tiles: i64,
+    pub total_bytes: i64,
+    pub max_tile_bytes: i64,
+    pub build_ms: i64,
+    pub attempts: u32,
+}
+
+/// (tile_count, total_bytes, max_tile_bytes) for one zoom of a tile table.
+fn zoom_stats(
+    storage_table: &str,
+    z: u8,
+) -> Result<(i64, i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+    let row: Option<String> = Spi::get_one_with_args(
+        &format!(
+            r#"SELECT json_build_array(
+                   count(*),
+                   COALESCE(sum(octet_length(mvt)), 0),
+                   COALESCE(max(octet_length(mvt)), 0))::text
+               FROM "{storage_table}" WHERE z = $1"#
+        ),
+        &[(z as i32).into()],
+    )?;
+    let s = row.ok_or("zoom_stats returned no row")?;
+    let arr: [i64; 3] = serde_json::from_str(&s)?;
+    Ok((arr[0], arr[1], arr[2]))
+}
+
 /// Total tile count emitted across all zoom levels.
 pub fn build(
     pyramid_name: &str,
@@ -36,7 +67,7 @@ pub fn build(
     let mut total: i64 = 0;
     for z in cfg.min_zoom..=cfg.max_zoom {
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
-        let inserted = build_zoom_level_with_budget(
+        let result = build_zoom_level_with_budget(
             pyramid_name,
             &storage_table,
             table,
@@ -45,7 +76,7 @@ pub fn build(
             cfg,
             &rect,
         )?;
-        total += inserted;
+        total += result.tiles;
     }
     Ok(total)
 }
@@ -62,7 +93,8 @@ fn build_zoom_level_with_budget(
     fid_column: &str,
     cfg: &PyramidConfig,
     rect: &TileRect,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
     let z = rect.z;
     let pixel_m = cfg.pixel_size_m(z);
     let mut knobs = ZoomKnobs::from_config(cfg, z);
@@ -96,18 +128,25 @@ fn build_zoom_level_with_budget(
             inserted
         );
 
-        if cfg.tile_size_budget_bytes <= 0 || attempt >= cfg.max_tile_size_attempts {
-            return Ok(inserted);
-        }
-        let max_bytes = max_tile_bytes(storage_table, z)?;
-        if max_bytes <= cfg.tile_size_budget_bytes {
-            return Ok(inserted);
+        let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
+        if cfg.tile_size_budget_bytes <= 0
+            || attempt >= cfg.max_tile_size_attempts
+            || max_tile_bytes <= cfg.tile_size_budget_bytes
+        {
+            return Ok(ZoomBuildResult {
+                z: rect.z,
+                tiles,
+                total_bytes,
+                max_tile_bytes,
+                build_ms: started.elapsed().as_millis() as i64,
+                attempts: attempt + 1,
+            });
         }
 
         // Pressure factor = √(overage). Square-rooted so each retry is a
         // measured tightening rather than a panic; the loop converges
         // geometrically across attempts.
-        let factor = (max_bytes as f64 / cfg.tile_size_budget_bytes as f64)
+        let factor = (max_tile_bytes as f64 / cfg.tile_size_budget_bytes as f64)
             .sqrt()
             .max(1.05);
         knobs.tighten(factor, pixel_m);
@@ -115,7 +154,7 @@ fn build_zoom_level_with_budget(
             "geometry_pyramid: pyramid '{}' z={} max_tile={} bytes > budget {} -> tighten x{:.2}",
             pyramid_name,
             z,
-            max_bytes,
+            max_tile_bytes,
             cfg.tile_size_budget_bytes,
             factor
         );
@@ -153,17 +192,6 @@ impl ZoomKnobs {
         self.min_area_m2 = self.min_len_m * self.min_len_m;
         self.drop_threshold = (self.drop_threshold / factor).clamp(0.0, 1.0);
     }
-}
-
-fn max_tile_bytes(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
-    Spi::get_one_with_args(
-        &format!(
-            r#"SELECT COALESCE(MAX(octet_length(mvt)), 0)::bigint
-               FROM "{storage_table}" WHERE z = $1"#
-        ),
-        &[(z as i32).into()],
-    )
-    .map(|opt: Option<i64>| opt.unwrap_or(0))
 }
 
 fn source_bbox(
