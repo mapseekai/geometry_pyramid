@@ -7,11 +7,8 @@
 
 use crate::config::PyramidConfig;
 use crate::storage;
+use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
-
-/// Web Mercator half-extent in metres. Used to convert between meter
-/// coordinates and tile indices when computing per-zoom tile ranges.
-const WEBMERC_HALF_EXTENT: f64 = 20_037_508.342_789_244;
 
 /// Total tile count emitted across all zoom levels.
 pub fn build(
@@ -38,6 +35,7 @@ pub fn build(
 
     let mut total: i64 = 0;
     for z in cfg.min_zoom..=cfg.max_zoom {
+        let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
         let inserted = build_zoom_level_with_budget(
             pyramid_name,
             &storage_table,
@@ -45,11 +43,7 @@ pub fn build(
             geom_column,
             fid_column,
             cfg,
-            z,
-            xmin_m,
-            ymin_m,
-            xmax_m,
-            ymax_m,
+            &rect,
         )?;
         total += inserted;
     }
@@ -60,7 +54,6 @@ pub fn build(
 /// then while any tile breaches the byte budget, wipe and rebuild with
 /// tighter knobs (more simplification, larger minimum-feature size, lower
 /// retention). Bounded by `max_tile_size_attempts`.
-#[allow(clippy::too_many_arguments)]
 fn build_zoom_level_with_budget(
     pyramid_name: &str,
     storage_table: &str,
@@ -68,12 +61,9 @@ fn build_zoom_level_with_budget(
     geom_column: &str,
     fid_column: &str,
     cfg: &PyramidConfig,
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
+    rect: &TileRect,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let z = rect.z;
     let pixel_m = cfg.pixel_size_m(z);
     let mut knobs = ZoomKnobs::from_config(cfg, z);
     let mut attempt: u32 = 0;
@@ -95,11 +85,7 @@ fn build_zoom_level_with_budget(
             geom_column,
             fid_column,
             cfg,
-            z,
-            xmin_m,
-            ymin_m,
-            xmax_m,
-            ymax_m,
+            rect,
             &knobs,
         )?;
         notice!(
@@ -207,7 +193,6 @@ fn source_bbox(
     Ok(Some((arr[0], arr[1], arr[2], arr[3])))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_zoom_level(
     pyramid_name: &str,
     storage_table: &str,
@@ -215,15 +200,11 @@ fn build_zoom_level(
     geom_column: &str,
     fid_column: &str,
     cfg: &PyramidConfig,
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
+    rect: &TileRect,
     knobs: &ZoomKnobs,
 ) -> Result<i64, spi::Error> {
-    let (xmin_t, ymin_t, xmax_t, ymax_t) =
-        bbox_to_tile_range(z, xmin_m, ymin_m, xmax_m, ymax_m);
+    let z = rect.z;
+    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
 
     // The four tippecanoe-style thresholds for this attempt. `cfg` is no
     // longer the source of truth — the budget retry loop owns them.
@@ -330,68 +311,9 @@ fn inserted_count(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
     .map(|opt: Option<i64>| opt.unwrap_or(0))
 }
 
-/// Convert a Web-Mercator metres bbox to inclusive tile (x, y) ranges at
-/// zoom `z`. Result is clamped to the valid tile range `[0, 2^z - 1]`.
-fn bbox_to_tile_range(
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
-) -> (i64, i64, i64, i64) {
-    let n: i64 = 1 << z;
-    let tile_span = (2.0 * WEBMERC_HALF_EXTENT) / (n as f64);
-
-    let to_tile_x = |m: f64| ((m + WEBMERC_HALF_EXTENT) / tile_span).floor() as i64;
-    let to_tile_y = |m: f64| ((WEBMERC_HALF_EXTENT - m) / tile_span).floor() as i64;
-
-    let xmin_t = to_tile_x(xmin_m).clamp(0, n - 1);
-    let xmax_t = to_tile_x(xmax_m).clamp(0, n - 1);
-    let ymin_t = to_tile_y(ymax_m).clamp(0, n - 1); // Y axis is inverted
-    let ymax_t = to_tile_y(ymin_m).clamp(0, n - 1);
-    (xmin_t, ymin_t, xmax_t, ymax_t)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn z0_full_world_is_single_tile() {
-        let r = bbox_to_tile_range(
-            0,
-            -WEBMERC_HALF_EXTENT,
-            -WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT,
-        );
-        assert_eq!(r, (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn z1_full_world_is_four_tiles() {
-        let r = bbox_to_tile_range(
-            1,
-            -WEBMERC_HALF_EXTENT + 1.0,
-            -WEBMERC_HALF_EXTENT + 1.0,
-            WEBMERC_HALF_EXTENT - 1.0,
-            WEBMERC_HALF_EXTENT - 1.0,
-        );
-        assert_eq!(r, (0, 0, 1, 1));
-    }
-
-    #[test]
-    fn out_of_range_is_clamped() {
-        // A tiny bbox far outside Web Mercator's valid extent should still
-        // clamp into the valid index space rather than producing negatives.
-        let r = bbox_to_tile_range(
-            5,
-            -1e9, -1e9, -9e8, -9e8,
-        );
-        let n: i64 = 1 << 5;
-        assert!(r.0 >= 0 && r.2 <= n - 1);
-        assert!(r.1 >= 0 && r.3 <= n - 1);
-    }
 
     #[test]
     fn tighten_bootstraps_disabled_knobs() {

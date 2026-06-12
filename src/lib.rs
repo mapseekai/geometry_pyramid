@@ -13,6 +13,7 @@ mod config;
 mod pyramid;
 mod storage;
 mod tile;
+mod tile_rect;
 
 extension_sql_file!("../sql/bootstrap.sql", bootstrap);
 
