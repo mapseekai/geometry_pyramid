@@ -10,7 +10,7 @@ use pgrx::prelude::*;
 /// Builds (or rebuilds) a vector pyramid for `table` using `geom_column` as
 /// the geometry source and `fid_column` as the stable feature id. `config`
 /// is a JSON document; pass `''` for defaults.
-#[pg_extern(name = "ST_BuildPyramid")]
+#[pg_extern(name = "st_buildpyramid")]
 fn st_build_pyramid(
     table: &str,
     geom_column: &str,
@@ -67,7 +67,7 @@ fn st_build_pyramid(
 }
 
 /// `ST_DropPyramid(name) -> bool`
-#[pg_extern(name = "ST_DropPyramid")]
+#[pg_extern(name = "st_droppyramid")]
 fn st_drop_pyramid(
     name: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -87,7 +87,7 @@ fn st_drop_pyramid(
 /// Re-builds the pyramid identified by `name` using its previously
 /// registered configuration. `where_clause` is currently ignored — full
 /// rebuilds only — and is reserved for an incremental refresh path.
-#[pg_extern(name = "ST_UpdatePyramid")]
+#[pg_extern(name = "st_updatepyramid")]
 fn st_update_pyramid(
     name: &str,
     _where_clause: &str,
@@ -128,7 +128,7 @@ fn st_update_pyramid(
 
 /// `ST_Pyramid(name) -> jsonb` — metadata for a single pyramid, including
 /// tile count.
-#[pg_extern(name = "ST_Pyramid")]
+#[pg_extern(name = "st_pyramid")]
 fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
     let storage_table = storage::tile_table_name(name);
     let tile_count = Spi::get_one::<i64>(&format!(

@@ -19,7 +19,7 @@ COMMENT ON TABLE geometry_pyramid_catalog IS
 -- ST_Pyramids() — list every registered pyramid with its tile count.
 -- Implemented in plain SQL: a SETOF query over the catalog joined with
 -- count(*) from each pyramid's storage table.
-CREATE OR REPLACE FUNCTION "ST_Pyramids"()
+CREATE OR REPLACE FUNCTION ST_Pyramids()
 RETURNS TABLE (
     name         text,
     source_table text,
@@ -52,5 +52,5 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION "ST_Pyramids"() IS
+COMMENT ON FUNCTION ST_Pyramids() IS
     'List every registered pyramid with its materialized tile count.';

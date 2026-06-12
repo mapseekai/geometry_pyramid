@@ -8,7 +8,7 @@ use pgrx::prelude::*;
 ///
 /// Returns the MVT-encoded tile for the given pyramid at zoom `z`, column
 /// `x`, row `y`. Returns NULL for empty/sparse cells or unknown pyramids.
-#[pg_extern(name = "ST_Tile")]
+#[pg_extern(name = "st_tile")]
 fn st_tile(
     name: &str,
     z: i32,

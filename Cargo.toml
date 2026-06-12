@@ -10,6 +10,10 @@ readme = "README.md"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "pgrx_embed_geometry_pyramid"
+path = "./src/bin/pgrx_embed.rs"
+
 [features]
 default = ["pg16"]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
