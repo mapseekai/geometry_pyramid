@@ -72,48 +72,57 @@ CREATE TABLE geometry_pyramid_stats (
 
 ## 阶段 3:并行构建
 
-### 任务表
+> **修订(2026-06-12,计划阶段发现)**:原设计的"任务表 + SKIP LOCKED 认领"不可行——
+> `ST_BuildPyramid` 是 SQL 函数,协调者事务未提交,其创建的影子表与任务行对独立会话的
+> bgworker 不可见(MVCC)。修订为:控制面走 spec/status **文件**(不受 MVCC 约束),
+> 并行时影子表由自治 DDL worker 创建并提交,任务采用静态轮转分配。架构不变
+> (动态 bgworker、影子表、按 zoom 串行)。不再需要 `geometry_pyramid_jobs` 表。
 
-```sql
-CREATE UNLOGGED TABLE geometry_pyramid_jobs (
-    job_id       bigserial PRIMARY KEY,
-    pyramid_name text     NOT NULL,
-    z            smallint NOT NULL,
-    xmin_t integer NOT NULL, ymin_t integer NOT NULL,
-    xmax_t integer NOT NULL, ymax_t integer NOT NULL,
-    -- 当轮 knobs 快照(预算重试每轮可能收紧)
-    simplify_tol_m float8 NOT NULL,
-    min_area_m2    float8 NOT NULL,
-    min_len_m      float8 NOT NULL,
-    drop_threshold float8 NOT NULL,
-    status       text NOT NULL DEFAULT 'pending',  -- pending|running|done|error
-    error        text,
-    claimed_by   integer
-);
-```
+### 控制面:spec / status 文件
 
-unlogged:任务是临时数据,崩溃后由协调者重发,省 WAL。
+- 协调者把任务规格写到 `$PGDATA/gp_tmp/gp_<pid>_<idx>.json`:db OID、源表/列、
+  `PyramidConfig`、当轮 knobs 快照、该 worker 的条带列表(`Vec<TileRect>`)。
+- `bgw_extra`(128 字节)只携带**文件名**;worker 自行用 `DataDir` 拼出全路径。
+- worker 结束时写 `<spec>.done` 或 `<spec>.err`(错误文本);硬崩溃时两者皆无,
+  协调者通过 worker handle 检测到退出 → 按"worker exited without status"处理。
+- 协调者负责清理本轮文件;残留文件无害(目录下次构建可整理)。
+
+### 影子表可见性
+
+- `parallel=1`:协调者在自己事务内建影子表(对外不可见也无需可见),与现状路径等价。
+- `parallel>1`:协调者先 spawn 一个 **ExecSql worker** 自治执行
+  `DROP TABLE IF EXISTS 影子表; CREATE TABLE 影子表 (...)` 并提交 → 影子表全局可见。
+  构建 worker 各自提交写入;协调者(读已提交)在后续语句中能看到这些行;
+  最终 swap 仍在协调者事务内执行(对已提交影子表做 DROP 主表 + RENAME)。
+- 失败残留:协调者事务中止时,workers 已提交的影子表会留存——由下次构建
+  `create` 的 `DROP IF EXISTS` 与 `ST_DropPyramid`(同时清影子表)兜底。
 
 ### 协调流程(按 zoom 串行、zoom 内并行)
 
 预算重试以 zoom 为单位(所有切片完成后才能检查 `MAX(octet_length)`),故 zoom 间保持串行:
 
-1. 该 zoom 的瓦片矩形按 x 切成 `4×K` 个条带(4 倍粒度做负载均衡;条带数不足则退化)。
-2. `K = min(cfg.parallel, 可用 worker 余量) - 1`;`K≤0` 或 `parallel=1` 时**完全跳过任务表**,协调者自己跑(与现状等价)。
-3. 写任务行 → `RegisterDynamicBackgroundWorker` 拉起 K 个 worker;协调者自身也消费任务(共 K+1 个消费者)。
-4. 协调者消费完后轮询任务表至全部 `done`/`error`;新配置键 `buildTimeoutMs`(默认 0 = 不限)控制等待上限。
-5. 任一 `error` → 等其余任务结束 → `abandon` 影子表 → 错误上抛。
-6. zoom 完成后协调者做预算检查与统计写入;重试时清空该 zoom 影子表数据并以收紧后的 knobs 重发任务。
+1. 该 zoom 的瓦片矩形按 x 切成 `4×(K+1)` 个条带(粒度倍数做负载均衡;条带数不足则退化)。
+2. `K = cfg.parallel - 1`;`K≤0` 时不拉 worker,协调者自己跑全部条带(与现状等价)。
+3. 条带按轮转静态分配:slot 0 归协调者(在自己事务内跑),slot 1..K 各写一个 spec
+   文件并 `load_dynamic()` 拉起 worker。
+4. 协调者跑完自己的条带后,轮询 status 文件 + worker handle 直到全部完成;
+   新配置键 `buildTimeoutMs`(默认 0 = 不限)控制等待上限。
+5. 任一 `.err` / 异常退出 → 错误上抛(主表无损;影子残留由兜底清理)。
+6. zoom 完成后协调者做预算检查与统计写入;重试时清空该 zoom 影子表数据并以
+   收紧后的 knobs 重发任务。
 
 ### worker(`worker.rs`)
 
-- `main_arg` 仅携带 database OID(bgworker 只能传一个 Datum);worker 连库后自主认领任务。
-- 认领:`UPDATE ... SET status='running', claimed_by=pg_backend_pid() WHERE job_id = (SELECT ... WHERE status='pending' LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING ...`;无任务即退出。
-- 每任务一个事务:认领 + `build_zoom_level(影子表, TileRect, knobs)` + 标记 `done` 同事务提交;worker 崩溃则回滚回 `pending`,可被重新认领。
+- 单一入口 `gp_worker_main`,spec 的 `mode` 区分 `ExecSql {sql}`(自治 DDL)与
+  `BuildStrips {…}`(条带构建)。
+- `BuildStrips`:每条带一个事务(`BackgroundWorker::transaction`)调用与串行路径
+  **同一个** `build_zoom_level`;全部完成写 `.done`,捕获到错误写 `.err`。
+- 连接:`BackgroundWorkerInitializeConnectionByOid(spec.db_oid)`。
 
 ### 退化语义
 
-- worker 注册失败(`max_worker_processes` 耗尽)→ notice 提示并降级为协调者全跑,**构建照常完成**。并行是尽力而为,不是正确性依赖。
+- `load_dynamic()` 注册失败(`max_worker_processes` 耗尽)→ notice 提示,该 slot 的
+  条带由协调者顺序执行,**构建照常完成**。并行是尽力而为,不是正确性依赖。
 - 影子表保证:无论 worker 提交了多少切片,主表在 swap 前不受影响。
 
 ## 阶段 4:增量更新
@@ -155,6 +164,5 @@ unlogged:任务是临时数据,崩溃后由协调者重发,省 WAL。
 | 项 | 类型 | 说明 |
 |---|---|---|
 | `geometry_pyramid_stats` 表 | 新增表 | 每 zoom 构建统计 |
-| `geometry_pyramid_jobs` 表 | 新增表(unlogged) | 并行任务队列 |
 | `ST_Pyramid().stats` | 新增输出字段 | 统计数组 |
 | `buildTimeoutMs` | 新增配置键 | 并行等待上限,默认 0(不限) |
