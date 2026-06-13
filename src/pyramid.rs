@@ -87,12 +87,22 @@ fn st_drop_pyramid(
 /// `ST_UpdatePyramid(name, where_clause) -> bool`
 ///
 /// Re-builds the pyramid identified by `name` using its previously
-/// registered configuration. `where_clause` is currently ignored — full
-/// rebuilds only — and is reserved for an incremental refresh path.
+/// registered configuration.
+///
+/// When `where_clause` is empty, performs a full rebuild (shadow-swap,
+/// exactly as `ST_BuildPyramid`).
+///
+/// When `where_clause` is non-empty, performs an **incremental** refresh:
+/// computes the bounding box of all source rows matching the clause,
+/// derives the dirty tile rectangle per zoom, DELETEs those tiles from
+/// the main tile table and rebuilds just them in place — all within the
+/// caller's transaction (failure rolls back; the pyramid is never
+/// left half-updated). This follows the Ganos trust model: the caller
+/// holds source-table privileges and the clause is executed as their SQL.
 #[pg_extern(name = "st_updatepyramid")]
 fn st_update_pyramid(
     name: &str,
-    _where_clause: &str,
+    where_clause: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     validate_identifier(name)?;
 
@@ -115,16 +125,35 @@ fn st_update_pyramid(
     let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
     let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
 
-    let total = build::build(name, &source_table, &geom_column, &fid_column, &cfg)?;
+    let total = if where_clause.trim().is_empty() {
+        build::build(name, &source_table, &geom_column, &fid_column, &cfg)?
+    } else {
+        crate::incremental::update(
+            name,
+            &source_table,
+            &geom_column,
+            &fid_column,
+            &cfg,
+            where_clause,
+        )?
+    };
     Spi::run_with_args(
         "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
         &[name.into()],
     )?;
-    notice!(
-        "geometry_pyramid: pyramid '{}' refreshed ({} tiles)",
-        name,
-        total
-    );
+    if where_clause.trim().is_empty() {
+        notice!(
+            "geometry_pyramid: pyramid '{}' refreshed ({} tiles)",
+            name,
+            total
+        );
+    } else {
+        notice!(
+            "geometry_pyramid: pyramid '{}' incrementally refreshed ({} tiles)",
+            name,
+            total
+        );
+    }
     Ok(true)
 }
 

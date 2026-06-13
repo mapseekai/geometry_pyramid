@@ -10,6 +10,7 @@ use pgrx::prelude::*;
 
 mod build;
 mod config;
+mod incremental;
 mod pyramid;
 mod shadow;
 mod stats;
@@ -332,6 +333,72 @@ mod tests {
         // exec_sql_autonomous above handles cleanup with "DROP TABLE IF EXISTS".
         // The test-database itself is torn down after each `cargo pgrx test` run,
         // so the table never accumulates stale data across test invocations.
+    }
+
+    /// Incremental update must touch only the dirty tiles, no-op on an empty
+    /// match, and reject a broken where_clause without damaging the pyramid.
+    #[pg_test]
+    fn incremental_update_rebuilds_only_dirty_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_inc (gid serial PRIMARY KEY, \
+             geom geometry(Point, 4326), touched bool DEFAULT false)",
+        )
+        .unwrap();
+        // Two points far apart: eastern (+100,+30) and western (-100,-30)
+        // hemispheres — they land in different tiles at higher zoom.
+        Spi::run(
+            "INSERT INTO _gp_inc (geom) VALUES \
+             (ST_SetSRID(ST_MakePoint(100, 30), 4326)), \
+             (ST_SetSRID(ST_MakePoint(-100, -30), 4326))",
+        )
+        .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_inc','geom','gid','{\"minZoom\":0,\"maxZoom\":6}')",
+        )
+        .unwrap();
+
+        // Snapshot every tile.
+        Spi::run("CREATE TEMP TABLE _snap AS SELECT z, x, y, mvt FROM _gp_tiles__gp_inc")
+            .unwrap();
+
+        // Move the eastern point (stays eastern), mark touched.
+        Spi::run(
+            "UPDATE _gp_inc SET geom = ST_SetSRID(ST_MakePoint(101, 31), 4326), \
+             touched = true WHERE gid = 1",
+        )
+        .unwrap();
+        let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('_gp_inc', 'touched = true')")
+            .unwrap();
+        assert_eq!(ok, Some(true));
+
+        // Western tiles (x in the western half) must be byte-unchanged.
+        let west_changed = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _snap s \
+             JOIN _gp_tiles__gp_inc t USING (z, x, y) \
+             WHERE s.x < (1 << s.z) / 2 AND s.mvt IS DISTINCT FROM t.mvt",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(west_changed, 0, "western tiles must be untouched by an eastern-only update");
+
+        // Empty match → no-op, returns true.
+        let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('_gp_inc', 'false')").unwrap();
+        assert_eq!(ok, Some(true));
+
+        // Broken where_clause → clean error, pyramid intact.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM ST_UpdatePyramid('_gp_inc', 'no_such_column = 1'); \
+               RAISE EXCEPTION 'should have failed'; \
+             EXCEPTION WHEN undefined_column THEN NULL; END $$",
+        )
+        .unwrap();
+        let tile = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_inc', 0, 0, 0)").unwrap();
+        assert!(tile.is_some(), "pyramid must survive a bad where_clause");
+
+        Spi::run("SELECT ST_DropPyramid('_gp_inc')").unwrap();
+        Spi::run("DROP TABLE _gp_inc").unwrap();
     }
 }
 
