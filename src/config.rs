@@ -102,6 +102,11 @@ pub struct PyramidConfig {
     /// round. 0 = wait indefinitely.
     #[serde(default, rename = "buildTimeoutMs")]
     pub build_timeout_ms: i64,
+
+    /// When a requested tile has z > maxZoom, slice it live from the source
+    /// table instead of returning NULL. Default true (mirrors Ganos maxLevel).
+    #[serde(default = "default_dynamic_beyond_max_zoom", rename = "dynamicBeyondMaxZoom")]
+    pub dynamic_beyond_max_zoom: bool,
 }
 
 impl PyramidConfig {
@@ -161,6 +166,7 @@ impl Default for PyramidConfig {
             tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
             max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
             build_timeout_ms: 0,
+            dynamic_beyond_max_zoom: true,
         }
     }
 }
@@ -212,6 +218,9 @@ fn default_tile_size_budget_bytes() -> i64 {
 }
 fn default_max_tile_size_attempts() -> u32 {
     DEFAULT_MAX_TILE_SIZE_ATTEMPTS
+}
+fn default_dynamic_beyond_max_zoom() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -273,5 +282,13 @@ mod tests {
         let (a, l) = cfg.min_size_thresholds_m(12);
         assert_eq!(a, 0.0);
         assert_eq!(l, 0.0);
+    }
+
+    #[test]
+    fn dynamic_beyond_max_zoom_defaults_true_and_parses() {
+        let def = PyramidConfig::default();
+        assert!(def.dynamic_beyond_max_zoom);
+        let off = PyramidConfig::parse(r#"{"dynamicBeyondMaxZoom":false}"#).unwrap();
+        assert!(!off.dynamic_beyond_max_zoom);
     }
 }
