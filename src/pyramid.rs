@@ -139,6 +139,14 @@ fn st_update_pyramid(
     let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
     let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
 
+    // Re-validate catalog-sourced identifiers before they ride into dynamic
+    // SQL. They were validated at ST_BuildPyramid time, but the catalog is a
+    // plain table with no integrity trigger — defense-in-depth, matching the
+    // validation ST_BuildPyramid applies to the same three values.
+    validate_identifier(&source_table)?;
+    validate_identifier(&geom_column)?;
+    validate_identifier(&fid_column)?;
+
     let total = if where_clause.trim().is_empty() {
         build::build(name, &source_table, &geom_column, &fid_column, &cfg)?
     } else {
