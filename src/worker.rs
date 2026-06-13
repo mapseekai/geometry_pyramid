@@ -132,3 +132,151 @@ mod tests {
         assert!(name.len() < 127);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Background-worker runtime (entry point + helpers)
+// ---------------------------------------------------------------------------
+
+use pgrx::bgworkers::{
+    BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
+};
+use std::time::Duration;
+
+/// Entry point for dynamic background workers. bgw_extra carries the spec
+/// FILENAME; the worker derives the directory from its own DataDir.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
+    let filename = BackgroundWorker::get_extra().to_string();
+    let path = spec_dir().join(&filename);
+
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    let spec: WorkerSpec = match std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::write(path.with_extension("err"), format!("bad spec: {e}"));
+            return;
+        }
+    };
+
+    BackgroundWorker::connect_worker_to_spi_by_oid(
+        Some(pg_sys::Oid::from(spec.db_oid)),
+        None,
+    );
+
+    match run_spec(&spec) {
+        Ok(()) => {
+            let _ = std::fs::write(path.with_extension("done"), b"ok");
+        }
+        Err(e) => {
+            let _ = std::fs::write(path.with_extension("err"), e.to_string());
+        }
+    }
+}
+
+fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match &spec.mode {
+        WorkerMode::ExecSql { sql } => {
+            let result: Result<(), pgrx::spi::Error> =
+                BackgroundWorker::transaction(|| pgrx::Spi::run(sql));
+            result?;
+            Ok(())
+        }
+        WorkerMode::BuildStrips {
+            pyramid_name,
+            storage_table,
+            source_table,
+            geom_column,
+            fid_column,
+            config,
+            knobs,
+            strips,
+        } => {
+            let k = crate::build::ZoomKnobs::from_values(*knobs);
+            for rect in strips {
+                let result: Result<i64, pgrx::spi::Error> =
+                    BackgroundWorker::transaction(|| {
+                        crate::build::build_zoom_level(
+                            pyramid_name,
+                            storage_table,
+                            source_table,
+                            geom_column,
+                            fid_column,
+                            config,
+                            rect,
+                            &k,
+                        )
+                    });
+                result?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Spawn one dynamic worker for an already-written spec file. Returns the
+/// handle, or Err when no worker slot is available (caller degrades to
+/// inline execution).
+pub(crate) fn spawn(
+    filename: &str,
+) -> Result<DynamicBackgroundWorker, Box<dyn std::error::Error + Send + Sync>> {
+    BackgroundWorkerBuilder::new("geometry_pyramid worker")
+        .set_function("gp_worker_main")
+        .set_library("geometry_pyramid")
+        .set_extra(filename)
+        .set_notify_pid(unsafe { pg_sys::MyProcPid })
+        .enable_spi_access()
+        .load_dynamic()
+        .map_err(|e| format!("failed to register background worker: {e:?}").into())
+}
+
+/// Run an SQL script in an autonomous transaction via a one-shot worker,
+/// waiting for completion. Used for committed shadow-table DDL.
+pub(crate) fn exec_sql_autonomous(
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, 0);
+    let spec = WorkerSpec {
+        db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
+        mode: WorkerMode::ExecSql { sql: sql.to_string() },
+    };
+    let path = write_spec(&filename, &spec)?;
+    let _handle = spawn(&filename)?;
+    let result = wait_for(std::slice::from_ref(&path), 60_000);
+    cleanup_spec(&path);
+    result
+}
+
+/// Poll status files until every spec is done, any errors out, or the
+/// timeout (ms, 0 = unbounded) elapses.
+pub(crate) fn wait_for(
+    paths: &[PathBuf],
+    timeout_ms: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
+    loop {
+        let mut pending = 0usize;
+        for p in paths {
+            let err_path = p.with_extension("err");
+            if err_path.exists() {
+                let msg = std::fs::read_to_string(&err_path).unwrap_or_default();
+                return Err(format!("worker failed: {msg}").into());
+            }
+            if !p.with_extension("done").exists() {
+                pending += 1;
+            }
+        }
+        if pending == 0 {
+            return Ok(());
+        }
+        if timeout_ms > 0 && started.elapsed().as_millis() as i64 > timeout_ms {
+            return Err(format!("timed out waiting for {pending} worker(s)").into());
+        }
+        pgrx::check_for_interrupts!();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
