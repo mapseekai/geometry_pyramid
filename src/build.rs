@@ -64,7 +64,15 @@ pub fn build(
         &[pyramid_name.into()],
     )?;
 
-    crate::shadow::create(pyramid_name)?;
+    let workers = cfg.parallel.max(1) - 1;
+    if workers == 0 {
+        // parallel=1: shadow lives in this transaction (no external worker needs to see it).
+        crate::shadow::create(pyramid_name)?;
+    } else {
+        // parallel>1: workers are independent backends, so the shadow DDL must be
+        // COMMITTED before they can see it — run it via an autonomous worker.
+        crate::worker::exec_sql_autonomous(&crate::shadow::create_sql(pyramid_name))?;
+    }
     let shadow_table = crate::shadow::shadow_table_name(pyramid_name);
 
     let total = build_into(pyramid_name, &shadow_table, table, geom_column, fid_column, cfg)?;
@@ -139,7 +147,12 @@ fn build_zoom_level_with_budget(
             )?;
         }
 
-        build_zoom_level(
+        // NOTE: budget-retry with parallel>1 may not fully reset committed worker
+        // rows across attempts (the DELETE runs in the coordinator txn and is
+        // visible to subsequent worker txns only after coordinator commit). For
+        // the default tile_size_budget_bytes=0 there are no retries, so this is
+        // a non-issue in the common path.
+        run_zoom_strips(
             pyramid_name,
             storage_table,
             table,
@@ -266,6 +279,110 @@ fn source_bbox(
     let Some(s) = row else { return Ok(None) };
     let arr: [f64; 4] = serde_json::from_str(&s)?;
     Ok(Some((arr[0], arr[1], arr[2], arr[3])))
+}
+
+/// Execute one zoom round, splitting the rectangle into x-strips and farming
+/// them to background workers when cfg.parallel > 1. Slot 0 always runs inline
+/// in the coordinator; a failed spawn degrades that slot to inline execution.
+/// Returns the total tile count for the zoom (recounted from the table so it
+/// includes rows committed by workers).
+#[allow(clippy::too_many_arguments)]
+fn run_zoom_strips(
+    pyramid_name: &str,
+    storage_table: &str,
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let workers = cfg.parallel.max(1) - 1;
+    if workers == 0 {
+        build_zoom_level(
+            pyramid_name,
+            storage_table,
+            table,
+            geom_column,
+            fid_column,
+            cfg,
+            rect,
+            knobs,
+        )?;
+        return Ok(inserted_count(storage_table, rect.z)?);
+    }
+
+    let strips = rect.split_x(4 * (workers + 1));
+    let slots = (workers as usize + 1).min(strips.len());
+
+    let mut spec_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut handles: Vec<pgrx::bgworkers::DynamicBackgroundWorker> = Vec::new();
+    let mut inline_strips: Vec<TileRect> = Vec::new();
+
+    for slot in 0..slots {
+        let chunk: Vec<TileRect> = strips.iter().copied().skip(slot).step_by(slots).collect();
+        if slot == 0 {
+            inline_strips = chunk;
+            continue;
+        }
+        let filename = crate::worker::spec_filename(
+            unsafe { pg_sys::MyProcPid } as u32,
+            slot as u32,
+        );
+        let spec = crate::worker::WorkerSpec {
+            db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
+            mode: crate::worker::WorkerMode::BuildStrips {
+                pyramid_name: pyramid_name.to_string(),
+                storage_table: storage_table.to_string(),
+                source_table: table.to_string(),
+                geom_column: geom_column.to_string(),
+                fid_column: fid_column.to_string(),
+                config: cfg.clone(),
+                knobs: knobs.to_values(),
+                strips: chunk.clone(),
+            },
+        };
+        let path = crate::worker::write_spec(&filename, &spec)?;
+        match crate::worker::spawn(&filename) {
+            Ok(handle) => {
+                spec_paths.push(path);
+                handles.push(handle);
+            }
+            Err(e) => {
+                notice!(
+                    "geometry_pyramid: worker slot {} unavailable ({}); running inline",
+                    slot,
+                    e
+                );
+                crate::worker::cleanup_spec(&path);
+                inline_strips.extend(chunk);
+            }
+        }
+    }
+
+    // Coordinator builds its own share while workers run.
+    for strip in &inline_strips {
+        build_zoom_level(
+            pyramid_name,
+            storage_table,
+            table,
+            geom_column,
+            fid_column,
+            cfg,
+            strip,
+            knobs,
+        )?;
+    }
+
+    let wait_result = crate::worker::wait_for(&spec_paths, cfg.build_timeout_ms);
+    for p in &spec_paths {
+        crate::worker::cleanup_spec(p);
+    }
+    // Keep worker handles alive until after wait_for; drop them now.
+    drop(handles);
+    wait_result?;
+
+    Ok(inserted_count(storage_table, rect.z)?)
 }
 
 pub(crate) fn build_zoom_level(
