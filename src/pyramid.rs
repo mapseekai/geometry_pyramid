@@ -131,6 +131,11 @@ fn st_update_pyramid(
 /// tile count.
 #[pg_extern(name = "st_pyramid")]
 fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
+    // An invalid identifier can never name a real pyramid, and guards the
+    // dynamic count(*) query below against SQL identifier injection.
+    if validate_identifier(name).is_err() {
+        return Ok(None);
+    }
     let storage_table = storage::tile_table_name(name);
     let tile_count = Spi::get_one::<i64>(&format!(
         r#"SELECT count(*)::bigint FROM "{storage_table}""#
