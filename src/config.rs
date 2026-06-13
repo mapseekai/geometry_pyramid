@@ -97,6 +97,11 @@ pub struct PyramidConfig {
     /// gives up and emits whatever it has after this many attempts.
     #[serde(default = "default_max_tile_size_attempts", rename = "maxTileSizeAttempts")]
     pub max_tile_size_attempts: u32,
+
+    /// Upper bound (ms) the coordinator waits for parallel workers per zoom
+    /// round. 0 = wait indefinitely.
+    #[serde(default, rename = "buildTimeoutMs")]
+    pub build_timeout_ms: i64,
 }
 
 impl PyramidConfig {
@@ -155,6 +160,7 @@ impl Default for PyramidConfig {
             drop_rate: DEFAULT_DROP_RATE,
             tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
             max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
+            build_timeout_ms: 0,
         }
     }
 }

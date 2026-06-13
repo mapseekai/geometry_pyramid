@@ -194,7 +194,7 @@ fn build_zoom_level_with_budget(
 /// Per-zoom tunable thresholds. Decoupled from `PyramidConfig` so the
 /// budget retry loop can ratchet them per attempt without mutating cfg.
 #[derive(Clone, Copy, Debug)]
-struct ZoomKnobs {
+pub(crate) struct ZoomKnobs {
     simplify_tol_m: f64,
     min_area_m2: f64,
     min_len_m: f64,
@@ -202,7 +202,7 @@ struct ZoomKnobs {
 }
 
 impl ZoomKnobs {
-    fn from_config(cfg: &PyramidConfig, z: u8) -> Self {
+    pub(crate) fn from_config(cfg: &PyramidConfig, z: u8) -> Self {
         let (a, l) = cfg.min_size_thresholds_m(z);
         Self {
             simplify_tol_m: cfg.simplify_tol_m(z),
@@ -220,6 +220,24 @@ impl ZoomKnobs {
         self.min_len_m = self.min_len_m.max(pixel_m) * factor;
         self.min_area_m2 = self.min_len_m * self.min_len_m;
         self.drop_threshold = (self.drop_threshold / factor).clamp(0.0, 1.0);
+    }
+
+    pub(crate) fn to_values(self) -> crate::worker::KnobValues {
+        crate::worker::KnobValues {
+            simplify_tol_m: self.simplify_tol_m,
+            min_area_m2: self.min_area_m2,
+            min_len_m: self.min_len_m,
+            drop_threshold: self.drop_threshold,
+        }
+    }
+
+    pub(crate) fn from_values(v: crate::worker::KnobValues) -> Self {
+        Self {
+            simplify_tol_m: v.simplify_tol_m,
+            min_area_m2: v.min_area_m2,
+            min_len_m: v.min_len_m,
+            drop_threshold: v.drop_threshold,
+        }
     }
 }
 
@@ -250,7 +268,7 @@ fn source_bbox(
     Ok(Some((arr[0], arr[1], arr[2], arr[3])))
 }
 
-fn build_zoom_level(
+pub(crate) fn build_zoom_level(
     pyramid_name: &str,
     storage_table: &str,
     table: &str,

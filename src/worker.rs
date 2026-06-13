@@ -1,0 +1,123 @@
+//! Background-worker control plane. Specs and completion status travel
+//! through files under $PGDATA/gp_tmp/ because the coordinator's
+//! transaction is uncommitted — its catalog rows and job rows would be
+//! invisible to workers under MVCC; files are not.
+
+use crate::config::PyramidConfig;
+use crate::tile_rect::TileRect;
+use pgrx::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize)]
+pub struct WorkerSpec {
+    pub db_oid: u32,
+    pub mode: WorkerMode,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum WorkerMode {
+    /// Execute one SQL script in an autonomous (separately committed)
+    /// transaction. Used to create the shadow table for parallel builds.
+    ExecSql { sql: String },
+    /// Build tile strips into `storage_table` using the shared
+    /// build_zoom_level pipeline, one transaction per strip.
+    BuildStrips {
+        pyramid_name: String,
+        storage_table: String,
+        source_table: String,
+        geom_column: String,
+        fid_column: String,
+        config: PyramidConfig,
+        knobs: KnobValues,
+        strips: Vec<TileRect>,
+    },
+}
+
+/// Serializable snapshot of build.rs's ZoomKnobs (the budget-retry loop
+/// tightens these per attempt, so they ride along with each round's spec).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct KnobValues {
+    pub simplify_tol_m: f64,
+    pub min_area_m2: f64,
+    pub min_len_m: f64,
+    pub drop_threshold: f64,
+}
+
+pub fn spec_filename(backend_pid: u32, idx: u32) -> String {
+    format!("gp_{backend_pid}_{idx}.json")
+}
+
+/// $PGDATA/gp_tmp — created on demand.
+pub fn spec_dir() -> PathBuf {
+    let datadir = unsafe {
+        std::ffi::CStr::from_ptr(pg_sys::DataDir as *const _)
+            .to_string_lossy()
+            .into_owned()
+    };
+    PathBuf::from(datadir).join("gp_tmp")
+}
+
+pub fn write_spec(
+    filename: &str,
+    spec: &WorkerSpec,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = spec_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(filename);
+    let _ = std::fs::remove_file(path.with_extension("done"));
+    let _ = std::fs::remove_file(path.with_extension("err"));
+    std::fs::write(&path, serde_json::to_vec(spec)?)?;
+    Ok(path)
+}
+
+pub fn cleanup_spec(path: &PathBuf) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("done"));
+    let _ = std::fs::remove_file(path.with_extension("err"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PyramidConfig;
+    use crate::tile_rect::TileRect;
+
+    #[test]
+    fn spec_roundtrips_through_json() {
+        let spec = WorkerSpec {
+            db_oid: 16384,
+            mode: WorkerMode::BuildStrips {
+                pyramid_name: "p".into(),
+                storage_table: "_gp_tiles_p__shadow".into(),
+                source_table: "src".into(),
+                geom_column: "geom".into(),
+                fid_column: "gid".into(),
+                config: PyramidConfig::default(),
+                knobs: KnobValues {
+                    simplify_tol_m: 1.0,
+                    min_area_m2: 2.0,
+                    min_len_m: 3.0,
+                    drop_threshold: 0.4,
+                },
+                strips: vec![TileRect { z: 3, xmin: 0, ymin: 0, xmax: 1, ymax: 7 }],
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: WorkerSpec = serde_json::from_str(&json).unwrap();
+        let WorkerMode::BuildStrips { strips, knobs, .. } = back.mode else {
+            panic!("wrong mode");
+        };
+        assert_eq!(back.db_oid, 16384);
+        assert_eq!(strips.len(), 1);
+        assert_eq!(strips[0].z, 3);
+        assert!((knobs.drop_threshold - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spec_filename_fits_bgw_extra() {
+        // bgw_extra is 128 bytes including NUL.
+        let name = spec_filename(u32::MAX, u32::MAX);
+        assert!(name.len() < 127);
+    }
+}

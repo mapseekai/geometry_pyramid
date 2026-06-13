@@ -16,6 +16,7 @@ mod stats;
 mod storage;
 mod tile;
 mod tile_rect;
+mod worker;
 
 extension_sql_file!("../sql/bootstrap.sql", bootstrap);
 

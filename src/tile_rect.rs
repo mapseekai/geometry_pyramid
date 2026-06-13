@@ -5,7 +5,7 @@
 pub const WEBMERC_HALF_EXTENT: f64 = 20_037_508.342_789_244;
 
 /// Inclusive tile-index rectangle at a fixed zoom.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TileRect {
     pub z: u8,
     pub xmin: i64,
