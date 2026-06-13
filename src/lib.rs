@@ -10,6 +10,7 @@ use pgrx::prelude::*;
 
 mod build;
 mod config;
+mod dynamic;
 mod incremental;
 mod pyramid;
 mod shadow;
