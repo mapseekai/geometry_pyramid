@@ -400,6 +400,82 @@ fn run_zoom_strips(
     Ok(inserted_count(storage_table, rect.z)?)
 }
 
+/// Attribute projection fragments for the feature pipeline: (inner, outer).
+/// Column names are revalidated defensively because they ride into dynamic SQL.
+pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
+    let mut inner = String::new();
+    let mut outer = String::new();
+    for col in &cfg.attributes {
+        if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
+        outer.push_str(&format!(r#", prep."{col}""#));
+    }
+    (inner, outer)
+}
+
+/// The shared `FROM … features` block of the MVT pipeline: a 2-D tile grid
+/// (`generate_series`, params $4..$7) joined to the per-tile feature pipeline
+/// (projection, per-zoom simplification, min-size + point-drop filters,
+/// `ST_AsMVTGeom`). References params $1,$3,$8,$9,$10,$11..$14 and tile coords
+/// t.x/t.y — never $2 (layer name) and no GROUP BY. Both the multi-tile build
+/// INSERT and the single-tile dynamic SELECT wrap this with
+/// `ST_AsMVT(features.*, $2, $3, 'geom','fid')` + `GROUP BY t.x, t.y`.
+/// A single tile is just the degenerate range xmin=xmax / ymin=ymax.
+pub(crate) fn tile_pipeline_from_sql(
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    attrs_inner: &str,
+    attrs_outer: &str,
+) -> String {
+    format!(
+        r#"FROM generate_series($4::int, $5::int) AS xs(x)
+           CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
+           CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
+           CROSS JOIN LATERAL (
+              SELECT
+                 ST_AsMVTGeom(prep.gtile,
+                              ST_TileEnvelope($1, t.x, t.y),
+                              $3, $9, true) AS geom,
+                 prep.fid
+                 {attrs_outer}
+              FROM (
+                 SELECT
+                    CASE
+                       WHEN $11::float8 > 0
+                            AND GeometryType(src."{geom_column}") NOT IN ('POINT','MULTIPOINT')
+                          THEN ST_SimplifyPreserveTopology(
+                                 ST_Transform(src."{geom_column}", $8),
+                                 $11::float8)
+                       ELSE ST_Transform(src."{geom_column}", $8)
+                    END AS gtile,
+                    src."{fid_column}"::bigint AS fid
+                    {attrs_inner}
+                 FROM "{table}" src
+                 WHERE src."{geom_column}" IS NOT NULL
+                   AND ST_Intersects(
+                          src."{geom_column}",
+                          ST_Transform(ST_TileEnvelope($1, t.x, t.y), $10)
+                       )
+              ) prep
+              WHERE
+                 ($12::float8 <= 0
+                  OR GeometryType(prep.gtile) NOT IN ('POLYGON','MULTIPOLYGON')
+                  OR ST_Area(prep.gtile) >= $12::float8)
+                 AND ($13::float8 <= 0
+                      OR GeometryType(prep.gtile) NOT IN ('LINESTRING','MULTILINESTRING')
+                      OR ST_Length(prep.gtile) >= $13::float8)
+                 AND ($14::float8 >= 1.0
+                      OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
+                      OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
+                         / 1000000.0 < $14::float8)
+           ) features
+           WHERE features.geom IS NOT NULL"#
+    )
+}
+
 pub(crate) fn build_zoom_level(
     pyramid_name: &str,
     storage_table: &str,
@@ -420,68 +496,13 @@ pub(crate) fn build_zoom_level(
     let min_len_m = knobs.min_len_m;
     let drop_threshold = knobs.drop_threshold;
 
-    // Attribute projection — column names are revalidated defensively here
-    // because they ride along into the dynamic SQL string.
-    let mut attrs_inner = String::new();
-    let mut attrs_outer = String::new();
-    for col in &cfg.attributes {
-        if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        attrs_inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
-        attrs_outer.push_str(&format!(r#", prep."{col}""#));
-    }
+    let (attrs_inner, attrs_outer) = attribute_projections(cfg);
 
+    let pipeline = tile_pipeline_from_sql(table, geom_column, fid_column, &attrs_inner, &attrs_outer);
     let sql = format!(
         r#"INSERT INTO "{storage_table}" (z, x, y, mvt)
-           SELECT $1::smallint, t.x, t.y,
-                  ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
-           FROM generate_series($4::int, $5::int) AS xs(x)
-           CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
-           CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
-           CROSS JOIN LATERAL (
-              SELECT
-                 ST_AsMVTGeom(prep.gtile,
-                              ST_TileEnvelope($1, t.x, t.y),
-                              $3, $9, true) AS geom,
-                 prep.fid
-                 {attrs_outer}
-              FROM (
-                 SELECT
-                    -- Per-zoom simplification (skip points; they have no edges).
-                    CASE
-                       WHEN $11::float8 > 0
-                            AND GeometryType(src."{geom_column}") NOT IN ('POINT','MULTIPOINT')
-                          THEN ST_SimplifyPreserveTopology(
-                                 ST_Transform(src."{geom_column}", $8),
-                                 $11::float8)
-                       ELSE ST_Transform(src."{geom_column}", $8)
-                    END AS gtile,
-                    src."{fid_column}"::bigint AS fid
-                    {attrs_inner}
-                 FROM "{table}" src
-                 WHERE src."{geom_column}" IS NOT NULL
-                   AND ST_Intersects(
-                          src."{geom_column}",
-                          ST_Transform(ST_TileEnvelope($1, t.x, t.y), $10)
-                       )
-              ) prep
-              WHERE
-                 -- Polygon area cutoff (only applied when threshold > 0).
-                 ($12::float8 <= 0
-                  OR GeometryType(prep.gtile) NOT IN ('POLYGON','MULTIPOLYGON')
-                  OR ST_Area(prep.gtile) >= $12::float8)
-                 -- Line length cutoff (only applied when threshold > 0).
-                 AND ($13::float8 <= 0
-                      OR GeometryType(prep.gtile) NOT IN ('LINESTRING','MULTILINESTRING')
-                      OR ST_Length(prep.gtile) >= $13::float8)
-                 -- Tippecanoe-style deterministic point dropping.
-                 AND ($14::float8 >= 1.0
-                      OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
-                      OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
-                         / 1000000.0 < $14::float8)
-           ) features
-           WHERE features.geom IS NOT NULL
+           SELECT $1::smallint, t.x, t.y, ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
+           {pipeline}
            GROUP BY t.x, t.y
            HAVING ST_AsMVT(features.*, $2, $3, 'geom', 'fid') IS NOT NULL"#
     );
