@@ -2,6 +2,13 @@
 //! atomically swapped into place, so readers never observe a half-built
 //! pyramid. With parallel > 1 the shadow is created by an autonomous
 //! worker (committed DDL) so background workers can see it.
+//!
+//! # Safety contract
+//! Every `pyramid_name` argument **must** have been validated by
+//! [`crate::pyramid::validate_identifier`] before being passed to any
+//! function in this module. The DDL strings are built with double-quoted
+//! identifiers, which is injection-safe only because `validate_identifier`
+//! excludes the double-quote character (it allows `[A-Za-z0-9_]` only).
 
 use crate::storage;
 use pgrx::prelude::*;
@@ -13,18 +20,14 @@ pub fn shadow_table_name(pyramid_name: &str) -> String {
 }
 
 /// SQL that (re)creates the shadow table. Factored out so the parallel
-/// path can hand the same DDL to an autonomous ExecSql worker.
+/// path can hand the same DDL to an autonomous ExecSql worker. The CREATE
+/// body comes from [`storage::tile_table_create_sql`] so the shadow schema
+/// can never drift from the main tile table.
 pub fn create_sql(pyramid_name: &str) -> String {
     let table = shadow_table_name(pyramid_name);
     format!(
-        r#"DROP TABLE IF EXISTS "{table}";
-           CREATE TABLE "{table}" (
-               z smallint NOT NULL,
-               x integer  NOT NULL,
-               y integer  NOT NULL,
-               mvt bytea  NOT NULL,
-               PRIMARY KEY (z, x, y)
-           )"#
+        r#"DROP TABLE IF EXISTS "{table}"; {}"#,
+        storage::tile_table_create_sql(&table)
     )
 }
 

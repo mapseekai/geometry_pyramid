@@ -11,6 +11,22 @@ pub fn tile_table_name(pyramid_name: &str) -> String {
     format!("{TILE_TABLE_PREFIX}{pyramid_name}")
 }
 
+/// `CREATE TABLE` DDL for a tile table named `table`. Single source of the
+/// tile-table schema, shared by the main-table and shadow-table paths so the
+/// two can never drift. `table` must be a validated identifier (callers pass
+/// names that passed `validate_identifier`).
+pub fn tile_table_create_sql(table: &str) -> String {
+    format!(
+        r#"CREATE TABLE "{table}" (
+            z smallint NOT NULL,
+            x integer  NOT NULL,
+            y integer  NOT NULL,
+            mvt bytea  NOT NULL,
+            PRIMARY KEY (z, x, y)
+        )"#
+    )
+}
+
 /// Drop and recreate the storage table for a pyramid.
 pub fn reset_tile_table(pyramid_name: &str) -> Result<(), spi::Error> {
     let table = tile_table_name(pyramid_name);
@@ -22,15 +38,7 @@ pub fn reset_tile_table(pyramid_name: &str) -> Result<(), spi::Error> {
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
     );
     Spi::run(&format!(r#"DROP TABLE IF EXISTS "{table}""#))?;
-    Spi::run(&format!(
-        r#"CREATE TABLE "{table}" (
-            z smallint NOT NULL,
-            x integer  NOT NULL,
-            y integer  NOT NULL,
-            mvt bytea  NOT NULL,
-            PRIMARY KEY (z, x, y)
-        )"#
-    ))?;
+    Spi::run(&tile_table_create_sql(&table))?;
     Ok(())
 }
 
