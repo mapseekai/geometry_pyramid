@@ -174,13 +174,16 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
 
 /// Reject identifiers that contain anything other than letters, digits or
 /// underscores. SQL identifier injection guard for the dynamic SQL paths.
+///
+/// The 45-char cap reserves headroom for PG's 63-byte identifier limit:
+/// the longest derived name is `_gp_tiles_`(10) + name(45) + `__shadow`(8) = 63.
 pub(crate) fn validate_identifier(
     ident: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if ident.is_empty() {
         return Err("identifier must not be empty".into());
     }
-    if ident.len() > 50 {
+    if ident.len() > 45 {
         return Err(format!("identifier too long: {ident}").into());
     }
     if !ident
@@ -206,5 +209,11 @@ mod tests {
         assert!(validate_identifier("\"foo\"").is_err());
         assert!(validate_identifier("foo;DROP").is_err());
         assert!(validate_identifier("").is_err());
+    }
+
+    #[test]
+    fn rejects_identifier_longer_than_45() {
+        assert!(validate_identifier(&"a".repeat(45)).is_ok());
+        assert!(validate_identifier(&"a".repeat(46)).is_err());
     }
 }

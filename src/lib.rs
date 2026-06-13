@@ -11,6 +11,7 @@ use pgrx::prelude::*;
 mod build;
 mod config;
 mod pyramid;
+mod shadow;
 mod stats;
 mod storage;
 mod tile;
