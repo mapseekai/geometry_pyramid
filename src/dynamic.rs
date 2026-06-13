@@ -22,6 +22,13 @@ pub(crate) fn generate_tile(
     x: i32,
     y: i32,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    // Defense-in-depth: these identifiers are interpolated into dynamic SQL.
+    // Callers pass catalog values (validated at build time), but this is a
+    // pub(crate) entry point, so re-validate here rather than trust the caller.
+    crate::pyramid::validate_identifier(source_table)?;
+    crate::pyramid::validate_identifier(geom_column)?;
+    crate::pyramid::validate_identifier(fid_column)?;
+
     // Guard against a stale catalog pointing at a dropped source table:
     // to_regclass returns NULL (not an error) for a missing relation.
     let reg: Option<String> = Spi::get_one_with_args(
@@ -47,7 +54,8 @@ pub(crate) fn generate_tile(
     let sql = format!(
         r#"SELECT ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
            {pipeline}
-           GROUP BY t.x, t.y"#
+           GROUP BY t.x, t.y
+           LIMIT 1"#
     );
 
     let bytes: Option<Vec<u8>> = Spi::get_one_with_args(
