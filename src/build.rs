@@ -139,7 +139,7 @@ fn build_zoom_level_with_budget(
                 tiles,
                 total_bytes,
                 max_tile_bytes,
-                build_ms: started.elapsed().as_millis() as i64,
+                build_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
                 attempts: attempt + 1,
             });
         }
