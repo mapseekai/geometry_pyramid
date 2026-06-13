@@ -409,9 +409,9 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
     let mut inner = String::new();
     let mut outer = String::new();
     for col in &cfg.attributes {
-        if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             notice!(
-                "geometry_pyramid: attribute column {:?} has invalid characters; skipped",
+                "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
                 col
             );
             continue;

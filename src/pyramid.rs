@@ -134,9 +134,18 @@ fn st_update_pyramid(
     )?;
     let Some(json) = row else { return Ok(false) };
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
-    let source_table = parsed["source_table"].as_str().unwrap_or("").to_string();
-    let geom_column = parsed["geom_column"].as_str().unwrap_or("").to_string();
-    let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
+    let source_table = parsed["source_table"]
+        .as_str()
+        .ok_or("catalog row has NULL source_table")?
+        .to_string();
+    let geom_column = parsed["geom_column"]
+        .as_str()
+        .ok_or("catalog row has NULL geom_column")?
+        .to_string();
+    let fid_column = parsed["fid_column"]
+        .as_str()
+        .ok_or("catalog row has NULL fid_column")?
+        .to_string();
     let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
 
     // Re-validate catalog-sourced identifiers before they ride into dynamic

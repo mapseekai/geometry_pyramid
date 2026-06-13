@@ -84,8 +84,17 @@ fn st_tile(
     if !cfg.dynamic_beyond_max_zoom {
         return Ok(None);
     }
-    let source_table = parsed["source_table"].as_str().unwrap_or("").to_string();
-    let geom_column = parsed["geom_column"].as_str().unwrap_or("").to_string();
-    let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
+    let source_table = parsed["source_table"]
+        .as_str()
+        .ok_or("catalog row has NULL source_table")?
+        .to_string();
+    let geom_column = parsed["geom_column"]
+        .as_str()
+        .ok_or("catalog row has NULL geom_column")?
+        .to_string();
+    let fid_column = parsed["fid_column"]
+        .as_str()
+        .ok_or("catalog row has NULL fid_column")?
+        .to_string();
     crate::dynamic::generate_tile(name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y)
 }
