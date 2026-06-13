@@ -99,6 +99,20 @@ fn st_drop_pyramid(
 /// caller's transaction (failure rolls back; the pyramid is never
 /// left half-updated). This follows the Ganos trust model: the caller
 /// holds source-table privileges and the clause is executed as their SQL.
+///
+/// # Limitation: the clause must cover a row's OLD location
+///
+/// The dirty rectangle is the extent of rows the clause matches *now*. A row
+/// that moved across tiles, or was deleted, leaves a stale tile at its former
+/// position unless the clause also selects that region. Concretely:
+/// - **Move across tiles**: `WHERE id = 42` only cleans the new position; the
+///   old tile keeps the stale feature. Pass a clause covering both (e.g. a
+///   bbox that spans old+new), or do a full rebuild.
+/// - **Delete**: after `DELETE FROM src WHERE id = 42`, the row no longer
+///   matches any clause, so `ST_UpdatePyramid(name, 'id = 42')` matches zero
+///   rows and is a no-op — the old tile is never cleaned. Use a clause that
+///   matches by region (e.g. `ST_Intersects(geom_or_bbox, ...)` against a
+///   captured old extent), or a full rebuild.
 #[pg_extern(name = "st_updatepyramid")]
 fn st_update_pyramid(
     name: &str,
