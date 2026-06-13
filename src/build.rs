@@ -401,12 +401,19 @@ fn run_zoom_strips(
 }
 
 /// Attribute projection fragments for the feature pipeline: (inner, outer).
-/// Column names are revalidated defensively because they ride into dynamic SQL.
+/// Both are comma-prefixed (`, src."col" AS "col"` / `, prep."col"`) and may be
+/// empty; they are spliced after a fixed column list. Column names are
+/// revalidated defensively because they ride into dynamic SQL — a name failing
+/// the validation is skipped with a notice rather than silently dropped.
 pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
     let mut inner = String::new();
     let mut outer = String::new();
     for col in &cfg.attributes {
         if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            notice!(
+                "geometry_pyramid: attribute column {:?} has invalid characters; skipped",
+                col
+            );
             continue;
         }
         inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
