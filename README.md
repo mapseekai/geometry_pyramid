@@ -16,8 +16,13 @@ zoom-level work across PostgreSQL background workers. `ST_Pyramid()` returns
 **per-zoom build statistics** (row count, tile count, byte size, build
 duration). `ST_UpdatePyramid` supports **incremental refresh**: when a
 `where_clause` is provided, only tiles intersecting the matched rows are
-rebuilt; omitting the clause triggers a full rebuild. PNG rendering and
-coalesce-densest remain on the roadmap.
+rebuilt; omitting the clause triggers a full rebuild. `ST_Tile` is now
+**hybrid**: tiles within `maxZoom` are served from materialized storage, while
+requests beyond `maxZoom` are sliced on-demand from the source table (when
+`dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
+semantics; unknown pyramids return NULL. PNG rendering, coalesce-densest,
+Ganos `splitSize` density-based dynamic build, and `buildRules` remain on the
+roadmap.
 
 ## SQL surface
 
@@ -27,7 +32,7 @@ coalesce-densest remain on the roadmap.
 | `ST_UpdatePyramid(name, where_clause) -> bool` | Refresh only the tiles intersecting rows matched by `where_clause` (full rebuild when the clause is empty). |
 | `ST_DropPyramid(name) -> bool` | Remove a pyramid and its tile storage. |
 | `ST_Pyramid(name) -> jsonb` | Inspect a pyramid's metadata and per-zoom build statistics. |
-| `ST_Tile(name, z, x, y) -> bytea` | Fetch an MVT tile (NULL on miss). |
+| `ST_Tile(name, z, x, y) -> bytea` | Fetch an MVT tile: materialized within maxZoom, sliced on-demand beyond it (NULL when absent or disabled). |
 | `ST_Pyramids() -> SETOF (name, source_table, built_at, tile_count)` | List all pyramids. |
 | `geometry_pyramid_version() -> text` | Extension version. |
 
@@ -44,6 +49,7 @@ keys mirror Ganos:
 | `tileSize` | `4096` | MVT extent. |
 | `tileExtend` | `8` | Tile-edge buffer to avoid clipping artefacts. |
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
+| `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
 | `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
 | `sparse` | `true` | Skip empty tiles. |
 | `attributes` | `[]` | Columns to include in MVT features. |
@@ -80,7 +86,8 @@ during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
     ├── stats.rs                 # per-zoom build statistics persistence
     ├── shadow.rs                # shadow-table lifecycle for atomic rebuild
     ├── worker.rs                # background-worker control plane (spec files + entry)
-    └── incremental.rs           # where_clause-scoped incremental refresh
+    ├── incremental.rs           # where_clause-scoped incremental refresh
+    └── dynamic.rs               # on-demand single-tile slicing (z > maxZoom)
 ```
 
 ## Prerequisites
@@ -140,6 +147,7 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
     server-side raster output, matching Ganos.
 11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
+12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics. Ganos `splitSize` density-based dynamic build and `buildRules` remain future work.~~ ✅
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 
