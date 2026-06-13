@@ -7,20 +7,32 @@ tables, exposing a SQL surface compatible with Alibaba Cloud
 
 ## Status
 
-Working single-threaded build path: `ST_BuildPyramid` materializes MVT
-tiles via PostGIS (`ST_TileEnvelope` + `ST_AsMVTGeom` + `ST_AsMVT`) into
-per-pyramid storage tables, and `ST_Tile` serves them. Parallel build,
-incremental updates, and PNG rendering are still on the roadmap.
+Working build path: `ST_BuildPyramid` materializes MVT tiles via PostGIS
+(`ST_TileEnvelope` + `ST_AsMVTGeom` + `ST_AsMVT`) into per-pyramid storage
+tables with **atomic rebuild** — tiles are written into a shadow table and
+swapped in a single transaction so readers never see a half-built pyramid.
+**Optional parallel build** honours the `parallel` config key by fanning out
+zoom-level work across PostgreSQL background workers. `ST_Pyramid()` returns
+**per-zoom build statistics** (row count, tile count, byte size, build
+duration). `ST_UpdatePyramid` supports **incremental refresh**: when a
+`where_clause` is provided, only tiles intersecting the matched rows are
+rebuilt; omitting the clause triggers a full rebuild. `ST_Tile` is now
+**hybrid**: tiles within `maxZoom` are served from materialized storage, while
+requests beyond `maxZoom` are sliced on-demand from the source table (when
+`dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
+semantics; unknown pyramids return NULL. PNG rendering, coalesce-densest,
+Ganos `splitSize` density-based dynamic build, and `buildRules` remain on the
+roadmap.
 
 ## SQL surface
 
 | Function | Purpose |
 |---|---|
 | `ST_BuildPyramid(table, geom, fid, config) -> bool` | Register / build a pyramid. |
-| `ST_UpdatePyramid(name, where_clause) -> bool` | Refresh tiles for changed rows. |
+| `ST_UpdatePyramid(name, where_clause) -> bool` | Refresh only the tiles intersecting rows matched by `where_clause` (full rebuild when the clause is empty). |
 | `ST_DropPyramid(name) -> bool` | Remove a pyramid and its tile storage. |
-| `ST_Pyramid(name) -> jsonb` | Inspect a pyramid's metadata. |
-| `ST_Tile(name, z, x, y) -> bytea` | Fetch an MVT tile (NULL on miss). |
+| `ST_Pyramid(name) -> jsonb` | Inspect a pyramid's metadata and per-zoom build statistics. |
+| `ST_Tile(name, z, x, y) -> bytea` | Fetch an MVT tile: materialized within maxZoom, sliced on-demand beyond it (NULL when absent or disabled). |
 | `ST_Pyramids() -> SETOF (name, source_table, built_at, tile_count)` | List all pyramids. |
 | `geometry_pyramid_version() -> text` | Extension version. |
 
@@ -37,7 +49,8 @@ keys mirror Ganos:
 | `tileSize` | `4096` | MVT extent. |
 | `tileExtend` | `8` | Tile-edge buffer to avoid clipping artefacts. |
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
-| `parallel` | `1` | Worker count for the build. |
+| `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
+| `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
 | `sparse` | `true` | Skip empty tiles. |
 | `attributes` | `[]` | Columns to include in MVT features. |
 | `simplifyPixels` | `1.0` | DP tolerance in tile pixels (≈1 px ≈ tippecanoe default). 0 disables. |
@@ -45,6 +58,13 @@ keys mirror Ganos:
 | `dropRate` | `1.0` | Tippecanoe-style point retention: keep `dropRate^(maxZoom − z)`. 1.0 disables; 0.4 mimics `tippecanoe -r2.5`. |
 | `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
+| `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
+
+## Notes
+
+Pyramid, table, and column identifiers are capped at **45 characters** so
+that derived names (e.g. the `_gp_tiles_<name>__shadow` shadow table used
+during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
 
 ## Project layout
 
@@ -61,7 +81,13 @@ keys mirror Ganos:
     ├── storage.rs               # per-pyramid `_gp_tiles_<name>` table mgmt
     ├── build.rs                 # zoom-level INSERT pipeline (PostGIS via SPI)
     ├── pyramid.rs               # ST_BuildPyramid / ST_DropPyramid / ...
-    └── tile.rs                  # ST_Tile
+    ├── tile.rs                  # ST_Tile
+    ├── tile_rect.rs             # tile-index rectangle math (bbox→tiles, strip split)
+    ├── stats.rs                 # per-zoom build statistics persistence
+    ├── shadow.rs                # shadow-table lifecycle for atomic rebuild
+    ├── worker.rs                # background-worker control plane (spec files + entry)
+    ├── incremental.rs           # where_clause-scoped incremental refresh
+    └── dynamic.rs               # on-demand single-tile slicing (z > maxZoom)
 ```
 
 ## Prerequisites
@@ -115,15 +141,13 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 5. ~~Tippecanoe-style strategies — per-zoom simplification, min feature size, point drop rate.~~ ✅
 6. ~~Tile-size budget — `--drop-densest-as-needed` analogue with geometric tightening.~~ ✅
 7. **Coalesce-densest** — merge adjacent small polygons at low zoom (`ST_Union` / `ST_Buffer(0)`).
-8. **Parallelism** — honor `parallel` config; partition tile range across
-   workers using PG bgworkers or client-side parallel `ST_BuildPyramid`
-   invocations.
-9. **Incremental updates** — make `ST_UpdatePyramid(name, where_clause)`
-   refresh only tiles whose source rows changed.
+8. ~~**Parallelism** — honour `parallel` config; partition tile range across workers using PG background workers.~~ ✅
+9. ~~**Incremental updates** — `ST_UpdatePyramid(name, where_clause)` rebuilds tiles intersecting matched rows.~~ ✅
+   - **Limitation:** incremental refresh rebuilds the tiles that intersect the rows matched by the `where_clause`. A feature that moved or was deleted leaves a stale tile at its **old** location unless the clause also covers that region. Pure-delete and move-out cases require either a clause that covers the old bounding area or a full rebuild.
 10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
     server-side raster output, matching Ganos.
-11. **Statistics** — per-zoom row counts, byte size, build duration in
-    `ST_Pyramid()` output.
+11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
+12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics. Ganos `splitSize` density-based dynamic build and `buildRules` remain future work.~~ ✅
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 

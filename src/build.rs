@@ -6,14 +6,46 @@
 //! them in the right order.
 
 use crate::config::PyramidConfig;
-use crate::storage;
+use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 
-/// Web Mercator half-extent in metres. Used to convert between meter
-/// coordinates and tile indices when computing per-zoom tile ranges.
-const WEBMERC_HALF_EXTENT: f64 = 20_037_508.342_789_244;
+/// Per-zoom build outcome, consumed by the stats layer.
+#[derive(Clone, Copy, Debug)]
+pub struct ZoomBuildResult {
+    pub z: u8,
+    pub tiles: i64,
+    pub total_bytes: i64,
+    pub max_tile_bytes: i64,
+    pub build_ms: i64,
+    pub attempts: u32,
+}
+
+/// (tile_count, total_bytes, max_tile_bytes) for one zoom of a tile table.
+fn zoom_stats(
+    storage_table: &str,
+    z: u8,
+) -> Result<(i64, i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+    let row: Option<String> = Spi::get_one_with_args(
+        &format!(
+            r#"SELECT json_build_array(
+                   count(*),
+                   COALESCE(sum(octet_length(mvt)), 0),
+                   COALESCE(max(octet_length(mvt)), 0))::text
+               FROM "{storage_table}" WHERE z = $1"#
+        ),
+        &[(z as i32).into()],
+    )?;
+    let s = row.ok_or("zoom_stats returned no row")?;
+    let arr: [i64; 3] = serde_json::from_str(&s)?;
+    Ok((arr[0], arr[1], arr[2]))
+}
 
 /// Total tile count emitted across all zoom levels.
+///
+/// Acquires a per-pyramid advisory transaction lock, writes all tiles into
+/// a shadow table, then atomically swaps the shadow into place as the main
+/// tile table. If anything fails before the swap, the transaction aborts and
+/// the shadow DDL is rolled back — leaving the previous main table untouched.
 pub fn build(
     pyramid_name: &str,
     table: &str,
@@ -21,11 +53,55 @@ pub fn build(
     fid_column: &str,
     cfg: &PyramidConfig,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    storage::reset_tile_table(pyramid_name)?;
-    let storage_table = storage::tile_table_name(pyramid_name);
+    // Serialize concurrent builds of the same pyramid for this transaction.
+    // The advisory-lock namespace is cluster-global (shared across all
+    // databases); the `geometry_pyramid:` prefix makes a collision with an
+    // unrelated lock astronomically unlikely (~1/2^63), and the lock is only
+    // an optimization against concurrent builders — correctness still rests
+    // on the transactional shadow swap.
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock(hashtextextended('geometry_pyramid:' || $1, 0))",
+        &[pyramid_name.into()],
+    )?;
 
-    // Source bbox in tile SRS. NULL when the source table is empty — in
-    // which case there is nothing to materialize.
+    let workers = cfg.parallel.max(1) - 1;
+    if workers > 0 && cfg.tile_size_budget_bytes > 0 {
+        // The budget retry loop wipes a zoom and rebuilds it within the
+        // coordinator's uncommitted transaction. Under parallel>1 the workers
+        // have already COMMITTED their strip rows, so a retry's DELETE is
+        // invisible to the next round's workers and they would collide on the
+        // (z,x,y) primary key. Reject the combination rather than corrupt.
+        return Err(
+            "tileSizeBudgetBytes (budget retry) is not supported with parallel > 1; \
+             set one of them back to its default"
+                .into(),
+        );
+    }
+    if workers == 0 {
+        // parallel=1: shadow lives in this transaction (no external worker needs to see it).
+        crate::shadow::create(pyramid_name)?;
+    } else {
+        // parallel>1: workers are independent backends, so the shadow DDL must be
+        // COMMITTED before they can see it — run it via an autonomous worker.
+        crate::worker::exec_sql_autonomous(&crate::shadow::create_sql(pyramid_name))?;
+    }
+    let shadow_table = crate::shadow::shadow_table_name(pyramid_name);
+
+    let total = build_into(pyramid_name, &shadow_table, table, geom_column, fid_column, cfg)?;
+
+    crate::shadow::swap(pyramid_name)?;
+    Ok(total)
+}
+
+/// The build loop, writing into an arbitrary target table.
+fn build_into(
+    pyramid_name: &str,
+    storage_table: &str,
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let bbox = source_bbox(table, geom_column, cfg.tile_srs)?;
     let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
         notice!(
@@ -33,25 +109,23 @@ pub fn build(
             table,
             pyramid_name
         );
-        return Ok(0);
+        return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
     let mut total: i64 = 0;
     for z in cfg.min_zoom..=cfg.max_zoom {
-        let inserted = build_zoom_level_with_budget(
+        let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
+        let result = build_zoom_level_with_budget(
             pyramid_name,
-            &storage_table,
+            storage_table,
             table,
             geom_column,
             fid_column,
             cfg,
-            z,
-            xmin_m,
-            ymin_m,
-            xmax_m,
-            ymax_m,
+            &rect,
         )?;
-        total += inserted;
+        crate::stats::upsert_zoom_stats(pyramid_name, &result)?;
+        total += result.tiles;
     }
     Ok(total)
 }
@@ -60,7 +134,6 @@ pub fn build(
 /// then while any tile breaches the byte budget, wipe and rebuild with
 /// tighter knobs (more simplification, larger minimum-feature size, lower
 /// retention). Bounded by `max_tile_size_attempts`.
-#[allow(clippy::too_many_arguments)]
 fn build_zoom_level_with_budget(
     pyramid_name: &str,
     storage_table: &str,
@@ -68,12 +141,10 @@ fn build_zoom_level_with_budget(
     geom_column: &str,
     fid_column: &str,
     cfg: &PyramidConfig,
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    rect: &TileRect,
+) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
+    let z = rect.z;
     let pixel_m = cfg.pixel_size_m(z);
     let mut knobs = ZoomKnobs::from_config(cfg, z);
     let mut attempt: u32 = 0;
@@ -88,40 +159,48 @@ fn build_zoom_level_with_budget(
             )?;
         }
 
-        let inserted = build_zoom_level(
+        // NOTE: budget-retry with parallel>1 may not fully reset committed worker
+        // rows across attempts (the DELETE runs in the coordinator txn and is
+        // visible to subsequent worker txns only after coordinator commit). For
+        // the default tile_size_budget_bytes=0 there are no retries, so this is
+        // a non-issue in the common path.
+        run_zoom_strips(
             pyramid_name,
             storage_table,
             table,
             geom_column,
             fid_column,
             cfg,
-            z,
-            xmin_m,
-            ymin_m,
-            xmax_m,
-            ymax_m,
+            rect,
             &knobs,
         )?;
+
+        let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         notice!(
             "geometry_pyramid: pyramid '{}' z={} attempt={} -> {} tiles",
             pyramid_name,
             z,
             attempt,
-            inserted
+            tiles
         );
-
-        if cfg.tile_size_budget_bytes <= 0 || attempt >= cfg.max_tile_size_attempts {
-            return Ok(inserted);
-        }
-        let max_bytes = max_tile_bytes(storage_table, z)?;
-        if max_bytes <= cfg.tile_size_budget_bytes {
-            return Ok(inserted);
+        if cfg.tile_size_budget_bytes <= 0
+            || attempt >= cfg.max_tile_size_attempts
+            || max_tile_bytes <= cfg.tile_size_budget_bytes
+        {
+            return Ok(ZoomBuildResult {
+                z: rect.z,
+                tiles,
+                total_bytes,
+                max_tile_bytes,
+                build_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                attempts: attempt + 1,
+            });
         }
 
         // Pressure factor = √(overage). Square-rooted so each retry is a
         // measured tightening rather than a panic; the loop converges
         // geometrically across attempts.
-        let factor = (max_bytes as f64 / cfg.tile_size_budget_bytes as f64)
+        let factor = (max_tile_bytes as f64 / cfg.tile_size_budget_bytes as f64)
             .sqrt()
             .max(1.05);
         knobs.tighten(factor, pixel_m);
@@ -129,7 +208,7 @@ fn build_zoom_level_with_budget(
             "geometry_pyramid: pyramid '{}' z={} max_tile={} bytes > budget {} -> tighten x{:.2}",
             pyramid_name,
             z,
-            max_bytes,
+            max_tile_bytes,
             cfg.tile_size_budget_bytes,
             factor
         );
@@ -140,7 +219,7 @@ fn build_zoom_level_with_budget(
 /// Per-zoom tunable thresholds. Decoupled from `PyramidConfig` so the
 /// budget retry loop can ratchet them per attempt without mutating cfg.
 #[derive(Clone, Copy, Debug)]
-struct ZoomKnobs {
+pub(crate) struct ZoomKnobs {
     simplify_tol_m: f64,
     min_area_m2: f64,
     min_len_m: f64,
@@ -148,7 +227,7 @@ struct ZoomKnobs {
 }
 
 impl ZoomKnobs {
-    fn from_config(cfg: &PyramidConfig, z: u8) -> Self {
+    pub(crate) fn from_config(cfg: &PyramidConfig, z: u8) -> Self {
         let (a, l) = cfg.min_size_thresholds_m(z);
         Self {
             simplify_tol_m: cfg.simplify_tol_m(z),
@@ -167,17 +246,24 @@ impl ZoomKnobs {
         self.min_area_m2 = self.min_len_m * self.min_len_m;
         self.drop_threshold = (self.drop_threshold / factor).clamp(0.0, 1.0);
     }
-}
 
-fn max_tile_bytes(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
-    Spi::get_one_with_args(
-        &format!(
-            r#"SELECT COALESCE(MAX(octet_length(mvt)), 0)::bigint
-               FROM "{storage_table}" WHERE z = $1"#
-        ),
-        &[(z as i32).into()],
-    )
-    .map(|opt: Option<i64>| opt.unwrap_or(0))
+    pub(crate) fn to_values(self) -> crate::worker::KnobValues {
+        crate::worker::KnobValues {
+            simplify_tol_m: self.simplify_tol_m,
+            min_area_m2: self.min_area_m2,
+            min_len_m: self.min_len_m,
+            drop_threshold: self.drop_threshold,
+        }
+    }
+
+    pub(crate) fn from_values(v: crate::worker::KnobValues) -> Self {
+        Self {
+            simplify_tol_m: v.simplify_tol_m,
+            min_area_m2: v.min_area_m2,
+            min_len_m: v.min_len_m,
+            drop_threshold: v.drop_threshold,
+        }
+    }
 }
 
 fn source_bbox(
@@ -207,48 +293,152 @@ fn source_bbox(
     Ok(Some((arr[0], arr[1], arr[2], arr[3])))
 }
 
+/// Execute one zoom round, splitting the rectangle into x-strips and farming
+/// them to background workers when cfg.parallel > 1. Slot 0 always runs inline
+/// in the coordinator; a failed spawn degrades that slot to inline execution.
+/// Returns the total tile count for the zoom (recounted from the table so it
+/// includes rows committed by workers).
 #[allow(clippy::too_many_arguments)]
-fn build_zoom_level(
+fn run_zoom_strips(
     pyramid_name: &str,
     storage_table: &str,
     table: &str,
     geom_column: &str,
     fid_column: &str,
     cfg: &PyramidConfig,
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
+    rect: &TileRect,
     knobs: &ZoomKnobs,
-) -> Result<i64, spi::Error> {
-    let (xmin_t, ymin_t, xmax_t, ymax_t) =
-        bbox_to_tile_range(z, xmin_m, ymin_m, xmax_m, ymax_m);
-
-    // The four tippecanoe-style thresholds for this attempt. `cfg` is no
-    // longer the source of truth — the budget retry loop owns them.
-    let simplify_tol_m = knobs.simplify_tol_m;
-    let min_area_m2 = knobs.min_area_m2;
-    let min_len_m = knobs.min_len_m;
-    let drop_threshold = knobs.drop_threshold;
-
-    // Attribute projection — column names are revalidated defensively here
-    // because they ride along into the dynamic SQL string.
-    let mut attrs_inner = String::new();
-    let mut attrs_outer = String::new();
-    for col in &cfg.attributes {
-        if !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        attrs_inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
-        attrs_outer.push_str(&format!(r#", prep."{col}""#));
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let workers = cfg.parallel.max(1) - 1;
+    if workers == 0 {
+        build_zoom_level(
+            pyramid_name,
+            storage_table,
+            table,
+            geom_column,
+            fid_column,
+            cfg,
+            rect,
+            knobs,
+        )?;
+        return Ok(inserted_count(storage_table, rect.z)?);
     }
 
-    let sql = format!(
-        r#"INSERT INTO "{storage_table}" (z, x, y, mvt)
-           SELECT $1::smallint, t.x, t.y,
-                  ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
-           FROM generate_series($4::int, $5::int) AS xs(x)
+    let strips = rect.split_x(4 * (workers + 1));
+    let slots = (workers as usize + 1).min(strips.len());
+
+    let mut spec_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut handles: Vec<pgrx::bgworkers::DynamicBackgroundWorker> = Vec::new();
+    let mut inline_strips: Vec<TileRect> = Vec::new();
+
+    for slot in 0..slots {
+        let chunk: Vec<TileRect> = strips.iter().copied().skip(slot).step_by(slots).collect();
+        if slot == 0 {
+            inline_strips = chunk;
+            continue;
+        }
+        // Use a process-unique index, not `slot`: slot numbers repeat every
+        // zoom round, so a worker slow to start could otherwise read a spec
+        // file already overwritten by a later round.
+        let filename = crate::worker::spec_filename(
+            unsafe { pg_sys::MyProcPid } as u32,
+            crate::worker::next_spec_idx(),
+        );
+        let spec = crate::worker::WorkerSpec {
+            db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
+            mode: crate::worker::WorkerMode::BuildStrips {
+                pyramid_name: pyramid_name.to_string(),
+                storage_table: storage_table.to_string(),
+                source_table: table.to_string(),
+                geom_column: geom_column.to_string(),
+                fid_column: fid_column.to_string(),
+                config: cfg.clone(),
+                knobs: knobs.to_values(),
+                strips: chunk.clone(),
+            },
+        };
+        let path = crate::worker::write_spec(&filename, &spec)?;
+        match crate::worker::spawn(&filename) {
+            Ok(handle) => {
+                spec_paths.push(path);
+                handles.push(handle);
+            }
+            Err(e) => {
+                notice!(
+                    "geometry_pyramid: worker slot {} unavailable ({}); running inline",
+                    slot,
+                    e
+                );
+                crate::worker::cleanup_spec(&path);
+                inline_strips.extend(chunk);
+            }
+        }
+    }
+
+    // Coordinator builds its own share while workers run.
+    for strip in &inline_strips {
+        build_zoom_level(
+            pyramid_name,
+            storage_table,
+            table,
+            geom_column,
+            fid_column,
+            cfg,
+            strip,
+            knobs,
+        )?;
+    }
+
+    let wait_result = crate::worker::wait_for(&spec_paths, cfg.build_timeout_ms);
+    for p in &spec_paths {
+        crate::worker::cleanup_spec(p);
+    }
+    // Keep worker handles alive until after wait_for; drop them now.
+    drop(handles);
+    wait_result?;
+
+    Ok(inserted_count(storage_table, rect.z)?)
+}
+
+/// Attribute projection fragments for the feature pipeline: (inner, outer).
+/// Both are comma-prefixed (`, src."col" AS "col"` / `, prep."col"`) and may be
+/// empty; they are spliced after a fixed column list. Column names are
+/// revalidated defensively because they ride into dynamic SQL — a name failing
+/// the validation is skipped with a notice rather than silently dropped.
+pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
+    let mut inner = String::new();
+    let mut outer = String::new();
+    for col in &cfg.attributes {
+        if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            notice!(
+                "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
+                col
+            );
+            continue;
+        }
+        inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
+        outer.push_str(&format!(r#", prep."{col}""#));
+    }
+    (inner, outer)
+}
+
+/// The shared `FROM … features` block of the MVT pipeline: a 2-D tile grid
+/// (`generate_series`, params $4..$7) joined to the per-tile feature pipeline
+/// (projection, per-zoom simplification, min-size + point-drop filters,
+/// `ST_AsMVTGeom`). References params $1,$3,$8,$9,$10,$11..$14 and tile coords
+/// t.x/t.y — never $2 (layer name) and no GROUP BY. Both the multi-tile build
+/// INSERT and the single-tile dynamic SELECT wrap this with
+/// `ST_AsMVT(features.*, $2, $3, 'geom','fid')` + `GROUP BY t.x, t.y`.
+/// A single tile is just the degenerate range xmin=xmax / ymin=ymax.
+pub(crate) fn tile_pipeline_from_sql(
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    attrs_inner: &str,
+    attrs_outer: &str,
+) -> String {
+    format!(
+        r#"FROM generate_series($4::int, $5::int) AS xs(x)
            CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
            CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
            CROSS JOIN LATERAL (
@@ -260,7 +450,6 @@ fn build_zoom_level(
                  {attrs_outer}
               FROM (
                  SELECT
-                    -- Per-zoom simplification (skip points; they have no edges).
                     CASE
                        WHEN $11::float8 > 0
                             AND GeometryType(src."{geom_column}") NOT IN ('POINT','MULTIPOINT')
@@ -279,21 +468,48 @@ fn build_zoom_level(
                        )
               ) prep
               WHERE
-                 -- Polygon area cutoff (only applied when threshold > 0).
                  ($12::float8 <= 0
                   OR GeometryType(prep.gtile) NOT IN ('POLYGON','MULTIPOLYGON')
                   OR ST_Area(prep.gtile) >= $12::float8)
-                 -- Line length cutoff (only applied when threshold > 0).
                  AND ($13::float8 <= 0
                       OR GeometryType(prep.gtile) NOT IN ('LINESTRING','MULTILINESTRING')
                       OR ST_Length(prep.gtile) >= $13::float8)
-                 -- Tippecanoe-style deterministic point dropping.
                  AND ($14::float8 >= 1.0
                       OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
                       OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
                          / 1000000.0 < $14::float8)
            ) features
-           WHERE features.geom IS NOT NULL
+           WHERE features.geom IS NOT NULL"#
+    )
+}
+
+pub(crate) fn build_zoom_level(
+    pyramid_name: &str,
+    storage_table: &str,
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+) -> Result<i64, spi::Error> {
+    let z = rect.z;
+    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
+
+    // The four tippecanoe-style thresholds for this attempt. `cfg` is no
+    // longer the source of truth — the budget retry loop owns them.
+    let simplify_tol_m = knobs.simplify_tol_m;
+    let min_area_m2 = knobs.min_area_m2;
+    let min_len_m = knobs.min_len_m;
+    let drop_threshold = knobs.drop_threshold;
+
+    let (attrs_inner, attrs_outer) = attribute_projections(cfg);
+
+    let pipeline = tile_pipeline_from_sql(table, geom_column, fid_column, &attrs_inner, &attrs_outer);
+    let sql = format!(
+        r#"INSERT INTO "{storage_table}" (z, x, y, mvt)
+           SELECT $1::smallint, t.x, t.y, ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
+           {pipeline}
            GROUP BY t.x, t.y
            HAVING ST_AsMVT(features.*, $2, $3, 'geom', 'fid') IS NOT NULL"#
     );
@@ -330,68 +546,9 @@ fn inserted_count(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
     .map(|opt: Option<i64>| opt.unwrap_or(0))
 }
 
-/// Convert a Web-Mercator metres bbox to inclusive tile (x, y) ranges at
-/// zoom `z`. Result is clamped to the valid tile range `[0, 2^z - 1]`.
-fn bbox_to_tile_range(
-    z: u8,
-    xmin_m: f64,
-    ymin_m: f64,
-    xmax_m: f64,
-    ymax_m: f64,
-) -> (i64, i64, i64, i64) {
-    let n: i64 = 1 << z;
-    let tile_span = (2.0 * WEBMERC_HALF_EXTENT) / (n as f64);
-
-    let to_tile_x = |m: f64| ((m + WEBMERC_HALF_EXTENT) / tile_span).floor() as i64;
-    let to_tile_y = |m: f64| ((WEBMERC_HALF_EXTENT - m) / tile_span).floor() as i64;
-
-    let xmin_t = to_tile_x(xmin_m).clamp(0, n - 1);
-    let xmax_t = to_tile_x(xmax_m).clamp(0, n - 1);
-    let ymin_t = to_tile_y(ymax_m).clamp(0, n - 1); // Y axis is inverted
-    let ymax_t = to_tile_y(ymin_m).clamp(0, n - 1);
-    (xmin_t, ymin_t, xmax_t, ymax_t)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn z0_full_world_is_single_tile() {
-        let r = bbox_to_tile_range(
-            0,
-            -WEBMERC_HALF_EXTENT,
-            -WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT,
-        );
-        assert_eq!(r, (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn z1_full_world_is_four_tiles() {
-        let r = bbox_to_tile_range(
-            1,
-            -WEBMERC_HALF_EXTENT + 1.0,
-            -WEBMERC_HALF_EXTENT + 1.0,
-            WEBMERC_HALF_EXTENT - 1.0,
-            WEBMERC_HALF_EXTENT - 1.0,
-        );
-        assert_eq!(r, (0, 0, 1, 1));
-    }
-
-    #[test]
-    fn out_of_range_is_clamped() {
-        // A tiny bbox far outside Web Mercator's valid extent should still
-        // clamp into the valid index space rather than producing negatives.
-        let r = bbox_to_tile_range(
-            5,
-            -1e9, -1e9, -9e8, -9e8,
-        );
-        let n: i64 = 1 << 5;
-        assert!(r.0 >= 0 && r.2 <= n - 1);
-        assert!(r.1 >= 0 && r.3 <= n - 1);
-    }
 
     #[test]
     fn tighten_bootstraps_disabled_knobs() {

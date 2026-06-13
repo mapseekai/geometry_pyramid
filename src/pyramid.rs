@@ -10,7 +10,7 @@ use pgrx::prelude::*;
 /// Builds (or rebuilds) a vector pyramid for `table` using `geom_column` as
 /// the geometry source and `fid_column` as the stable feature id. `config`
 /// is a JSON document; pass `''` for defaults.
-#[pg_extern(name = "ST_BuildPyramid")]
+#[pg_extern(name = "st_buildpyramid")]
 fn st_build_pyramid(
     table: &str,
     geom_column: &str,
@@ -67,7 +67,7 @@ fn st_build_pyramid(
 }
 
 /// `ST_DropPyramid(name) -> bool`
-#[pg_extern(name = "ST_DropPyramid")]
+#[pg_extern(name = "st_droppyramid")]
 fn st_drop_pyramid(
     name: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -79,18 +79,44 @@ fn st_drop_pyramid(
     )?
     .unwrap_or(0);
     storage::drop_tile_table(name)?;
+    crate::stats::delete_stats(name)?;
+    crate::shadow::abandon(name)?;
     Ok(removed > 0)
 }
 
 /// `ST_UpdatePyramid(name, where_clause) -> bool`
 ///
 /// Re-builds the pyramid identified by `name` using its previously
-/// registered configuration. `where_clause` is currently ignored — full
-/// rebuilds only — and is reserved for an incremental refresh path.
-#[pg_extern(name = "ST_UpdatePyramid")]
+/// registered configuration.
+///
+/// When `where_clause` is empty, performs a full rebuild (shadow-swap,
+/// exactly as `ST_BuildPyramid`).
+///
+/// When `where_clause` is non-empty, performs an **incremental** refresh:
+/// computes the bounding box of all source rows matching the clause,
+/// derives the dirty tile rectangle per zoom, DELETEs those tiles from
+/// the main tile table and rebuilds just them in place — all within the
+/// caller's transaction (failure rolls back; the pyramid is never
+/// left half-updated). This follows the Ganos trust model: the caller
+/// holds source-table privileges and the clause is executed as their SQL.
+///
+/// # Limitation: the clause must cover a row's OLD location
+///
+/// The dirty rectangle is the extent of rows the clause matches *now*. A row
+/// that moved across tiles, or was deleted, leaves a stale tile at its former
+/// position unless the clause also selects that region. Concretely:
+/// - **Move across tiles**: `WHERE id = 42` only cleans the new position; the
+///   old tile keeps the stale feature. Pass a clause covering both (e.g. a
+///   bbox that spans old+new), or do a full rebuild.
+/// - **Delete**: after `DELETE FROM src WHERE id = 42`, the row no longer
+///   matches any clause, so `ST_UpdatePyramid(name, 'id = 42')` matches zero
+///   rows and is a no-op — the old tile is never cleaned. Use a clause that
+///   matches by region (e.g. `ST_Intersects(geom_or_bbox, ...)` against a
+///   captured old extent), or a full rebuild.
+#[pg_extern(name = "st_updatepyramid")]
 fn st_update_pyramid(
     name: &str,
-    _where_clause: &str,
+    where_clause: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     validate_identifier(name)?;
 
@@ -108,28 +134,69 @@ fn st_update_pyramid(
     )?;
     let Some(json) = row else { return Ok(false) };
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
-    let source_table = parsed["source_table"].as_str().unwrap_or("").to_string();
-    let geom_column = parsed["geom_column"].as_str().unwrap_or("").to_string();
-    let fid_column = parsed["fid_column"].as_str().unwrap_or("").to_string();
+    let source_table = parsed["source_table"]
+        .as_str()
+        .ok_or("catalog row has NULL source_table")?
+        .to_string();
+    let geom_column = parsed["geom_column"]
+        .as_str()
+        .ok_or("catalog row has NULL geom_column")?
+        .to_string();
+    let fid_column = parsed["fid_column"]
+        .as_str()
+        .ok_or("catalog row has NULL fid_column")?
+        .to_string();
     let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
 
-    let total = build::build(name, &source_table, &geom_column, &fid_column, &cfg)?;
+    // Re-validate catalog-sourced identifiers before they ride into dynamic
+    // SQL. They were validated at ST_BuildPyramid time, but the catalog is a
+    // plain table with no integrity trigger — defense-in-depth, matching the
+    // validation ST_BuildPyramid applies to the same three values.
+    validate_identifier(&source_table)?;
+    validate_identifier(&geom_column)?;
+    validate_identifier(&fid_column)?;
+
+    let total = if where_clause.trim().is_empty() {
+        build::build(name, &source_table, &geom_column, &fid_column, &cfg)?
+    } else {
+        crate::incremental::update(
+            name,
+            &source_table,
+            &geom_column,
+            &fid_column,
+            &cfg,
+            where_clause,
+        )?
+    };
     Spi::run_with_args(
         "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
         &[name.into()],
     )?;
-    notice!(
-        "geometry_pyramid: pyramid '{}' refreshed ({} tiles)",
-        name,
-        total
-    );
+    if where_clause.trim().is_empty() {
+        notice!(
+            "geometry_pyramid: pyramid '{}' refreshed ({} tiles)",
+            name,
+            total
+        );
+    } else {
+        notice!(
+            "geometry_pyramid: pyramid '{}' incrementally refreshed ({} tiles)",
+            name,
+            total
+        );
+    }
     Ok(true)
 }
 
 /// `ST_Pyramid(name) -> jsonb` — metadata for a single pyramid, including
 /// tile count.
-#[pg_extern(name = "ST_Pyramid")]
+#[pg_extern(name = "st_pyramid")]
 fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
+    // An invalid identifier can never name a real pyramid, and guards the
+    // dynamic count(*) query below against SQL identifier injection.
+    if validate_identifier(name).is_err() {
+        return Ok(None);
+    }
     let storage_table = storage::tile_table_name(name);
     let tile_count = Spi::get_one::<i64>(&format!(
         r#"SELECT count(*)::bigint FROM "{storage_table}""#
@@ -145,7 +212,15 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
             'fid_column', fid_column, \
             'config', config, \
             'built_at', built_at, \
-            'tile_count', $2::bigint \
+            'tile_count', $2::bigint, \
+            'stats', (SELECT COALESCE(jsonb_agg(jsonb_build_object(\
+                'z', s.z, \
+                'tileCount', s.tile_count, \
+                'totalBytes', s.total_bytes, \
+                'maxTileBytes', s.max_tile_bytes, \
+                'buildMs', s.build_ms, \
+                'attempts', s.attempts) ORDER BY s.z), '[]'::jsonb) \
+                FROM geometry_pyramid_stats s WHERE s.pyramid_name = $1) \
          )::text \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into(), tile_count.into()],
@@ -160,13 +235,16 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
 
 /// Reject identifiers that contain anything other than letters, digits or
 /// underscores. SQL identifier injection guard for the dynamic SQL paths.
+///
+/// The 45-char cap reserves headroom for PG's 63-byte identifier limit:
+/// the longest derived name is `_gp_tiles_`(10) + name(45) + `__shadow`(8) = 63.
 pub(crate) fn validate_identifier(
     ident: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if ident.is_empty() {
         return Err("identifier must not be empty".into());
     }
-    if ident.len() > 50 {
+    if ident.len() > 45 {
         return Err(format!("identifier too long: {ident}").into());
     }
     if !ident
@@ -192,5 +270,11 @@ mod tests {
         assert!(validate_identifier("\"foo\"").is_err());
         assert!(validate_identifier("foo;DROP").is_err());
         assert!(validate_identifier("").is_err());
+    }
+
+    #[test]
+    fn rejects_identifier_longer_than_45() {
+        assert!(validate_identifier(&"a".repeat(45)).is_ok());
+        assert!(validate_identifier(&"a".repeat(46)).is_err());
     }
 }

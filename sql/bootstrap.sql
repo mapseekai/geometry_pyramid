@@ -19,7 +19,7 @@ COMMENT ON TABLE geometry_pyramid_catalog IS
 -- ST_Pyramids() — list every registered pyramid with its tile count.
 -- Implemented in plain SQL: a SETOF query over the catalog joined with
 -- count(*) from each pyramid's storage table.
-CREATE OR REPLACE FUNCTION "ST_Pyramids"()
+CREATE OR REPLACE FUNCTION ST_Pyramids()
 RETURNS TABLE (
     name         text,
     source_table text,
@@ -52,5 +52,21 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION "ST_Pyramids"() IS
+COMMENT ON FUNCTION ST_Pyramids() IS
     'List every registered pyramid with its materialized tile count.';
+
+-- Per-zoom build statistics, maintained by the build/update paths.
+CREATE TABLE IF NOT EXISTS geometry_pyramid_stats (
+    pyramid_name   text     NOT NULL,
+    z              smallint NOT NULL,
+    tile_count     bigint   NOT NULL,
+    total_bytes    bigint   NOT NULL,
+    max_tile_bytes bigint   NOT NULL,
+    build_ms       bigint   NOT NULL,
+    attempts       integer  NOT NULL DEFAULT 1,
+    built_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (pyramid_name, z)
+);
+
+COMMENT ON TABLE geometry_pyramid_stats IS
+    'Per-zoom build statistics for pyramids managed by geometry_pyramid.';
