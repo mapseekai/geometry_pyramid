@@ -36,8 +36,19 @@ pub fn create(pyramid_name: &str) -> Result<(), spi::Error> {
     Spi::run(&create_sql(pyramid_name))
 }
 
-/// Atomically replace the main tile table with the shadow. Runs in the
-/// caller's transaction; the ACCESS EXCLUSIVE window covers only this DDL.
+/// Replace the main tile table with the shadow. Runs in the caller's
+/// transaction, so it is all-or-nothing: a crash or error before commit
+/// rolls the whole swap back and the previous main table survives.
+///
+/// Both statements take `ACCESS EXCLUSIVE` on the named tables, so a
+/// concurrent reader that has not yet acquired its `ACCESS SHARE` lock
+/// blocks until this transaction commits and then sees the new table. The
+/// one residual gap is OID-level: a reader that resolved the old main
+/// table's OID *before* the swap committed can observe a transient
+/// "relation does not exist" on its next access, because DROP+RENAME gives
+/// the replacement table a fresh OID. This is a transient error, never data
+/// corruption, and is the accepted trade-off of the shadow-swap design
+/// (a fully reader-transparent swap would require a view indirection layer).
 pub fn swap(pyramid_name: &str) -> Result<(), spi::Error> {
     let main = storage::tile_table_name(pyramid_name);
     let shadow = shadow_table_name(pyramid_name);

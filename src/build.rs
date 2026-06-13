@@ -54,6 +54,11 @@ pub fn build(
     cfg: &PyramidConfig,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     // Serialize concurrent builds of the same pyramid for this transaction.
+    // The advisory-lock namespace is cluster-global (shared across all
+    // databases); the `geometry_pyramid:` prefix makes a collision with an
+    // unrelated lock astronomically unlikely (~1/2^63), and the lock is only
+    // an optimization against concurrent builders — correctness still rests
+    // on the transactional shadow swap.
     Spi::run_with_args(
         "SELECT pg_advisory_xact_lock(hashtextextended('geometry_pyramid:' || $1, 0))",
         &[pyramid_name.into()],
