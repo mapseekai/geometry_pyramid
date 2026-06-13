@@ -140,7 +140,13 @@ mod tests {
 use pgrx::bgworkers::{
     BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+
+/// Per-backend counter so successive autonomous workers never reuse a spec
+/// filename within the same backend (which would clobber each other's status
+/// files). Combined with the backend PID this makes every spec path unique.
+static NEXT_SPEC_IDX: AtomicU32 = AtomicU32::new(0);
 
 /// Entry point for dynamic background workers. bgw_extra carries the spec
 /// FILENAME; the worker derives the directory from its own DataDir.
@@ -239,7 +245,8 @@ pub(crate) fn spawn(
 pub(crate) fn exec_sql_autonomous(
     sql: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, 0);
+    let idx = NEXT_SPEC_IDX.fetch_add(1, Ordering::Relaxed);
+    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, idx);
     let spec = WorkerSpec {
         db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
         mode: WorkerMode::ExecSql { sql: sql.to_string() },
@@ -253,6 +260,12 @@ pub(crate) fn exec_sql_autonomous(
 
 /// Poll status files until every spec is done, any errors out, or the
 /// timeout (ms, 0 = unbounded) elapses.
+///
+/// A worker that dies without writing a status file (e.g. an OS kill, or a
+/// PG `FATAL`/`PANIC` that longjmps past the `.err` write) is only detected
+/// here by the timeout — hence callers should pass a non-zero `timeout_ms`
+/// for unattended builds. The common failure (a PG `ERROR` inside the
+/// worker's transaction) is caught by pgrx and surfaced as a written `.err`.
 pub(crate) fn wait_for(
     paths: &[PathBuf],
     timeout_ms: i64,
