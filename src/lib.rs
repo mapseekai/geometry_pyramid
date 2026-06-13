@@ -266,10 +266,24 @@ mod tests {
         )
         .unwrap();
 
+        // We compare serial vs parallel by per-tile ENCODED SIZE, not raw bytes.
+        // Two reasons raw byte-identity does not hold and size does:
+        //   1. The pyramid name is the MVT layer name; equal-length names
+        //      ('build_ser'/'build_par', both 9 chars) make that contribution
+        //      identical in size.
+        //   2. ST_AsMVT aggregates features in source-scan order. The serial
+        //      build scans a wide tile range while each parallel worker scans a
+        //      narrow x-strip, so features within a tile can be encoded in a
+        //      different ORDER — same geometry, same total bytes, different
+        //      layout. octet_length is invariant under that reordering, so size
+        //      equality is the right order-independent check: it proves each
+        //      tile carries the same feature set (the pipeline is otherwise
+        //      deterministic — hashtextextended point drop, no randomness).
+
         // Serial build (parallel defaults to 1 — in-transaction path).
         Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_par','geom','gid', \
-             '{\"name\":\"par_serial\",\"minZoom\":0,\"maxZoom\":5}')",
+             '{\"name\":\"build_ser\",\"minZoom\":0,\"maxZoom\":5}')",
         )
         .unwrap();
 
@@ -279,45 +293,37 @@ mod tests {
         // zoom level, well within the available budget.)
         Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_par','geom','gid', \
-             '{\"name\":\"par_parallel\",\"minZoom\":0,\"maxZoom\":5,\"parallel\":2, \
+             '{\"name\":\"build_par\",\"minZoom\":0,\"maxZoom\":5,\"parallel\":2, \
                \"buildTimeoutMs\":60000}')",
         )
         .unwrap();
 
-        // The two pyramids have different names ('par_serial' vs 'par_parallel'), so
-        // every MVT tile embeds a layer name that differs by exactly 2 bytes:
-        // 'par_parallel' is 2 UTF-8 chars longer than 'par_serial', and both
-        // lengths fit in a 1-byte protobuf varint, so the length-prefix byte is
-        // the same size — only the string payload adds 2 bytes per tile.
-        //
-        // Raw byte equality is therefore impossible.  We assert instead:
-        //   (a) same (z,x,y) coverage
-        //   (b) octet_length(serial) + 2 == octet_length(parallel) for every tile
-        // Condition (b) proves the only difference is the embedded layer name and
-        // the geometry/feature content is byte-identical.
-        let coverage_mismatch = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles_par_serial a \
-             FULL JOIN _gp_tiles_par_parallel b USING (z, x, y) \
-             WHERE a.mvt IS NULL OR b.mvt IS NULL",
+        // Guard against both builds silently producing zero tiles (which would
+        // make the comparison below pass vacuously).
+        let serial_tiles = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_build_ser",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(coverage_mismatch, 0, "serial and parallel must cover the same (z,x,y) tiles");
+        assert!(serial_tiles > 0, "serial build produced no tiles");
 
-        let content_mismatches = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles_par_serial a \
-             JOIN _gp_tiles_par_parallel b USING (z, x, y) \
-             WHERE octet_length(a.mvt) + 2 <> octet_length(b.mvt)",
+        // A single FULL JOIN catches a coverage gap (a missing/empty worker
+        // strip ⇒ NULL octet_length on one side ⇒ unequal) AND any per-tile
+        // size difference (extra/missing/different features change the size).
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_build_ser a \
+             FULL JOIN _gp_tiles_build_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
         )
         .unwrap()
         .unwrap();
         assert_eq!(
-            content_mismatches, 0,
-            "parallel tile sizes must equal serial + 2-byte layer-name delta for every tile"
+            mismatches, 0,
+            "parallel tiles must match serial in coverage and per-tile encoded size"
         );
 
-        Spi::run("SELECT ST_DropPyramid('par_serial')").unwrap();
-        Spi::run("SELECT ST_DropPyramid('par_parallel')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('build_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('build_par')").unwrap();
         // _gp_par was committed by exec_sql_autonomous and survives this test's
         // rollback.  We cannot drop it here (DROP needs ACCESS EXCLUSIVE but this
         // transaction holds ACCESS SHARE from the serial build's SELECT scan, and
