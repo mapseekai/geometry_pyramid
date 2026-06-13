@@ -401,6 +401,84 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('_gp_inc')").unwrap();
         Spi::run("DROP TABLE _gp_inc").unwrap();
     }
+
+    /// ST_Tile serves materialized tiles within maxZoom, slices on-demand above it
+    /// (when enabled), returns NULL for unknown pyramids, and respects the
+    /// dynamicBeyondMaxZoom switch.
+    #[pg_test]
+    fn dynamic_tile_beyond_max_zoom() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_dyn (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        // A point well inside one tile (avoids tile-boundary ambiguity).
+        Spi::run("INSERT INTO _gp_dyn (geom) VALUES (ST_SetSRID(ST_MakePoint(30, 40), 4326))")
+            .unwrap();
+
+        // Pyramid materialized only to z=4; dynamic default ON.
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_dyn','geom','gid','{\"name\":\"dyn\",\"minZoom\":0,\"maxZoom\":4}')",
+        )
+        .unwrap();
+
+        // Unknown pyramid -> NULL (regression: used to error on missing table).
+        let unknown = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('no_such_pyramid', 0, 0, 0)").unwrap();
+        assert!(unknown.is_none(), "unknown pyramid must return NULL, not error");
+
+        // Materialized hit: z=0 is the whole world, the point is in tile (0,0,0).
+        let z0 = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('dyn', 0, 0, 0)").unwrap();
+        assert!(z0.is_some(), "materialized z=0 tile must exist");
+
+        // Compute the z=6 tile that contains the point (z=6 > maxZoom=4 => dynamic).
+        let tx = Spi::get_one::<i32>(
+            "SELECT floor((ST_X(ST_Transform(geom,3857)) + 20037508.342789244) \
+                    / (2*20037508.342789244) * pow(2,6))::int FROM _gp_dyn LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        let ty = Spi::get_one::<i32>(
+            "SELECT floor((20037508.342789244 - ST_Y(ST_Transform(geom,3857))) \
+                    / (2*20037508.342789244) * pow(2,6))::int FROM _gp_dyn LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Dynamic hit: the tile covering the point at z=6 must be sliced live.
+        let dyn_hit = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('dyn', 6, $1, $2)",
+            &[tx.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(dyn_hit.is_some(), "z=6 tile over the point must be sliced on-demand");
+        assert!(!dyn_hit.unwrap().is_empty());
+
+        // Dynamic miss: a z=6 tile far from the point has no data -> NULL.
+        let far_x = if tx > 0 { 0 } else { 63 };
+        let dyn_miss = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('dyn', 6, $1, $2)",
+            &[far_x.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(dyn_miss.is_none(), "empty region at z=6 must return NULL");
+
+        // Switch OFF: rebuild with dynamicBeyondMaxZoom=false => z=6 returns NULL.
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_dyn','geom','gid', \
+             '{\"name\":\"dynoff\",\"minZoom\":0,\"maxZoom\":4,\"dynamicBeyondMaxZoom\":false}')",
+        )
+        .unwrap();
+        let off = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('dynoff', 6, $1, $2)",
+            &[tx.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(off.is_none(), "dynamicBeyondMaxZoom=false must return NULL beyond maxZoom");
+
+        Spi::run("SELECT ST_DropPyramid('dyn')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('dynoff')").unwrap();
+        Spi::run("DROP TABLE _gp_dyn").unwrap();
+    }
 }
 
 /// Required by `cargo pgrx test`.

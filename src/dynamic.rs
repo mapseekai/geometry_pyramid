@@ -51,11 +51,15 @@ pub(crate) fn generate_tile(
 
     // Single tile = degenerate 1x1 range: xmin=xmax=x ($4,$5), ymin=ymax=y
     // ($6,$7). Same 14-param binding as build_zoom_level.
+    //
+    // Drop the GROUP BY: for a 1x1 tile range, ST_AsMVT without GROUP BY is a
+    // global aggregate that always returns exactly 1 row — even when 0 features
+    // intersect the tile (in that case it returns empty bytes). This avoids the
+    // pgrx 0.16 SpiError::InvalidPosition panic that occurs when a query with
+    // GROUP BY returns 0 rows inside a nested SPI call (pg_extern called via SPI).
     let sql = format!(
         r#"SELECT ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
-           {pipeline}
-           GROUP BY t.x, t.y
-           LIMIT 1"#
+           {pipeline}"#
     );
 
     let bytes: Option<Vec<u8>> = Spi::get_one_with_args(
@@ -77,5 +81,7 @@ pub(crate) fn generate_tile(
             knobs.drop_threshold.into(),
         ],
     )?;
-    Ok(bytes)
+    // ST_AsMVT on 0 input rows returns empty bytes (not NULL). Convert empty
+    // MVT to None so callers see NULL for tiles with no features.
+    Ok(bytes.filter(|b| !b.is_empty()))
 }
