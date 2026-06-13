@@ -146,7 +146,15 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
             'fid_column', fid_column, \
             'config', config, \
             'built_at', built_at, \
-            'tile_count', $2::bigint \
+            'tile_count', $2::bigint, \
+            'stats', (SELECT COALESCE(jsonb_agg(jsonb_build_object(\
+                'z', s.z, \
+                'tileCount', s.tile_count, \
+                'totalBytes', s.total_bytes, \
+                'maxTileBytes', s.max_tile_bytes, \
+                'buildMs', s.build_ms, \
+                'attempts', s.attempts) ORDER BY s.z), '[]'::jsonb) \
+                FROM geometry_pyramid_stats s WHERE s.pyramid_name = $1) \
          )::text \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into(), tile_count.into()],

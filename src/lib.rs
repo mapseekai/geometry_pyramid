@@ -107,6 +107,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(ms >= 0);
+        let info = Spi::get_one::<pgrx::JsonB>("SELECT ST_Pyramid('_gp_stats_t')")
+            .unwrap()
+            .expect("metadata should exist");
+        let stats = info.0.get("stats").and_then(|v| v.as_array()).expect("stats array");
+        assert_eq!(stats.len(), 4);
+        assert!(stats[0].get("tileCount").is_some());
         Spi::run("SELECT ST_DropPyramid('_gp_stats_t')").unwrap();
         let rows = Spi::get_one::<i64>(
             "SELECT count(*)::bigint FROM geometry_pyramid_stats WHERE pyramid_name='_gp_stats_t'",
