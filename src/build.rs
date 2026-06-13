@@ -65,6 +65,18 @@ pub fn build(
     )?;
 
     let workers = cfg.parallel.max(1) - 1;
+    if workers > 0 && cfg.tile_size_budget_bytes > 0 {
+        // The budget retry loop wipes a zoom and rebuilds it within the
+        // coordinator's uncommitted transaction. Under parallel>1 the workers
+        // have already COMMITTED their strip rows, so a retry's DELETE is
+        // invisible to the next round's workers and they would collide on the
+        // (z,x,y) primary key. Reject the combination rather than corrupt.
+        return Err(
+            "tileSizeBudgetBytes (budget retry) is not supported with parallel > 1; \
+             set one of them back to its default"
+                .into(),
+        );
+    }
     if workers == 0 {
         // parallel=1: shadow lives in this transaction (no external worker needs to see it).
         crate::shadow::create(pyramid_name)?;
@@ -325,9 +337,12 @@ fn run_zoom_strips(
             inline_strips = chunk;
             continue;
         }
+        // Use a process-unique index, not `slot`: slot numbers repeat every
+        // zoom round, so a worker slow to start could otherwise read a spec
+        // file already overwritten by a later round.
         let filename = crate::worker::spec_filename(
             unsafe { pg_sys::MyProcPid } as u32,
-            slot as u32,
+            crate::worker::next_spec_idx(),
         );
         let spec = crate::worker::WorkerSpec {
             db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),

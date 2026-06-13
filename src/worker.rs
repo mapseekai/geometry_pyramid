@@ -143,10 +143,16 @@ use pgrx::bgworkers::{
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-/// Per-backend counter so successive autonomous workers never reuse a spec
-/// filename within the same backend (which would clobber each other's status
-/// files). Combined with the backend PID this makes every spec path unique.
-static NEXT_SPEC_IDX: AtomicU32 = AtomicU32::new(0);
+/// Per-backend counter so successive workers never reuse a spec filename
+/// within the same backend (which would clobber each other's status files,
+/// or let a slow-to-start worker read a spec already overwritten by a later
+/// round). Combined with the backend PID this makes every spec path unique.
+pub(crate) static NEXT_SPEC_IDX: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a process-unique spec index. Use for every spawned worker.
+pub(crate) fn next_spec_idx() -> u32 {
+    NEXT_SPEC_IDX.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Entry point for dynamic background workers. bgw_extra carries the spec
 /// FILENAME; the worker derives the directory from its own DataDir.
@@ -245,8 +251,7 @@ pub(crate) fn spawn(
 pub(crate) fn exec_sql_autonomous(
     sql: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let idx = NEXT_SPEC_IDX.fetch_add(1, Ordering::Relaxed);
-    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, idx);
+    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, next_spec_idx());
     let spec = WorkerSpec {
         db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
         mode: WorkerMode::ExecSql { sql: sql.to_string() },
