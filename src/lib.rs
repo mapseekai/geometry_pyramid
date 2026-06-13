@@ -124,6 +124,53 @@ mod tests {
         Spi::run("DROP TABLE _gp_stats_t").unwrap();
     }
 
+    /// A failed rebuild must leave the previous tiles intact (atomicity), and a
+    /// successful rebuild must replace them. No shadow tables may be left behind.
+    #[pg_test]
+    fn failed_rebuild_keeps_previous_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_atomic (gid serial PRIMARY KEY, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO _gp_atomic (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
+            .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_atomic','geom','gid','{\"minZoom\":0,\"maxZoom\":1}')",
+        )
+        .unwrap();
+        let before = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_atomic',0,0,0)")
+            .unwrap()
+            .expect("tile must exist after first build");
+
+        // attributes references a non-existent column: passes identifier validation
+        // but the build SQL must error. Capture it in a subtransaction (DO block),
+        // then verify the old tiles still read.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM ST_BuildPyramid('_gp_atomic','geom','gid', \
+                 '{\"minZoom\":0,\"maxZoom\":1,\"attributes\":[\"no_such_col\"]}'); \
+             EXCEPTION WHEN others THEN NULL; END $$",
+        )
+        .unwrap();
+
+        let after = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_atomic',0,0,0)")
+            .unwrap()
+            .expect("previous tile must survive a failed rebuild");
+        assert_eq!(before, after);
+
+        let shadows = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM pg_tables WHERE tablename LIKE '%\\_\\_shadow'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shadows, 0);
+
+        Spi::run("SELECT ST_DropPyramid('_gp_atomic')").unwrap();
+        Spi::run("DROP TABLE _gp_atomic").unwrap();
+    }
+
     /// Tippecanoe-style point dropping must reduce feature counts at low
     /// zoom even though the raw source contains many points.
     #[pg_test]

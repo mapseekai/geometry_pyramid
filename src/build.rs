@@ -6,7 +6,6 @@
 //! them in the right order.
 
 use crate::config::PyramidConfig;
-use crate::storage;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 
@@ -42,6 +41,11 @@ fn zoom_stats(
 }
 
 /// Total tile count emitted across all zoom levels.
+///
+/// Acquires a per-pyramid advisory transaction lock, writes all tiles into
+/// a shadow table, then atomically swaps the shadow into place as the main
+/// tile table. If anything fails before the swap, the transaction aborts and
+/// the shadow DDL is rolled back — leaving the previous main table untouched.
 pub fn build(
     pyramid_name: &str,
     table: &str,
@@ -49,11 +53,30 @@ pub fn build(
     fid_column: &str,
     cfg: &PyramidConfig,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    storage::reset_tile_table(pyramid_name)?;
-    let storage_table = storage::tile_table_name(pyramid_name);
+    // Serialize concurrent builds of the same pyramid for this transaction.
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock(hashtextextended('geometry_pyramid:' || $1, 0))",
+        &[pyramid_name.into()],
+    )?;
 
-    // Source bbox in tile SRS. NULL when the source table is empty — in
-    // which case there is nothing to materialize.
+    crate::shadow::create(pyramid_name)?;
+    let shadow_table = crate::shadow::shadow_table_name(pyramid_name);
+
+    let total = build_into(pyramid_name, &shadow_table, table, geom_column, fid_column, cfg)?;
+
+    crate::shadow::swap(pyramid_name)?;
+    Ok(total)
+}
+
+/// The build loop, writing into an arbitrary target table.
+fn build_into(
+    pyramid_name: &str,
+    storage_table: &str,
+    table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let bbox = source_bbox(table, geom_column, cfg.tile_srs)?;
     let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
         notice!(
@@ -61,7 +84,7 @@ pub fn build(
             table,
             pyramid_name
         );
-        return Ok(0);
+        return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
     let mut total: i64 = 0;
@@ -69,7 +92,7 @@ pub fn build(
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
         let result = build_zoom_level_with_budget(
             pyramid_name,
-            &storage_table,
+            storage_table,
             table,
             geom_column,
             fid_column,

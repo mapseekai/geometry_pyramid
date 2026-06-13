@@ -27,21 +27,6 @@ pub fn tile_table_create_sql(table: &str) -> String {
     )
 }
 
-/// Drop and recreate the storage table for a pyramid.
-pub fn reset_tile_table(pyramid_name: &str) -> Result<(), spi::Error> {
-    let table = tile_table_name(pyramid_name);
-    // Identifiers are validated upstream by `validate_identifier`; re-check
-    // here as a defense-in-depth measure before composing DDL.
-    debug_assert!(
-        table
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    );
-    Spi::run(&format!(r#"DROP TABLE IF EXISTS "{table}""#))?;
-    Spi::run(&tile_table_create_sql(&table))?;
-    Ok(())
-}
-
 /// Drop the storage table if it exists. Used by `ST_DropPyramid`.
 pub fn drop_tile_table(pyramid_name: &str) -> Result<(), spi::Error> {
     let table = tile_table_name(pyramid_name);
