@@ -7,16 +7,16 @@ use crate::config::PyramidConfig;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
-pub struct WorkerSpec {
+pub(crate) struct WorkerSpec {
     pub db_oid: u32,
     pub mode: WorkerMode,
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum WorkerMode {
+pub(crate) enum WorkerMode {
     /// Execute one SQL script in an autonomous (separately committed)
     /// transaction. Used to create the shadow table for parallel builds.
     ExecSql { sql: String },
@@ -37,28 +37,39 @@ pub enum WorkerMode {
 /// Serializable snapshot of build.rs's ZoomKnobs (the budget-retry loop
 /// tightens these per attempt, so they ride along with each round's spec).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct KnobValues {
+pub(crate) struct KnobValues {
     pub simplify_tol_m: f64,
     pub min_area_m2: f64,
     pub min_len_m: f64,
     pub drop_threshold: f64,
 }
 
-pub fn spec_filename(backend_pid: u32, idx: u32) -> String {
+pub(crate) fn spec_filename(backend_pid: u32, idx: u32) -> String {
     format!("gp_{backend_pid}_{idx}.json")
 }
 
-/// $PGDATA/gp_tmp — created on demand.
-pub fn spec_dir() -> PathBuf {
+/// $PGDATA/gp_tmp — created on demand. Must only be called inside a backend
+/// or background-worker process, where `pg_sys::DataDir` is initialized; the
+/// assertion guards against misuse from early `_PG_init`.
+pub(crate) fn spec_dir() -> PathBuf {
     let datadir = unsafe {
-        std::ffi::CStr::from_ptr(pg_sys::DataDir as *const _)
+        let ptr = pg_sys::DataDir;
+        assert!(
+            !ptr.is_null(),
+            "DataDir is NULL — spec_dir called outside backend context"
+        );
+        std::ffi::CStr::from_ptr(ptr as *const _)
             .to_string_lossy()
             .into_owned()
     };
     PathBuf::from(datadir).join("gp_tmp")
 }
 
-pub fn write_spec(
+/// Write a spec file, clearing any stale `.done`/`.err` status. The caller
+/// MUST write the spec BEFORE starting the worker that reads it: the worker
+/// opens the file by name, so an overwrite after it has opened would not be
+/// observed.
+pub(crate) fn write_spec(
     filename: &str,
     spec: &WorkerSpec,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
@@ -71,7 +82,7 @@ pub fn write_spec(
     Ok(path)
 }
 
-pub fn cleanup_spec(path: &PathBuf) {
+pub(crate) fn cleanup_spec(path: &Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(path.with_extension("done"));
     let _ = std::fs::remove_file(path.with_extension("err"));
