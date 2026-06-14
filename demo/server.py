@@ -5,6 +5,7 @@ Serves ST_Tile output at /tiles/{name}/{z}/{x}/{y}.pbf and the static MapLibre
 demo page at /. Single-connection, synchronous — for local acceptance only, not
 production. Connection comes from DATABASE_URL (or libpq PG* env vars).
 """
+
 import os
 import re
 import sys
@@ -14,7 +15,7 @@ from pathlib import Path
 import psycopg
 
 DEMO_DIR = Path(__file__).resolve().parent
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = int(os.environ.get("PORT", "8089"))
 
 # /tiles/<name>/<z>/<x>/<y>.pbf  — name limited to identifier chars.
 _TILE_RE = re.compile(r"^/tiles/([A-Za-z0-9_]+)/(\d+)/(\d+)/(\d+)\.pbf$")
