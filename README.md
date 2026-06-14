@@ -22,7 +22,10 @@ requests beyond `maxZoom` are sliced on-demand from the source table (when
 `dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
 semantics; unknown pyramids return NULL. PNG rendering, coalesce-densest,
 Ganos `splitSize` density-based dynamic build, and `buildRules` remain on the
-roadmap.
+roadmap. Sparse tiles (feature count < `splitSize`, default 10000) are not
+materialized at build time and are sliced on-demand by `ST_Tile`; combined
+with the `maxZoom` level boundary, materialization covers only the dense
+low/mid-zoom tiles.
 
 ## SQL surface
 
@@ -59,12 +62,15 @@ keys mirror Ganos:
 | `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 | `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
+| `splitSize` | `10000` | Tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source. 0 materializes every non-empty tile. |
 
 ## Notes
 
 Pyramid, table, and column identifiers are capped at **45 characters** so
 that derived names (e.g. the `_gp_tiles_<name>__shadow` shadow table used
 during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
+
+> **Note on `splitSize`:** with `splitSize` > 0 (the default is 10000), any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on every request. For a busy tile server over a large source, set `splitSize` to 0 (materialize everything) or tune it to your density so the live-scan fallback stays bounded.
 
 ## Project layout
 
@@ -148,6 +154,7 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
     server-side raster output, matching Ganos.
 11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
 12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics. Ganos `splitSize` density-based dynamic build and `buildRules` remain future work.~~ ✅
+13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅ (`buildRules` per-level rules remain future work).
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 
