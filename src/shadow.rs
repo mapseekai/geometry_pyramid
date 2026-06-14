@@ -53,7 +53,14 @@ pub fn swap(pyramid_name: &str) -> Result<(), spi::Error> {
     let main = storage::tile_table_name(pyramid_name);
     let shadow = shadow_table_name(pyramid_name);
     Spi::run(&format!(r#"DROP TABLE IF EXISTS "{main}""#))?;
-    Spi::run(&format!(r#"ALTER TABLE "{shadow}" RENAME TO "{main}""#))
+    Spi::run(&format!(r#"ALTER TABLE "{shadow}" RENAME TO "{main}""#))?;
+    // ALTER TABLE ... RENAME does not rename the `id` column's owned
+    // bigserial sequence, so realign it to the main table name (DROP main
+    // above also dropped any prior "{main}_id_seq", freeing the name). Keeps
+    // \d / pg_dump output consistent; IF EXISTS guards the no-id-column case.
+    Spi::run(&format!(
+        r#"ALTER SEQUENCE IF EXISTS "{shadow}_id_seq" RENAME TO "{main}_id_seq""#
+    ))
 }
 
 /// Best-effort cleanup of a leftover shadow table.

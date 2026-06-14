@@ -564,6 +564,45 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('dense')").unwrap();
         Spi::run("DROP TABLE _gp_sp").unwrap();
     }
+
+    /// The tile table carries id (serial), format ('pbf'), and srid (= tileSRS).
+    #[pg_test]
+    fn tile_table_has_id_format_srid() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_cols (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO _gp_cols (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
+            .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_cols','geom','gid', \
+             '{\"minZoom\":0,\"maxZoom\":2,\"splitSize\":0}')",
+        )
+        .unwrap();
+
+        let format = Spi::get_one::<String>(
+            "SELECT format FROM _gp_tiles__gp_cols LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(format, "pbf", "format column must be 'pbf'");
+
+        let srid = Spi::get_one::<i32>("SELECT srid FROM _gp_tiles__gp_cols LIMIT 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(srid, 3857, "srid column must equal the default tileSRS (3857)");
+
+        let null_ids = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles__gp_cols WHERE id IS NULL",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(null_ids, 0, "id column must be populated by bigserial");
+
+        Spi::run("SELECT ST_DropPyramid('_gp_cols')").unwrap();
+        Spi::run("DROP TABLE _gp_cols").unwrap();
+    }
 }
 
 /// Required by `cargo pgrx test`.
