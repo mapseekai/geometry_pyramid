@@ -126,14 +126,17 @@ fn st_update_pyramid(
     validate_identifier(name)?;
 
     // Pull catalog row as a single JSON blob to side-step pgrx's
-    // limited multi-column SPI accessors.
+    // limited multi-column SPI accessors. MAX(...) guarantees exactly one row
+    // (NULL when the pyramid is unknown) so get_one_with_args never sees a
+    // 0-row result, which pgrx 0.16 surfaces as a "SpiTupleTable positioned
+    // before the start or after the end" error inside a nested SPI context.
     let row: Option<String> = Spi::get_one_with_args(
-        "SELECT json_build_object( \
+        "SELECT MAX(json_build_object( \
             'source_table', source_table, \
             'geom_column',  geom_column, \
             'fid_column',   fid_column, \
             'config',       config \
-         )::text \
+         )::text) \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into()],
     )?;
@@ -203,14 +206,24 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
         return Ok(None);
     }
     let storage_table = storage::tile_table_name(name);
-    let tile_count = Spi::get_one::<i64>(&format!(
-        r#"SELECT count(*)::bigint FROM "{storage_table}""#
-    ))
-    .unwrap_or(Some(0))
-    .unwrap_or(0);
+    // Only count when the storage table exists. An unknown or
+    // registered-but-unbuilt pyramid has no table; counting it directly would
+    // raise "relation does not exist" (a longjmp that .unwrap_or cannot catch).
+    let reg: Option<String> = Spi::get_one_with_args(
+        "SELECT to_regclass($1)::text",
+        &[format!("\"{storage_table}\"").into()],
+    )?;
+    let tile_count: i64 = if reg.is_some() {
+        Spi::get_one(&format!(r#"SELECT count(*)::bigint FROM "{storage_table}""#))?.unwrap_or(0)
+    } else {
+        0
+    };
 
+    // MAX(...) guarantees exactly one row (NULL when the pyramid is unknown),
+    // so get_one_with_args never sees a 0-row result (which pgrx 0.16 errors on
+    // in a nested SPI context). NULL → Ok(None).
     let row: Option<String> = Spi::get_one_with_args(
-        "SELECT jsonb_build_object( \
+        "SELECT MAX(jsonb_build_object( \
             'name', pyramid_name, \
             'source_table', source_table, \
             'geom_column', geom_column, \
@@ -226,7 +239,7 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
                 'buildMs', s.build_ms, \
                 'attempts', s.attempts) ORDER BY s.z), '[]'::jsonb) \
                 FROM geometry_pyramid_stats s WHERE s.pyramid_name = $1) \
-         )::text \
+         )::text) \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into(), tile_count.into()],
     )?;
