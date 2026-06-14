@@ -98,6 +98,12 @@ pub struct PyramidConfig {
     #[serde(default = "default_max_tile_size_attempts", rename = "maxTileSizeAttempts")]
     pub max_tile_size_attempts: u32,
 
+    /// Tiles whose feature count is below splitSize are NOT materialized at
+    /// build time; ST_Tile slices them on-demand from the source (density
+    /// boundary, mirrors Ganos). 0 disables (materialize every non-empty tile).
+    #[serde(default = "default_split_size", rename = "splitSize")]
+    pub split_size: u32,
+
     /// Upper bound (ms) the coordinator waits for parallel workers per zoom
     /// round. 0 = wait indefinitely.
     #[serde(default, rename = "buildTimeoutMs")]
@@ -165,6 +171,7 @@ impl Default for PyramidConfig {
             drop_rate: DEFAULT_DROP_RATE,
             tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
             max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
+            split_size: 10000,
             build_timeout_ms: 0,
             dynamic_beyond_max_zoom: true,
         }
@@ -221,6 +228,9 @@ fn default_max_tile_size_attempts() -> u32 {
 }
 fn default_dynamic_beyond_max_zoom() -> bool {
     true
+}
+fn default_split_size() -> u32 {
+    10000
 }
 
 #[cfg(test)]
@@ -290,5 +300,14 @@ mod tests {
         assert!(def.dynamic_beyond_max_zoom);
         let off = PyramidConfig::parse(r#"{"dynamicBeyondMaxZoom":false}"#).unwrap();
         assert!(!off.dynamic_beyond_max_zoom);
+    }
+
+    #[test]
+    fn split_size_defaults_10000_and_parses() {
+        assert_eq!(PyramidConfig::default().split_size, 10000);
+        let c = PyramidConfig::parse(r#"{"splitSize":0}"#).unwrap();
+        assert_eq!(c.split_size, 0);
+        let c2 = PyramidConfig::parse(r#"{"splitSize":250}"#).unwrap();
+        assert_eq!(c2.split_size, 250);
     }
 }
