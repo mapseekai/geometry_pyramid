@@ -603,6 +603,37 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('_gp_cols')").unwrap();
         Spi::run("DROP TABLE _gp_cols").unwrap();
     }
+
+    /// The && + tile-envelope-margin candidate filter still produces correct
+    /// tiles: non-empty where the source has geometry, NULL for empty regions.
+    /// (The seamless-edge buffer benefit is validated visually in demo/.)
+    #[pg_test]
+    fn bbox_filter_and_margin_render() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_bbox (gid serial PRIMARY KEY, geom geometry(Polygon, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_bbox (geom) VALUES \
+             (ST_SetSRID(ST_MakeEnvelope(-1, -1, 1, 1), 4326))",
+        )
+        .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_bbox','geom','gid', \
+             '{\"minZoom\":0,\"maxZoom\":3,\"splitSize\":0}')",
+        )
+        .unwrap();
+
+        let z0 = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_bbox', 0, 0, 0)").unwrap();
+        assert!(z0.is_some() && !z0.unwrap().is_empty(), "z0 tile must contain the polygon");
+
+        let empty = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_bbox', 3, 0, 0)").unwrap();
+        assert!(empty.is_none(), "empty region tile must be NULL");
+
+        Spi::run("SELECT ST_DropPyramid('_gp_bbox')").unwrap();
+        Spi::run("DROP TABLE _gp_bbox").unwrap();
+    }
 }
 
 /// Required by `cargo pgrx test`.
