@@ -20,12 +20,12 @@ rebuilt; omitting the clause triggers a full rebuild. `ST_Tile` is now
 **hybrid**: tiles within `maxZoom` are served from materialized storage, while
 requests beyond `maxZoom` are sliced on-demand from the source table (when
 `dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
-semantics; unknown pyramids return NULL. PNG rendering, coalesce-densest,
-Ganos `splitSize` density-based dynamic build, and `buildRules` remain on the
-roadmap. Sparse tiles (feature count < `splitSize`, default 10000) are not
-materialized at build time and are sliced on-demand by `ST_Tile`; combined
-with the `maxZoom` level boundary, materialization covers only the dense
-low/mid-zoom tiles.
+semantics; unknown pyramids return NULL (so do `ST_Pyramid` / `ST_UpdatePyramid`
+on an unknown name — cleanly, never an error). Sparse tiles (feature count <
+`splitSize`, default 10000) are likewise not materialized at build time and are
+sliced on-demand by `ST_Tile`; combined with the `maxZoom` level boundary,
+materialization covers only the dense low/mid-zoom tiles. PNG rendering,
+coalesce-densest, and Ganos `buildRules` (per-level rules) remain on the roadmap.
 
 ## SQL surface
 
@@ -49,7 +49,7 @@ keys mirror Ganos:
 | `name` | _table name_ | Allow multiple pyramids on the same table. |
 | `sourceSRS` | `4326` | SRID of the source `geom` column. |
 | `tileSRS` | `3857` | Tile coordinate system (Web Mercator). |
-| `tileSize` | `4096` | MVT extent. |
+| `tileSize` | `4096` | MVT extent (must be > 0). |
 | `tileExtend` | `8` | Tile-edge buffer to avoid clipping artefacts. |
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
@@ -70,6 +70,12 @@ Pyramid, table, and column identifiers are capped at **45 characters** so
 that derived names (e.g. the `_gp_tiles_<name>__shadow` shadow table used
 during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
 
+Each pyramid's tiles live in a table `_gp_tiles_<name>` with columns
+`id bigserial, z smallint, x integer, y integer, format text, srid integer,
+mvt bytea` and `PRIMARY KEY (z, x, y)`. `format` is currently always `'pbf'`;
+`srid` is the tile coordinate system (`tileSRS`). Consumers may read this table
+directly; `ST_Tile` returns only the `mvt` column.
+
 > **Note on `splitSize`:** with `splitSize` > 0 (the default is 10000), any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on every request. For a busy tile server over a large source, set `splitSize` to 0 (materialize everything) or tune it to your density so the live-scan fallback stays bounded.
 
 ## Project layout
@@ -81,6 +87,7 @@ during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
 ├── rust-toolchain.toml          # pinned toolchain
 ├── .cargo/config.toml           # macOS dynamic_lookup linker flag
 ├── sql/bootstrap.sql            # catalog DDL + ST_Pyramids() (extension_sql_file!)
+├── demo/                        # HTTP tile server + offline MapLibre viewer (see demo/README.md)
 └── src/
     ├── lib.rs                   # pg_module_magic + module wiring + pg_test
     ├── config.rs                # PyramidConfig (JSON parsing)
@@ -129,7 +136,7 @@ SELECT ST_Pyramid('buildings');
 
 For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 
-1. **Bbox prefilter** in source SRS — `ST_Intersects(src.geom, ST_Transform(ST_TileEnvelope(z,x,y), sourceSRS))` so the source's GiST index drives the scan.
+1. **Bbox prefilter** in source SRS — `src.geom && ST_Transform(ST_TileEnvelope(z,x,y, margin => tileExtend/tileSize), sourceSRS)` — an index-only `&&` against the buffer-expanded tile envelope, so the source's GiST index drives the scan and buffer-band edge geometry is included (seamless tile borders).
 2. **Project to tile SRS** — `ST_Transform(geom, tileSRS)` (Web Mercator by default).
 3. **Per-zoom simplification** *(tippecanoe-style)* — `ST_SimplifyPreserveTopology(g, tol_m)` where `tol_m = simplifyPixels × (40 075 016.685 / (tileSize × 2^z))`. Points are skipped.
 4. **Min-feature-size filter** — drop polygons with `ST_Area < (minFeatureSizePixels × pixel_m)²`, lines with `ST_Length < minFeatureSizePixels × pixel_m`.
