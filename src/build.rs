@@ -462,9 +462,9 @@ pub(crate) fn tile_pipeline_from_sql(
                     {attrs_inner}
                  FROM "{table}" src
                  WHERE src."{geom_column}" IS NOT NULL
-                   AND ST_Intersects(
-                          src."{geom_column}",
-                          ST_Transform(ST_TileEnvelope($1, t.x, t.y), $10)
+                   AND src."{geom_column}" && ST_Transform(
+                          ST_TileEnvelope($1, t.x, t.y, margin => ($9::float8 / $3::float8)),
+                          $10
                        )
               ) prep
               WHERE

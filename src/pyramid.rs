@@ -35,6 +35,11 @@ fn st_build_pyramid(
     if cfg.max_zoom > 24 {
         return Err(format!("maxZoom ({}) exceeds the supported limit of 24", cfg.max_zoom).into());
     }
+    if cfg.tile_size == 0 {
+        // tile_size is the MVT extent and the divisor in pixel_size_m and in the
+        // candidate-filter margin (tileExtend/tileSize); zero would divide by zero.
+        return Err("tileSize must be > 0".into());
+    }
 
     Spi::run_with_args(
         "INSERT INTO geometry_pyramid_catalog \
