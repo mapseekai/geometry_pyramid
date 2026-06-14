@@ -479,6 +479,91 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('dynoff')").unwrap();
         Spi::run("DROP TABLE _gp_dyn").unwrap();
     }
+
+    /// splitSize defers sub-threshold (sparse) tiles: they are NOT materialized at
+    /// build time but ST_Tile still serves them by on-demand slicing. splitSize=0
+    /// materializes them as before.
+    #[pg_test]
+    fn split_size_defers_sparse_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_sp (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        // 5 scattered points; at maxZoom=4 each lands in its own tile with 1 feature.
+        Spi::run(
+            "INSERT INTO _gp_sp (geom) VALUES \
+             (ST_SetSRID(ST_MakePoint(30, 40), 4326)), \
+             (ST_SetSRID(ST_MakePoint(-60, -20), 4326)), \
+             (ST_SetSRID(ST_MakePoint(120, 10), 4326)), \
+             (ST_SetSRID(ST_MakePoint(-120, 50), 4326)), \
+             (ST_SetSRID(ST_MakePoint(80, -45), 4326))",
+        )
+        .unwrap();
+
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_sp','geom','gid', \
+             '{\"name\":\"sparse\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":100}')",
+        )
+        .unwrap();
+        let materialized = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_sparse",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(materialized, 0, "splitSize=100 must skip all sub-threshold tiles");
+
+        let tx = Spi::get_one::<i32>(
+            "SELECT floor((ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(30,40),4326),3857)) \
+                    + 20037508.342789244) / (2*20037508.342789244) * pow(2,4))::int",
+        )
+        .unwrap()
+        .unwrap();
+        let ty = Spi::get_one::<i32>(
+            "SELECT floor((20037508.342789244 \
+                    - ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(30,40),4326),3857))) \
+                    / (2*20037508.342789244) * pow(2,4))::int",
+        )
+        .unwrap()
+        .unwrap();
+        let sparse_hit = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('sparse', 4, $1, $2)",
+            &[tx.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(sparse_hit.is_some(), "sparse tile must be sliced on-demand within maxZoom");
+        assert!(!sparse_hit.unwrap().is_empty());
+
+        let far_x = if tx > 0 { 0 } else { 15 };
+        let empty = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('sparse', 4, $1, $2)",
+            &[far_x.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(empty.is_none(), "empty region must return NULL");
+
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_sp','geom','gid', \
+             '{\"name\":\"dense\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":0}')",
+        )
+        .unwrap();
+        let dense_materialized = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_dense",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(dense_materialized > 0, "splitSize=0 must materialize tiles");
+        let dense_hit = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('dense', 4, $1, $2)",
+            &[tx.into(), ty.into()],
+        )
+        .unwrap();
+        assert!(dense_hit.is_some(), "materialized tile must be served from storage");
+
+        Spi::run("SELECT ST_DropPyramid('sparse')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('dense')").unwrap();
+        Spi::run("DROP TABLE _gp_sp").unwrap();
+    }
 }
 
 /// Required by `cargo pgrx test`.

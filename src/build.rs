@@ -506,12 +506,13 @@ pub(crate) fn build_zoom_level(
     let (attrs_inner, attrs_outer) = attribute_projections(cfg);
 
     let pipeline = tile_pipeline_from_sql(table, geom_column, fid_column, &attrs_inner, &attrs_outer);
+    let split_size = cfg.split_size;
     let sql = format!(
         r#"INSERT INTO "{storage_table}" (z, x, y, mvt)
            SELECT $1::smallint, t.x, t.y, ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
            {pipeline}
            GROUP BY t.x, t.y
-           HAVING ST_AsMVT(features.*, $2, $3, 'geom', 'fid') IS NOT NULL"#
+           HAVING count(*) >= {split_size} AND ST_AsMVT(features.*, $2, $3, 'geom', 'fid') IS NOT NULL"#
     );
 
     let inserted_before = inserted_count(storage_table, z)?;

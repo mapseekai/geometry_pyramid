@@ -63,20 +63,38 @@ fn st_tile(
 
     if zu <= cfg.max_zoom {
         // Materialized range: read the storage table. Guard its existence so a
-        // registered-but-unbuilt pyramid yields NULL instead of erroring.
+        // registered-but-unbuilt pyramid is treated as a miss, not an error.
         let table = storage::tile_table_name(name);
         let reg: Option<String> = Spi::get_one_with_args(
             "SELECT to_regclass($1)::text",
             &[format!("\"{table}\"").into()],
         )?;
-        if reg.is_none() {
+        // Wrap in a subquery that always returns exactly one row (NULL on miss) to
+        // avoid the pgrx 0.16 SpiError::InvalidPosition panic that fires when a
+        // get_one_with_args call sees a 0-row result inside a nested SPI context.
+        let hit: Option<Vec<u8>> = if reg.is_some() {
+            Spi::get_one_with_args(
+                &format!(
+                    r#"SELECT (SELECT mvt FROM "{table}" WHERE z = $1 AND x = $2 AND y = $3 LIMIT 1)"#
+                ),
+                &[(z as i16).into(), x.into(), y.into()],
+            )?
+        } else {
+            None
+        };
+        if hit.is_some() {
+            return Ok(hit);
+        }
+        // Storage miss within the materialized range. With splitSize > 0 the tile
+        // may be a deferred sparse tile (or genuinely empty) — slice on-demand;
+        // an empty region yields None. With splitSize == 0 a miss means empty.
+        if cfg.split_size == 0 {
             return Ok(None);
         }
-        let bytes: Option<Vec<u8>> = Spi::get_one_with_args(
-            &format!(r#"SELECT mvt FROM "{table}" WHERE z = $1 AND x = $2 AND y = $3"#),
-            &[(z as i16).into(), x.into(), y.into()],
-        )?;
-        return Ok(bytes);
+        let (source_table, geom_column, fid_column) = catalog_identifiers(&parsed)?;
+        return crate::dynamic::generate_tile(
+            name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y,
+        );
     }
 
     // z > maxZoom: on-demand slice from the source, if enabled. generate_tile
@@ -84,6 +102,16 @@ fn st_tile(
     if !cfg.dynamic_beyond_max_zoom {
         return Ok(None);
     }
+    let (source_table, geom_column, fid_column) = catalog_identifiers(&parsed)?;
+    crate::dynamic::generate_tile(name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y)
+}
+
+/// Extract the source-table / geom / fid identifiers from a parsed catalog row,
+/// erroring clearly if any is NULL. Shared by the materialized-miss fallback and
+/// the beyond-maxZoom dynamic path.
+fn catalog_identifiers(
+    parsed: &serde_json::Value,
+) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
     let source_table = parsed["source_table"]
         .as_str()
         .ok_or("catalog row has NULL source_table")?
@@ -96,5 +124,5 @@ fn st_tile(
         .as_str()
         .ok_or("catalog row has NULL fid_column")?
         .to_string();
-    crate::dynamic::generate_tile(name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y)
+    Ok((source_table, geom_column, fid_column))
 }
