@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>geometry_pyramid demo</title>
+  <link href="./maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+    #hud {
+      position: absolute; top: 8px; left: 8px; z-index: 1;
+      font: 12px/1.4 monospace; background: rgba(0,0,0,.7); color: #fff;
+      padding: 6px 8px; border-radius: 4px;
+    }
+    #hud b { color: #6cf; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="hud">z=<b id="z">0</b> · <span id="mode"></span></div>
+  <script src="./maplibre-gl.js"></script>
+  <script>
+    const PYRAMID = "demo";
+    const MAX_ZOOM = 8; // pyramid maxZoom; beyond this -> dynamic slicing
+    const map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        sources: {
+          pyr: {
+            type: "vector",
+            tiles: [location.origin + "/tiles/" + PYRAMID + "/{z}/{x}/{y}.pbf"],
+            minzoom: 0,
+            maxzoom: 22
+          }
+        },
+        layers: [
+          { id: "bg", type: "background", paint: { "background-color": "#11151c" } },
+          {
+            id: "pts", type: "circle", source: "pyr", "source-layer": PYRAMID,
+            paint: {
+              "circle-radius": 2.5,
+              "circle-color": "#ff5a5f",
+              "circle-opacity": 0.85
+            }
+          }
+        ]
+      },
+      center: [116.49, 40.0],
+      zoom: 9
+    });
+    map.addControl(new maplibregl.NavigationControl());
+    function updateHud() {
+      const z = map.getZoom();
+      document.getElementById("z").textContent = z.toFixed(1);
+      document.getElementById("mode").textContent =
+        z > MAX_ZOOM ? "DYNAMIC (z > maxZoom)" : "materialized";
+    }
+    map.on("zoom", updateHud);
+    map.on("load", updateHud);
+  </script>
+</body>
+</html>
