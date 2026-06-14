@@ -635,6 +635,18 @@ mod tests {
         Spi::run("DROP TABLE _gp_bbox").unwrap();
     }
 
+    /// ST_Pyramid / ST_UpdatePyramid on an unknown pyramid return cleanly
+    /// (NULL / false) instead of erroring. The pg_test body runs inside a
+    /// nested SPI context — exactly where the pgrx 0-row error used to fire.
+    #[pg_test]
+    fn unknown_pyramid_returns_cleanly() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        let info = Spi::get_one::<pgrx::JsonB>("SELECT ST_Pyramid('no_such_pyr')").unwrap();
+        assert!(info.is_none(), "ST_Pyramid(unknown) must be NULL, not error");
+        let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('no_such_pyr', '')").unwrap();
+        assert_eq!(ok, Some(false), "ST_UpdatePyramid(unknown) must return false, not error");
+    }
+
     /// tileSize=0 is rejected (it is the MVT extent and a divisor in the
     /// pixel-size and filter-margin math; zero would divide by zero).
     #[pg_test]
