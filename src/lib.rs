@@ -195,7 +195,7 @@ mod tests {
 
         let ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_drop','geom','gid', \
-              '{\"minZoom\":0,\"maxZoom\":4,\"dropRate\":0.4}')",
+              '{\"minZoom\":0,\"maxZoom\":4,\"dropRate\":0.4,\"splitSize\":0}')",
         )
         .unwrap();
         assert_eq!(ok, Some(true));
@@ -285,7 +285,7 @@ mod tests {
         // Serial build (parallel defaults to 1 — in-transaction path).
         Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_par','geom','gid', \
-             '{\"name\":\"build_ser\",\"minZoom\":0,\"maxZoom\":5}')",
+             '{\"name\":\"build_ser\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":0}')",
         )
         .unwrap();
 
@@ -296,7 +296,7 @@ mod tests {
         Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_par','geom','gid', \
              '{\"name\":\"build_par\",\"minZoom\":0,\"maxZoom\":5,\"parallel\":2, \
-               \"buildTimeoutMs\":60000}')",
+               \"buildTimeoutMs\":60000,\"splitSize\":0}')",
         )
         .unwrap();
 
@@ -355,7 +355,7 @@ mod tests {
         )
         .unwrap();
         Spi::get_one::<bool>(
-            "SELECT ST_BuildPyramid('_gp_inc','geom','gid','{\"minZoom\":0,\"maxZoom\":6}')",
+            "SELECT ST_BuildPyramid('_gp_inc','geom','gid','{\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0}')",
         )
         .unwrap();
 
