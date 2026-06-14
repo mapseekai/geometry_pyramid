@@ -18,10 +18,13 @@ pub fn tile_table_name(pyramid_name: &str) -> String {
 pub fn tile_table_create_sql(table: &str) -> String {
     format!(
         r#"CREATE TABLE "{table}" (
-            z smallint NOT NULL,
-            x integer  NOT NULL,
-            y integer  NOT NULL,
-            mvt bytea  NOT NULL,
+            id     bigserial,
+            z      smallint NOT NULL,
+            x      integer  NOT NULL,
+            y      integer  NOT NULL,
+            format text     NOT NULL,
+            srid   integer  NOT NULL,
+            mvt    bytea    NOT NULL,
             PRIMARY KEY (z, x, y)
         )"#
     )
