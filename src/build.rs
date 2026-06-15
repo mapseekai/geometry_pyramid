@@ -266,31 +266,38 @@ impl ZoomKnobs {
     }
 }
 
+/// Run `inner_sql` — whose single output column must be a geometry/box aliased
+/// `g` — and return its extent as `[xmin, ymin, xmax, ymax]`, or `None` when
+/// `g` is NULL. Centralizes two things every extent query in the crate needs:
+/// the `CASE WHEN g IS NOT NULL` guard (so the outer SELECT always returns one
+/// row — pgrx errors on a 0-row `get_one` result in a nested SPI context) and
+/// the `json_build_array(...)::text` packing the scalar SPI accessor relies on.
+pub(crate) fn bbox_from_query(
+    inner_sql: &str,
+    args: &[pgrx::datum::DatumWithOid],
+) -> Result<Option<[f64; 4]>, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        "SELECT CASE WHEN g IS NOT NULL \
+                THEN json_build_array(ST_XMin(g), ST_YMin(g), ST_XMax(g), ST_YMax(g))::text \
+                ELSE NULL END \
+         FROM ({inner_sql}) s"
+    );
+    let row: Option<String> = Spi::get_one_with_args(&sql, args)?;
+    let Some(s) = row else { return Ok(None) };
+    Ok(Some(serde_json::from_str(&s)?))
+}
+
 fn source_bbox(
     table: &str,
     geom_column: &str,
     tile_srs: i32,
 ) -> Result<Option<(f64, f64, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Identifiers are validated by callers. We pack the four bbox edges
-    // into a JSON array string so we can use Spi::get_one (avoiding the
-    // need for a multi-column SPI accessor).
-    let sql = format!(
-        r#"WITH e AS (
-              SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS env
-              FROM "{table}"
-              WHERE "{geom_column}" IS NOT NULL
-           )
-           SELECT json_build_array(
-                    ST_XMin(env), ST_YMin(env),
-                    ST_XMax(env), ST_YMax(env)
-                  )::text
-           FROM e
-           WHERE env IS NOT NULL"#
+    // Identifiers are validated by callers.
+    let inner = format!(
+        r#"SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS g
+           FROM "{table}" WHERE "{geom_column}" IS NOT NULL"#
     );
-    let row: Option<String> = Spi::get_one_with_args(&sql, &[tile_srs.into()])?;
-    let Some(s) = row else { return Ok(None) };
-    let arr: [f64; 4] = serde_json::from_str(&s)?;
-    Ok(Some((arr[0], arr[1], arr[2], arr[3])))
+    Ok(bbox_from_query(&inner, &[tile_srs.into()])?.map(|a| (a[0], a[1], a[2], a[3])))
 }
 
 /// Execute one zoom round, splitting the rectangle into x-strips and farming

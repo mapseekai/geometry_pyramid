@@ -25,33 +25,20 @@ pub fn update(
         r#"SELECT 1 FROM "{source_table}" WHERE ({where_clause}) LIMIT 0"#
     ))?;
 
-    // Dirty extent in tile SRS. The outer SELECT always returns exactly one
-    // row (the aggregate produces one row even when no input rows match).
-    // We use a CASE to return NULL when env is NULL, so Spi::get_one_with_args
-    // returns Some(None) / None rather than 0 rows (which would panic).
-    let sql = format!(
-        r#"SELECT CASE WHEN env IS NOT NULL
-                  THEN json_build_array(
-                         ST_XMin(env), ST_YMin(env),
-                         ST_XMax(env), ST_YMax(env))::text
-                  ELSE NULL
-                  END
-           FROM (
-              SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS env
-              FROM "{source_table}"
-              WHERE "{geom_column}" IS NOT NULL AND ({where_clause})
-           ) e"#
+    // Dirty extent in tile SRS over the matched rows. bbox_from_query applies
+    // the CASE→NULL guard, so an empty match is Ok(None) here, not a 0-row error.
+    let inner = format!(
+        r#"SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS g
+           FROM "{source_table}"
+           WHERE "{geom_column}" IS NOT NULL AND ({where_clause})"#
     );
-    let row: Option<String> = Spi::get_one_with_args(&sql, &[cfg.tile_srs.into()])?;
-    let Some(s) = row else {
+    let Some(arr) = build::bbox_from_query(&inner, &[cfg.tile_srs.into()])? else {
         notice!(
             "geometry_pyramid: where_clause matched no rows; pyramid '{}' unchanged",
             pyramid_name
         );
         return Ok(0);
     };
-    let arr: [f64; 4] = serde_json::from_str(&s)?;
-    let (xmin_m, ymin_m, xmax_m, ymax_m) = (arr[0], arr[1], arr[2], arr[3]);
 
     rebuild_extent(
         pyramid_name,
@@ -59,10 +46,10 @@ pub fn update(
         geom_column,
         fid_column,
         cfg,
-        xmin_m,
-        ymin_m,
-        xmax_m,
-        ymax_m,
+        arr[0],
+        arr[1],
+        arr[2],
+        arr[3],
     )
 }
 
@@ -161,16 +148,12 @@ pub fn update_extent(
     ymax: f64,
     srid: i32,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    // Transform the caller bbox from `srid` into tileSRS, taking the four
-    // edges. ST_MakeEnvelope normalizes min/max. CASE→NULL on a NULL transform
-    // result so get_one_with_args sees one row, never zero (pgrx 0.16 errors on
-    // a 0-row result inside a nested SPI context). NULL → no-op Ok(0).
-    let sql = r#"SELECT CASE WHEN g IS NOT NULL
-                       THEN json_build_array(ST_XMin(g), ST_YMin(g), ST_XMax(g), ST_YMax(g))::text
-                       ELSE NULL END
-                FROM (SELECT ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,$5), $6) AS g) s"#;
-    let row: Option<String> = Spi::get_one_with_args(
-        sql,
+    // Transform the caller bbox from `srid` into tileSRS, then take its four
+    // edges. ST_MakeEnvelope normalizes min/max; bbox_from_query's CASE→NULL
+    // guard turns a NULL transform result into a no-op Ok(0).
+    let inner = "SELECT ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,$5), $6) AS g";
+    let Some(arr) = build::bbox_from_query(
+        inner,
         &[
             xmin.into(),
             ymin.into(),
@@ -179,9 +162,10 @@ pub fn update_extent(
             srid.into(),
             cfg.tile_srs.into(),
         ],
-    )?;
-    let Some(s) = row else { return Ok(0) };
-    let arr: [f64; 4] = serde_json::from_str(&s)?;
+    )?
+    else {
+        return Ok(0);
+    };
     rebuild_extent(
         pyramid_name, source_table, geom_column, fid_column, cfg,
         arr[0], arr[1], arr[2], arr[3],
