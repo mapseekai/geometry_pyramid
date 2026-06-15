@@ -46,6 +46,12 @@ pub struct CatalogRow {
     pub geom_column: String,
     pub fid_column: String,
     pub config: PyramidConfig,
+    /// Whether the pyramid's `_gp_tiles_<name>` storage table currently exists.
+    /// Computed via `to_regclass` inside the catalog lookup so callers do not
+    /// need a second SPI round-trip to check (a registered-but-unbuilt pyramid
+    /// has a catalog row but no table). Defaults to `false` if absent.
+    #[serde(default)]
+    pub storage_exists: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

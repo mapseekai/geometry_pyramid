@@ -51,17 +51,14 @@ fn st_tile(
     }
 
     if zu <= cfg.max_zoom {
-        // Materialized range: read the storage table. Guard its existence so a
-        // registered-but-unbuilt pyramid is treated as a miss, not an error.
-        let table = storage::tile_table_name(name);
-        let reg: Option<String> = Spi::get_one_with_args(
-            "SELECT to_regclass($1)::text",
-            &[format!("\"{table}\"").into()],
-        )?;
-        // Wrap in a subquery that always returns exactly one row (NULL on miss) to
-        // avoid the pgrx 0.16 SpiError::InvalidPosition panic that fires when a
-        // get_one_with_args call sees a 0-row result inside a nested SPI context.
-        let hit: Option<Vec<u8>> = if reg.is_some() {
+        // Materialized range: read the storage table. catalog_meta already told
+        // us whether it exists (folded into its lookup via to_regclass), so a
+        // registered-but-unbuilt pyramid is a miss, not an error — no extra
+        // round-trip here. The scalar subquery always returns exactly one row
+        // (NULL on miss), dodging pgrx's 0-row InvalidPosition error in a nested
+        // SPI context.
+        let hit: Option<Vec<u8>> = if meta.storage_exists {
+            let table = storage::tile_table_name(name);
             Spi::get_one_with_args(
                 &format!(
                     r#"SELECT (SELECT mvt FROM "{table}" WHERE z = $1 AND x = $2 AND y = $3 LIMIT 1)"#

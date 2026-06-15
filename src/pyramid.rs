@@ -129,15 +129,20 @@ fn st_drop_pyramid(
 pub(crate) fn catalog_meta(
     name: &str,
 ) -> Result<Option<CatalogRow>, Box<dyn std::error::Error + Send + Sync>> {
+    // to_regclass($2) folds the storage-table existence check into this same
+    // round-trip (it returns NULL rather than erroring on a missing relation),
+    // so the hot ST_Tile path no longer needs a separate to_regclass query.
+    let storage_arg = format!("\"{}\"", storage::tile_table_name(name));
     let row: Option<String> = Spi::get_one_with_args(
         "SELECT MAX(json_build_object( \
-            'source_table', source_table, \
-            'geom_column',  geom_column, \
-            'fid_column',   fid_column, \
-            'config',       config \
+            'source_table',   source_table, \
+            'geom_column',    geom_column, \
+            'fid_column',     fid_column, \
+            'config',         config, \
+            'storage_exists', to_regclass($2) IS NOT NULL \
          )::text) \
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
-        &[name.into()],
+        &[name.into(), storage_arg.as_str().into()],
     )?;
     let Some(json) = row else { return Ok(None) };
     let meta: CatalogRow = serde_json::from_str(&json)?;
