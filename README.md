@@ -110,15 +110,15 @@ directly; `ST_Tile` returns only the `mvt` column.
 - `cargo-pgrx`:
 
 ```bash
-cargo install --locked cargo-pgrx --version 0.16.0
-cargo pgrx init --pg16=$(which pg_config)   # or download
+cargo install --locked cargo-pgrx --version 0.18.0
+cargo pgrx init --pg17=$(which pg_config)   # or download
 ```
 
 ## Build / run
 
 ```bash
-cargo check                 # fast compile verification
-cargo pgrx run pg16         # build, install, open psql
+cargo check                 # fast compile verification (default feature: pg17)
+cargo pgrx run pg17         # build, install, open psql
 cargo pgrx test             # run #[test] + #[pg_test]
 cargo pgrx package          # produce installable artefact
 ```
