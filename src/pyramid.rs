@@ -5,10 +5,6 @@ use crate::config::{CatalogRow, PyramidConfig};
 use crate::storage;
 use pgrx::prelude::*;
 
-/// Upper bound for `tileSize` (MVT extent). Well above the common 4096 while
-/// staying clear of the `i32` wrap that the `as i32` bind would otherwise hit.
-const MAX_TILE_SIZE: u32 = 16384;
-
 /// `ST_BuildPyramid(table, geom_column, fid_column, config_json) -> bool`
 ///
 /// Builds (or rebuilds) a vector pyramid for `table` using `geom_column` as
@@ -29,41 +25,8 @@ fn st_build_pyramid(
     let pyramid_name = cfg.name.clone().unwrap_or_else(|| table.to_string());
     validate_identifier(&pyramid_name)?;
 
-    if cfg.min_zoom > cfg.max_zoom {
-        return Err(format!(
-            "minZoom ({}) must be <= maxZoom ({})",
-            cfg.min_zoom, cfg.max_zoom
-        )
-        .into());
-    }
-    if cfg.max_zoom > 24 {
-        return Err(format!("maxZoom ({}) exceeds the supported limit of 24", cfg.max_zoom).into());
-    }
-    if cfg.tile_size == 0 {
-        // tile_size is the MVT extent and the divisor in pixel_size_m and in the
-        // candidate-filter margin (tileExtend/tileSize); zero would divide by zero.
-        return Err("tileSize must be > 0".into());
-    }
-    if cfg.tile_size > MAX_TILE_SIZE {
-        // tile_size (u32) is cast to i32 when bound into ST_AsMVTGeom; a value
-        // past i32::MAX would wrap negative and surface as a confusing PostGIS
-        // error. Cap it at a realistic MVT extent ceiling instead.
-        return Err(format!(
-            "tileSize ({}) exceeds the supported limit of {MAX_TILE_SIZE}",
-            cfg.tile_size
-        )
-        .into());
-    }
-    if cfg.tile_extend >= cfg.tile_size {
-        // The buffer band must be a fraction of the extent; an extend >= the
-        // extent makes the margin ratio (tileExtend/tileSize) >= 1 and clips
-        // nothing meaningfully.
-        return Err(format!(
-            "tileExtend ({}) must be < tileSize ({})",
-            cfg.tile_extend, cfg.tile_size
-        )
-        .into());
-    }
+    // Single source of truth for config invariants (see PyramidConfig::validate).
+    cfg.validate()?;
 
     Spi::run_with_args(
         "INSERT INTO geometry_pyramid_catalog \

@@ -24,6 +24,14 @@ pub const DEFAULT_MAX_TILE_SIZE_ATTEMPTS: u32 = 5;
 /// into a per-pixel ground distance for simplification / size filters.
 pub const WEBMERC_FULL_SPAN_M: f64 = 40_075_016.685_578_488;
 
+/// Largest accepted `maxZoom`. Tile indices stay well within i32 and the
+/// build cost stays bounded.
+pub const MAX_ZOOM_LIMIT: u8 = 24;
+
+/// Upper bound for `tileSize` (MVT extent). Well above the common 4096 while
+/// staying clear of the `i32` wrap that the `as i32` bind would otherwise hit.
+pub const MAX_TILE_SIZE: u32 = 16384;
+
 /// A `geometry_pyramid_catalog` row joined with its parsed `config`, as
 /// produced by the `json_build_object(...)` projection the lookup queries use.
 /// Deserializing straight into this (rather than a `serde_json::Value` plus
@@ -196,6 +204,48 @@ impl PyramidConfig {
         }
         serde_json::from_str(json)
     }
+
+    /// Check the cross-field invariants a build relies on. Pure (no SPI), so it
+    /// is unit-testable and is the single source of truth for these constraints
+    /// — `ST_BuildPyramid` calls it once instead of scattering the checks.
+    ///
+    /// # Errors
+    /// Returns a message describing the first violated invariant:
+    /// `minZoom <= maxZoom`, `maxZoom <= MAX_ZOOM_LIMIT`, `0 < tileSize <=
+    /// MAX_TILE_SIZE`, and `tileExtend < tileSize`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_zoom > self.max_zoom {
+            return Err(format!(
+                "minZoom ({}) must be <= maxZoom ({})",
+                self.min_zoom, self.max_zoom
+            ));
+        }
+        if self.max_zoom > MAX_ZOOM_LIMIT {
+            return Err(format!(
+                "maxZoom ({}) exceeds the supported limit of {MAX_ZOOM_LIMIT}",
+                self.max_zoom
+            ));
+        }
+        // tile_size is the MVT extent and the divisor in pixel_size_m and in the
+        // candidate-filter margin (tileExtend/tileSize); zero would divide by
+        // zero, and a value past i32::MAX wraps negative when bound as i32.
+        if self.tile_size == 0 {
+            return Err("tileSize must be > 0".into());
+        }
+        if self.tile_size > MAX_TILE_SIZE {
+            return Err(format!(
+                "tileSize ({}) exceeds the supported limit of {MAX_TILE_SIZE}",
+                self.tile_size
+            ));
+        }
+        if self.tile_extend >= self.tile_size {
+            return Err(format!(
+                "tileExtend ({}) must be < tileSize ({})",
+                self.tile_extend, self.tile_size
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_source_srs() -> i32 {
@@ -251,6 +301,25 @@ mod tests {
         assert_eq!(cfg.tile_size, DEFAULT_TILE_SIZE);
         assert_eq!(cfg.source_srs, 4326);
         assert_eq!(cfg.tile_srs, 3857);
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(PyramidConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_broken_invariants() {
+        let cases = [
+            PyramidConfig { min_zoom: 5, max_zoom: 3, ..Default::default() },
+            PyramidConfig { max_zoom: 30, ..Default::default() },
+            PyramidConfig { tile_size: 0, ..Default::default() },
+            PyramidConfig { tile_size: 40000, ..Default::default() },
+            PyramidConfig { tile_size: 256, tile_extend: 256, ..Default::default() },
+        ];
+        for cfg in cases {
+            assert!(cfg.validate().is_err(), "expected rejection for {cfg:?}");
+        }
     }
 
     #[test]
