@@ -4,36 +4,32 @@
 //! (crate::build::tile_pipeline_from_sql), so tiles are visually consistent
 //! across the materialized/dynamic boundary. Read-only; nothing is cached.
 
-use crate::config::PyramidConfig;
+use crate::source::PyramidSource;
 use pgrx::prelude::*;
 
 /// Slice a single (z, x, y) tile from the source table and return its MVT
 /// bytes, or None when the source has no features there (or the source table
-/// is missing). `source_table` / `geom_column` / `fid_column` must be
-/// validated identifiers (callers pass catalog values re-validated upstream).
-#[allow(clippy::too_many_arguments)]
+/// is missing). `src`'s identifiers must be validated (callers pass catalog
+/// values re-validated upstream); they are re-validated here for defense.
 pub(crate) fn generate_tile(
-    pyramid_name: &str,
-    source_table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
+    src: PyramidSource,
     z: u8,
     x: i32,
     y: i32,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = src.cfg;
     // Defense-in-depth: these identifiers are interpolated into dynamic SQL.
     // Callers pass catalog values (validated at build time), but this is a
     // pub(crate) entry point, so re-validate here rather than trust the caller.
-    crate::pyramid::validate_identifier(source_table)?;
-    crate::pyramid::validate_identifier(geom_column)?;
-    crate::pyramid::validate_identifier(fid_column)?;
+    crate::pyramid::validate_identifier(src.source_table)?;
+    crate::pyramid::validate_identifier(src.geom_column)?;
+    crate::pyramid::validate_identifier(src.fid_column)?;
 
     // Guard against a stale catalog pointing at a dropped source table:
     // to_regclass returns NULL (not an error) for a missing relation.
     let reg: Option<String> = Spi::get_one_with_args(
         "SELECT to_regclass($1)::text",
-        &[format!("\"{source_table}\"").into()],
+        &[format!("\"{}\"", src.source_table).into()],
     )?;
     if reg.is_none() {
         return Ok(None);
@@ -42,9 +38,9 @@ pub(crate) fn generate_tile(
     let knobs = crate::build::ZoomKnobs::from_config(cfg, z).to_values();
     let (attrs_inner, attrs_outer) = crate::build::attribute_projections(cfg);
     let pipeline = crate::build::tile_pipeline_from_sql(
-        source_table,
-        geom_column,
-        fid_column,
+        src.source_table,
+        src.geom_column,
+        src.fid_column,
         &attrs_inner,
         &attrs_outer,
     );
@@ -66,7 +62,7 @@ pub(crate) fn generate_tile(
         &sql,
         &[
             (z as i32).into(),
-            pyramid_name.into(),
+            src.name.into(),
             (cfg.tile_size as i32).into(),
             x.into(),
             x.into(),

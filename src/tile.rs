@@ -10,6 +10,7 @@
 //!                                when `dynamicBeyondMaxZoom = true`, else NULL
 //!   • unknown pyramid          → NULL (catalog-first; never touches storage)
 
+use crate::source::PyramidSource;
 use crate::storage;
 use pgrx::prelude::*;
 
@@ -43,7 +44,14 @@ fn st_tile(
     let Some(meta) = crate::pyramid::catalog_meta(name)? else {
         return Ok(None);
     };
-    let cfg = &meta.config;
+    let src = PyramidSource {
+        name,
+        source_table: &meta.source_table,
+        geom_column: &meta.geom_column,
+        fid_column: &meta.fid_column,
+        cfg: &meta.config,
+    };
+    let cfg = src.cfg;
 
     let zu = z as u8;
     if zu < cfg.min_zoom {
@@ -77,9 +85,7 @@ fn st_tile(
         if cfg.split_size == 0 {
             return Ok(None);
         }
-        return crate::dynamic::generate_tile(
-            name, &meta.source_table, &meta.geom_column, &meta.fid_column, cfg, zu, x, y,
-        );
+        return crate::dynamic::generate_tile(src, zu, x, y);
     }
 
     // z > maxZoom: on-demand slice from the source, if enabled. generate_tile
@@ -87,7 +93,5 @@ fn st_tile(
     if !cfg.dynamic_beyond_max_zoom {
         return Ok(None);
     }
-    crate::dynamic::generate_tile(
-        name, &meta.source_table, &meta.geom_column, &meta.fid_column, cfg, zu, x, y,
-    )
+    crate::dynamic::generate_tile(src, zu, x, y)
 }

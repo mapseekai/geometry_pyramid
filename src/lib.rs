@@ -14,6 +14,7 @@ mod dynamic;
 mod incremental;
 mod pyramid;
 mod shadow;
+mod source;
 mod stats;
 mod storage;
 mod tile;

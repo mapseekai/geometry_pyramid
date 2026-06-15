@@ -209,19 +209,17 @@ fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + 
             strips,
         } => {
             let k = crate::build::ZoomKnobs::from_values(*knobs);
+            let src = crate::source::PyramidSource {
+                name: pyramid_name,
+                source_table,
+                geom_column,
+                fid_column,
+                cfg: config,
+            };
             for rect in strips {
                 let result: Result<i64, pgrx::spi::Error> =
                     BackgroundWorker::transaction(|| {
-                        crate::build::build_zoom_level(
-                            pyramid_name,
-                            storage_table,
-                            source_table,
-                            geom_column,
-                            fid_column,
-                            config,
-                            rect,
-                            &k,
-                        )
+                        crate::build::build_zoom_level(src, storage_table, rect, &k)
                     });
                 result?;
             }

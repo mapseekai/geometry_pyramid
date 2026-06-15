@@ -2,6 +2,7 @@
 
 use crate::build;
 use crate::config::{CatalogRow, PyramidConfig};
+use crate::source::PyramidSource;
 use crate::storage;
 use pgrx::prelude::*;
 
@@ -47,7 +48,14 @@ fn st_build_pyramid(
         ],
     )?;
 
-    let total = build::build(&pyramid_name, table, geom_column, fid_column, &cfg)?;
+    let src = PyramidSource {
+        name: &pyramid_name,
+        source_table: table,
+        geom_column,
+        fid_column,
+        cfg: &cfg,
+    };
+    let total = build::build(src)?;
     notice!(
         "geometry_pyramid: pyramid '{}' built with {} tile(s) across z={}..={}",
         pyramid_name,
@@ -162,18 +170,18 @@ fn st_update_pyramid(
     let Some(meta) = catalog_meta(name)? else {
         return Ok(false);
     };
+    let src = PyramidSource {
+        name,
+        source_table: &meta.source_table,
+        geom_column: &meta.geom_column,
+        fid_column: &meta.fid_column,
+        cfg: &meta.config,
+    };
 
     let total = if where_clause.trim().is_empty() {
-        build::build(name, &meta.source_table, &meta.geom_column, &meta.fid_column, &meta.config)?
+        build::build(src)?
     } else {
-        crate::incremental::update(
-            name,
-            &meta.source_table,
-            &meta.geom_column,
-            &meta.fid_column,
-            &meta.config,
-            where_clause,
-        )?
+        crate::incremental::update(src, where_clause)?
     };
     Spi::run_with_args(
         "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
@@ -221,18 +229,14 @@ fn st_update_pyramid_by_extent(
     let Some(meta) = catalog_meta(name)? else {
         return Ok(false);
     };
-    let total = crate::incremental::update_extent(
+    let src = PyramidSource {
         name,
-        &meta.source_table,
-        &meta.geom_column,
-        &meta.fid_column,
-        &meta.config,
-        xmin,
-        ymin,
-        xmax,
-        ymax,
-        srid,
-    )?;
+        source_table: &meta.source_table,
+        geom_column: &meta.geom_column,
+        fid_column: &meta.fid_column,
+        cfg: &meta.config,
+    };
+    let total = crate::incremental::update_extent(src, xmin, ymin, xmax, ymax, srid)?;
     Spi::run_with_args(
         "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
         &[name.into()],

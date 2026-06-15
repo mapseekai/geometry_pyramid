@@ -6,6 +6,7 @@
 //! them in the right order.
 
 use crate::config::PyramidConfig;
+use crate::source::PyramidSource;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 
@@ -46,13 +47,7 @@ fn zoom_stats(
 /// a shadow table, then atomically swaps the shadow into place as the main
 /// tile table. If anything fails before the swap, the transaction aborts and
 /// the shadow DDL is rolled back — leaving the previous main table untouched.
-pub fn build(
-    pyramid_name: &str,
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+pub fn build(src: PyramidSource) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     // Serialize concurrent builds of the same pyramid for this transaction.
     // The advisory-lock namespace is cluster-global (shared across all
     // databases); the `geometry_pyramid:` prefix makes a collision with an
@@ -61,11 +56,11 @@ pub fn build(
     // on the transactional shadow swap.
     Spi::run_with_args(
         "SELECT pg_advisory_xact_lock(hashtextextended('geometry_pyramid:' || $1, 0))",
-        &[pyramid_name.into()],
+        &[src.name.into()],
     )?;
 
-    let workers = cfg.parallel.max(1) - 1;
-    if workers > 0 && cfg.tile_size_budget_bytes > 0 {
+    let workers = src.cfg.parallel.max(1) - 1;
+    if workers > 0 && src.cfg.tile_size_budget_bytes > 0 {
         // The budget retry loop wipes a zoom and rebuilds it within the
         // coordinator's uncommitted transaction. Under parallel>1 the workers
         // have already COMMITTED their strip rows, so a retry's DELETE is
@@ -79,52 +74,40 @@ pub fn build(
     }
     if workers == 0 {
         // parallel=1: shadow lives in this transaction (no external worker needs to see it).
-        crate::shadow::create(pyramid_name)?;
+        crate::shadow::create(src.name)?;
     } else {
         // parallel>1: workers are independent backends, so the shadow DDL must be
         // COMMITTED before they can see it — run it via an autonomous worker.
-        crate::worker::exec_sql_autonomous(&crate::shadow::create_sql(pyramid_name))?;
+        crate::worker::exec_sql_autonomous(&crate::shadow::create_sql(src.name))?;
     }
-    let shadow_table = crate::shadow::shadow_table_name(pyramid_name);
+    let shadow_table = crate::shadow::shadow_table_name(src.name);
 
-    let total = build_into(pyramid_name, &shadow_table, table, geom_column, fid_column, cfg)?;
+    let total = build_into(src, &shadow_table)?;
 
-    crate::shadow::swap(pyramid_name)?;
+    crate::shadow::swap(src.name)?;
     Ok(total)
 }
 
 /// The build loop, writing into an arbitrary target table.
 fn build_into(
-    pyramid_name: &str,
+    src: PyramidSource,
     storage_table: &str,
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    let bbox = source_bbox(table, geom_column, cfg.tile_srs)?;
+    let bbox = source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?;
     let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
         notice!(
             "geometry_pyramid: source table '{}' has no rows; pyramid '{}' is empty",
-            table,
-            pyramid_name
+            src.source_table,
+            src.name
         );
         return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
     let mut total: i64 = 0;
-    for z in cfg.min_zoom..=cfg.max_zoom {
+    for z in src.cfg.min_zoom..=src.cfg.max_zoom {
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
-        let result = build_zoom_level_with_budget(
-            pyramid_name,
-            storage_table,
-            table,
-            geom_column,
-            fid_column,
-            cfg,
-            &rect,
-        )?;
-        crate::stats::upsert_zoom_stats(pyramid_name, &result)?;
+        let result = build_zoom_level_with_budget(src, storage_table, &rect)?;
+        crate::stats::upsert_zoom_stats(src.name, &result)?;
         total += result.tiles;
     }
     Ok(total)
@@ -135,14 +118,11 @@ fn build_into(
 /// tighter knobs (more simplification, larger minimum-feature size, lower
 /// retention). Bounded by `max_tile_size_attempts`.
 fn build_zoom_level_with_budget(
-    pyramid_name: &str,
+    src: PyramidSource,
     storage_table: &str,
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
     rect: &TileRect,
 ) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = src.cfg;
     let started = std::time::Instant::now();
     let z = rect.z;
     let pixel_m = cfg.pixel_size_m(z);
@@ -164,21 +144,12 @@ fn build_zoom_level_with_budget(
         // visible to subsequent worker txns only after coordinator commit). For
         // the default tile_size_budget_bytes=0 there are no retries, so this is
         // a non-issue in the common path.
-        run_zoom_strips(
-            pyramid_name,
-            storage_table,
-            table,
-            geom_column,
-            fid_column,
-            cfg,
-            rect,
-            &knobs,
-        )?;
+        run_zoom_strips(src, storage_table, rect, &knobs)?;
 
         let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         notice!(
             "geometry_pyramid: pyramid '{}' z={} attempt={} -> {} tiles",
-            pyramid_name,
+            src.name,
             z,
             attempt,
             tiles
@@ -206,7 +177,7 @@ fn build_zoom_level_with_budget(
         knobs.tighten(factor, pixel_m);
         notice!(
             "geometry_pyramid: pyramid '{}' z={} max_tile={} bytes > budget {} -> tighten x{:.2}",
-            pyramid_name,
+            src.name,
             z,
             max_tile_bytes,
             cfg.tile_size_budget_bytes,
@@ -305,29 +276,15 @@ fn source_bbox(
 /// in the coordinator; a failed spawn degrades that slot to inline execution.
 /// Returns the total tile count for the zoom (recounted from the table so it
 /// includes rows committed by workers).
-#[allow(clippy::too_many_arguments)]
 fn run_zoom_strips(
-    pyramid_name: &str,
+    src: PyramidSource,
     storage_table: &str,
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
     rect: &TileRect,
     knobs: &ZoomKnobs,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    let workers = cfg.parallel.max(1) - 1;
+    let workers = src.cfg.parallel.max(1) - 1;
     if workers == 0 {
-        build_zoom_level(
-            pyramid_name,
-            storage_table,
-            table,
-            geom_column,
-            fid_column,
-            cfg,
-            rect,
-            knobs,
-        )?;
+        build_zoom_level(src, storage_table, rect, knobs)?;
         return Ok(inserted_count(storage_table, rect.z)?);
     }
 
@@ -354,12 +311,12 @@ fn run_zoom_strips(
         let spec = crate::worker::WorkerSpec {
             db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
             mode: crate::worker::WorkerMode::BuildStrips {
-                pyramid_name: pyramid_name.to_string(),
+                pyramid_name: src.name.to_string(),
                 storage_table: storage_table.to_string(),
-                source_table: table.to_string(),
-                geom_column: geom_column.to_string(),
-                fid_column: fid_column.to_string(),
-                config: cfg.clone(),
+                source_table: src.source_table.to_string(),
+                geom_column: src.geom_column.to_string(),
+                fid_column: src.fid_column.to_string(),
+                config: src.cfg.clone(),
                 knobs: knobs.to_values(),
                 strips: chunk.clone(),
             },
@@ -384,19 +341,10 @@ fn run_zoom_strips(
 
     // Coordinator builds its own share while workers run.
     for strip in &inline_strips {
-        build_zoom_level(
-            pyramid_name,
-            storage_table,
-            table,
-            geom_column,
-            fid_column,
-            cfg,
-            strip,
-            knobs,
-        )?;
+        build_zoom_level(src, storage_table, strip, knobs)?;
     }
 
-    let wait_result = crate::worker::wait_for(&spec_paths, cfg.build_timeout_ms);
+    let wait_result = crate::worker::wait_for(&spec_paths, src.cfg.build_timeout_ms);
     for p in &spec_paths {
         crate::worker::cleanup_spec(p);
     }
@@ -491,15 +439,12 @@ pub(crate) fn tile_pipeline_from_sql(
 }
 
 pub(crate) fn build_zoom_level(
-    pyramid_name: &str,
+    src: PyramidSource,
     storage_table: &str,
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    cfg: &PyramidConfig,
     rect: &TileRect,
     knobs: &ZoomKnobs,
 ) -> Result<i64, spi::Error> {
+    let cfg = src.cfg;
     let z = rect.z;
     let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
 
@@ -512,7 +457,8 @@ pub(crate) fn build_zoom_level(
 
     let (attrs_inner, attrs_outer) = attribute_projections(cfg);
 
-    let pipeline = tile_pipeline_from_sql(table, geom_column, fid_column, &attrs_inner, &attrs_outer);
+    let pipeline =
+        tile_pipeline_from_sql(src.source_table, src.geom_column, src.fid_column, &attrs_inner, &attrs_outer);
     let split_size = cfg.split_size;
     let sql = format!(
         r#"INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
@@ -528,7 +474,7 @@ pub(crate) fn build_zoom_level(
         &sql,
         &[
             (z as i32).into(),
-            pyramid_name.into(),
+            src.name.into(),
             (cfg.tile_size as i32).into(),
             (xmin_t as i32).into(),
             (xmax_t as i32).into(),
