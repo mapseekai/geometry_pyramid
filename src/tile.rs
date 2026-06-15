@@ -37,24 +37,13 @@ fn st_tile(
     }
 
     // Catalog-first: an unknown pyramid yields NULL (never an error), and the
-    // config tells us where the materialized/dynamic boundary is.
-    // Wrap in a subquery with MAX so the outer SELECT always returns exactly
-    // one row; pgrx 0.16's get_one_with_args panics on 0-row results from
-    // pg_extern context when called nested inside an SPI session.
-    let row: Option<String> = Spi::get_one_with_args(
-        "SELECT MAX(json_build_object( \
-            'source_table', source_table, \
-            'geom_column',  geom_column, \
-            'fid_column',   fid_column, \
-            'config',       config \
-         )::text) \
-         FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
-        &[name.into()],
-    )?;
-    let Some(json) = row else { return Ok(None) };
-    let parsed: serde_json::Value = serde_json::from_str(&json)?;
-    let cfg: crate::config::PyramidConfig =
-        serde_json::from_value(parsed["config"].clone())?;
+    // config tells us where the materialized/dynamic boundary is. catalog_meta
+    // deserializes the row once (no intermediate Value clone) and re-validates
+    // the source identifiers it carries.
+    let Some(meta) = crate::pyramid::catalog_meta(name)? else {
+        return Ok(None);
+    };
+    let cfg = &meta.config;
 
     let zu = z as u8;
     if zu < cfg.min_zoom {
@@ -91,9 +80,8 @@ fn st_tile(
         if cfg.split_size == 0 {
             return Ok(None);
         }
-        let (source_table, geom_column, fid_column) = catalog_identifiers(&parsed)?;
         return crate::dynamic::generate_tile(
-            name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y,
+            name, &meta.source_table, &meta.geom_column, &meta.fid_column, cfg, zu, x, y,
         );
     }
 
@@ -102,27 +90,7 @@ fn st_tile(
     if !cfg.dynamic_beyond_max_zoom {
         return Ok(None);
     }
-    let (source_table, geom_column, fid_column) = catalog_identifiers(&parsed)?;
-    crate::dynamic::generate_tile(name, &source_table, &geom_column, &fid_column, &cfg, zu, x, y)
-}
-
-/// Extract the source-table / geom / fid identifiers from a parsed catalog row,
-/// erroring clearly if any is NULL. Shared by the materialized-miss fallback and
-/// the beyond-maxZoom dynamic path.
-fn catalog_identifiers(
-    parsed: &serde_json::Value,
-) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let source_table = parsed["source_table"]
-        .as_str()
-        .ok_or("catalog row has NULL source_table")?
-        .to_string();
-    let geom_column = parsed["geom_column"]
-        .as_str()
-        .ok_or("catalog row has NULL geom_column")?
-        .to_string();
-    let fid_column = parsed["fid_column"]
-        .as_str()
-        .ok_or("catalog row has NULL fid_column")?
-        .to_string();
-    Ok((source_table, geom_column, fid_column))
+    crate::dynamic::generate_tile(
+        name, &meta.source_table, &meta.geom_column, &meta.fid_column, cfg, zu, x, y,
+    )
 }

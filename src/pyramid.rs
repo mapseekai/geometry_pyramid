@@ -1,9 +1,13 @@
 //! Top-level SQL surface for pyramid lifecycle management.
 
 use crate::build;
-use crate::config::PyramidConfig;
+use crate::config::{CatalogRow, PyramidConfig};
 use crate::storage;
 use pgrx::prelude::*;
+
+/// Upper bound for `tileSize` (MVT extent). Well above the common 4096 while
+/// staying clear of the `i32` wrap that the `as i32` bind would otherwise hit.
+const MAX_TILE_SIZE: u32 = 16384;
 
 /// `ST_BuildPyramid(table, geom_column, fid_column, config_json) -> bool`
 ///
@@ -39,6 +43,26 @@ fn st_build_pyramid(
         // tile_size is the MVT extent and the divisor in pixel_size_m and in the
         // candidate-filter margin (tileExtend/tileSize); zero would divide by zero.
         return Err("tileSize must be > 0".into());
+    }
+    if cfg.tile_size > MAX_TILE_SIZE {
+        // tile_size (u32) is cast to i32 when bound into ST_AsMVTGeom; a value
+        // past i32::MAX would wrap negative and surface as a confusing PostGIS
+        // error. Cap it at a realistic MVT extent ceiling instead.
+        return Err(format!(
+            "tileSize ({}) exceeds the supported limit of {MAX_TILE_SIZE}",
+            cfg.tile_size
+        )
+        .into());
+    }
+    if cfg.tile_extend >= cfg.tile_size {
+        // The buffer band must be a fraction of the extent; an extend >= the
+        // extent makes the margin ratio (tileExtend/tileSize) >= 1 and clips
+        // nothing meaningfully.
+        return Err(format!(
+            "tileExtend ({}) must be < tileSize ({})",
+            cfg.tile_extend, cfg.tile_size
+        )
+        .into());
     }
 
     Spi::run_with_args(
@@ -129,17 +153,19 @@ fn st_drop_pyramid(
 ///   rows and is a no-op — the old tile is never cleaned. Use a clause that
 ///   matches by region (e.g. `ST_Intersects(geom_or_bbox, ...)` against a
 ///   captured old extent), or a full rebuild.
-/// Load and validate a pyramid's catalog row: (source_table, geom_column,
-/// fid_column, config). Returns `None` when the pyramid is unknown.
+/// Load and validate a pyramid's catalog row (source/geom/fid identifiers plus
+/// parsed config). Returns `None` when the pyramid is unknown.
 ///
 /// The MAX(...) wrapper guarantees exactly one row (NULL when unknown) so
 /// `get_one_with_args` never sees a 0-row result, which pgrx 0.16 surfaces as
 /// a "SpiTupleTable positioned before the start or after the end" error inside
-/// a nested SPI context. The three identifiers are re-validated before they
-/// ride into dynamic SQL — defense-in-depth, matching ST_BuildPyramid.
+/// a nested SPI context. The row is deserialized straight into `CatalogRow`
+/// (one pass, no intermediate `Value` clone). The three identifiers are
+/// re-validated before they ride into dynamic SQL — defense-in-depth, matching
+/// ST_BuildPyramid.
 pub(crate) fn catalog_meta(
     name: &str,
-) -> Result<Option<(String, String, String, PyramidConfig)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<CatalogRow>, Box<dyn std::error::Error + Send + Sync>> {
     let row: Option<String> = Spi::get_one_with_args(
         "SELECT MAX(json_build_object( \
             'source_table', source_table, \
@@ -151,24 +177,11 @@ pub(crate) fn catalog_meta(
         &[name.into()],
     )?;
     let Some(json) = row else { return Ok(None) };
-    let parsed: serde_json::Value = serde_json::from_str(&json)?;
-    let source_table = parsed["source_table"]
-        .as_str()
-        .ok_or("catalog row has NULL source_table")?
-        .to_string();
-    let geom_column = parsed["geom_column"]
-        .as_str()
-        .ok_or("catalog row has NULL geom_column")?
-        .to_string();
-    let fid_column = parsed["fid_column"]
-        .as_str()
-        .ok_or("catalog row has NULL fid_column")?
-        .to_string();
-    let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
-    validate_identifier(&source_table)?;
-    validate_identifier(&geom_column)?;
-    validate_identifier(&fid_column)?;
-    Ok(Some((source_table, geom_column, fid_column, cfg)))
+    let meta: CatalogRow = serde_json::from_str(&json)?;
+    validate_identifier(&meta.source_table)?;
+    validate_identifier(&meta.geom_column)?;
+    validate_identifier(&meta.fid_column)?;
+    Ok(Some(meta))
 }
 
 #[pg_extern(name = "st_updatepyramid")]
@@ -178,19 +191,19 @@ fn st_update_pyramid(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     validate_identifier(name)?;
 
-    let Some((source_table, geom_column, fid_column, cfg)) = catalog_meta(name)? else {
+    let Some(meta) = catalog_meta(name)? else {
         return Ok(false);
     };
 
     let total = if where_clause.trim().is_empty() {
-        build::build(name, &source_table, &geom_column, &fid_column, &cfg)?
+        build::build(name, &meta.source_table, &meta.geom_column, &meta.fid_column, &meta.config)?
     } else {
         crate::incremental::update(
             name,
-            &source_table,
-            &geom_column,
-            &fid_column,
-            &cfg,
+            &meta.source_table,
+            &meta.geom_column,
+            &meta.fid_column,
+            &meta.config,
             where_clause,
         )?
     };
@@ -237,15 +250,15 @@ fn st_update_pyramid_by_extent(
     srid: i32,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     validate_identifier(name)?;
-    let Some((source_table, geom_column, fid_column, cfg)) = catalog_meta(name)? else {
+    let Some(meta) = catalog_meta(name)? else {
         return Ok(false);
     };
     let total = crate::incremental::update_extent(
         name,
-        &source_table,
-        &geom_column,
-        &fid_column,
-        &cfg,
+        &meta.source_table,
+        &meta.geom_column,
+        &meta.fid_column,
+        &meta.config,
         xmin,
         ymin,
         xmax,

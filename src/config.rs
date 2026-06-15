@@ -24,6 +24,22 @@ pub const DEFAULT_MAX_TILE_SIZE_ATTEMPTS: u32 = 5;
 /// into a per-pixel ground distance for simplification / size filters.
 pub const WEBMERC_FULL_SPAN_M: f64 = 40_075_016.685_578_488;
 
+/// A `geometry_pyramid_catalog` row joined with its parsed `config`, as
+/// produced by the `json_build_object(...)` projection the lookup queries use.
+/// Deserializing straight into this (rather than a `serde_json::Value` plus
+/// per-field string indexing and a `config` deep-clone) keeps the hot
+/// `ST_Tile` path allocation-light and the parsing in one typed place.
+///
+/// A NULL `source_table` / `geom_column` / `fid_column` fails deserialization
+/// with a clean serde error — the same outcome as the previous `.ok_or` guards.
+#[derive(Debug, Deserialize)]
+pub struct CatalogRow {
+    pub source_table: String,
+    pub geom_column: String,
+    pub fid_column: String,
+    pub config: PyramidConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     /// Optional pyramid name. Defaults to the source table name.
