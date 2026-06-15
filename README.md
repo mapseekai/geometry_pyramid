@@ -55,7 +55,6 @@ keys mirror Ganos:
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
 | `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
-| `sparse` | `true` | Skip empty tiles. |
 | `attributes` | `[]` | Columns to include in MVT features. |
 | `simplifyPixels` | `1.0` | DP tolerance in tile pixels (≈1 px ≈ tippecanoe default). 0 disables. |
 | `minFeatureSizePixels` | `0.0` | Drop polygons whose area `<` and lines `<` this many tile pixels. 0 disables. |

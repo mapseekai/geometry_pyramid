@@ -59,10 +59,6 @@ pub struct PyramidConfig {
     #[serde(default = "default_parallel")]
     pub parallel: u32,
 
-    /// When true, only generate tiles for non-empty regions (sparse pyramid).
-    #[serde(default = "default_sparse")]
-    pub sparse: bool,
-
     /// Optional list of attribute columns to include in MVT features.
     #[serde(default)]
     pub attributes: Vec<String>,
@@ -164,7 +160,6 @@ impl Default for PyramidConfig {
             min_zoom: DEFAULT_MIN_ZOOM,
             max_zoom: DEFAULT_MAX_ZOOM,
             parallel: DEFAULT_PARALLEL,
-            sparse: true,
             attributes: Vec::new(),
             simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
             min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
@@ -208,9 +203,6 @@ fn default_max_zoom() -> u8 {
 fn default_parallel() -> u32 {
     DEFAULT_PARALLEL
 }
-fn default_sparse() -> bool {
-    true
-}
 fn default_simplify_pixels() -> f64 {
     DEFAULT_SIMPLIFY_PIXELS
 }
@@ -243,7 +235,6 @@ mod tests {
         assert_eq!(cfg.tile_size, DEFAULT_TILE_SIZE);
         assert_eq!(cfg.source_srs, 4326);
         assert_eq!(cfg.tile_srs, 3857);
-        assert!(cfg.sparse);
     }
 
     #[test]
