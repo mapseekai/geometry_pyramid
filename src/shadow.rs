@@ -66,7 +66,20 @@ pub fn swap(pyramid_name: &str) -> Result<(), spi::Error> {
 /// Best-effort cleanup of a leftover shadow table.
 pub fn abandon(pyramid_name: &str) -> Result<(), spi::Error> {
     let shadow = shadow_table_name(pyramid_name);
-    Spi::run(&format!(r#"DROP TABLE IF EXISTS "{shadow}""#))
+    // Only attempt the DROP when the shadow actually exists. A normal drop has
+    // no leftover shadow (a successful build renamed it to the main table), so
+    // a bare `DROP TABLE IF EXISTS` would emit a chatty "does not exist,
+    // skipping" NOTICE every time. to_regclass returns NULL (no error) when the
+    // relation is missing; IF EXISTS is retained so a concurrent drop between
+    // the check and the DROP is still a no-op rather than an error.
+    let exists: Option<String> = Spi::get_one_with_args(
+        "SELECT to_regclass($1)::text",
+        &[format!("\"{shadow}\"").into()],
+    )?;
+    if exists.is_some() {
+        Spi::run(&format!(r#"DROP TABLE IF EXISTS "{shadow}""#))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

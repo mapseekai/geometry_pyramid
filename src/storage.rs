@@ -33,5 +33,15 @@ pub fn tile_table_create_sql(table: &str) -> String {
 /// Drop the storage table if it exists. Used by `ST_DropPyramid`.
 pub fn drop_tile_table(pyramid_name: &str) -> Result<(), spi::Error> {
     let table = tile_table_name(pyramid_name);
-    Spi::run(&format!(r#"DROP TABLE IF EXISTS "{table}""#))
+    // Drop only when present so a registered-but-unbuilt pyramid (no storage
+    // table) does not emit a "does not exist, skipping" NOTICE. to_regclass
+    // returns NULL on a missing relation; IF EXISTS guards a concurrent drop.
+    let exists: Option<String> = Spi::get_one_with_args(
+        "SELECT to_regclass($1)::text",
+        &[format!("\"{table}\"").into()],
+    )?;
+    if exists.is_some() {
+        Spi::run(&format!(r#"DROP TABLE IF EXISTS "{table}""#))?;
+    }
+    Ok(())
 }
