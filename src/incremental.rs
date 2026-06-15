@@ -114,16 +114,25 @@ pub(crate) fn rebuild_extent(
         )?;
         rebuilt += inserted;
 
-        // Refresh this zoom's stats from the (partially rebuilt) table.
+        // Refresh this zoom's stats from the (partially rebuilt) table. The
+        // three aggregates come from a single FROM-subquery scan rather than
+        // three correlated subqueries, so the zoom's rows are read once (the
+        // same shape build.rs::zoom_stats already uses).
         Spi::run_with_args(
             &format!(
-                r#"UPDATE geometry_pyramid_stats SET
-                     tile_count     = (SELECT count(*) FROM "{storage_table}" WHERE z = $1),
-                     total_bytes    = (SELECT COALESCE(sum(octet_length(mvt)),0) FROM "{storage_table}" WHERE z = $1),
-                     max_tile_bytes = (SELECT COALESCE(max(octet_length(mvt)),0) FROM "{storage_table}" WHERE z = $1),
+                r#"UPDATE geometry_pyramid_stats s SET
+                     tile_count     = agg.cnt,
+                     total_bytes    = agg.total_bytes,
+                     max_tile_bytes = agg.max_tile_bytes,
                      build_ms       = $2,
                      built_at       = now()
-                   WHERE pyramid_name = $3 AND z = $1"#
+                   FROM (
+                     SELECT count(*)                              AS cnt,
+                            COALESCE(sum(octet_length(mvt)), 0)   AS total_bytes,
+                            COALESCE(max(octet_length(mvt)), 0)   AS max_tile_bytes
+                     FROM "{storage_table}" WHERE z = $1
+                   ) agg
+                   WHERE s.pyramid_name = $3 AND s.z = $1"#
             ),
             &[
                 (z as i32).into(),

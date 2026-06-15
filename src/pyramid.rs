@@ -105,6 +105,17 @@ fn st_drop_pyramid(
 /// left half-updated). This follows the Ganos trust model: the caller
 /// holds source-table privileges and the clause is executed as their SQL.
 ///
+/// # Security: never wrap this `SECURITY DEFINER`
+///
+/// `where_clause` is concatenated into dynamic SQL (it must be — it is
+/// arbitrary predicate SQL, not a value). That is safe only because the
+/// function runs with the **caller's** privileges: anything the clause could
+/// do, the caller could already do with a direct query. Do NOT expose this
+/// (or `ST_BuildPyramid`) through a `SECURITY DEFINER` wrapper or to a
+/// lower-privilege role — that would turn the clause into an injection vector
+/// running as the definer. Prefer the parameterized
+/// `ST_UpdatePyramidByExtent` when the refresh region is known.
+///
 /// # Limitation: the clause must cover a row's OLD location
 ///
 /// The dirty rectangle is the extent of rows the clause matches *now*. A row
