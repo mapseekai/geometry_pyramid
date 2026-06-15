@@ -64,6 +64,95 @@ keys mirror Ganos:
 | `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
 | `splitSize` | `10000` | Tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source. 0 materializes every non-empty tile. |
 
+## Creating a pyramid
+
+A pyramid is built from an existing PostGIS table with a geometry column and a
+stable feature-id column. The full lifecycle is build → fetch → inspect →
+update → drop.
+
+**1. Enable the extensions** (once per database):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
+```
+
+**2. Build a pyramid** with `ST_BuildPyramid(table, geom, fid, config)`. The
+`config` is a JSON document (pass `'{}'` for all defaults); the keys are listed
+in the table above. Say you have:
+
+```sql
+CREATE TABLE buildings (
+    gid  serial PRIMARY KEY,
+    name text,
+    geom geometry(Polygon, 4326)
+);
+-- ... load rows, then ideally index the geometry so the build's && prefilter is fast:
+CREATE INDEX ON buildings USING gist (geom);
+```
+
+Build a pyramid over it:
+
+```sql
+SELECT ST_BuildPyramid(
+    'buildings',          -- source table
+    'geom',               -- geometry column
+    'gid',                -- stable feature-id column
+    '{
+       "name":       "buildings",
+       "sourceSRS":  4326,
+       "tileSRS":    3857,
+       "minZoom":    0,
+       "maxZoom":    14,
+       "attributes": ["name"]
+     }'
+);
+```
+
+`name` lets several pyramids share one source table; it defaults to the table
+name. `sourceSRS` must match the `geom` column's SRID. `attributes` are the
+non-geometry columns carried into each MVT feature. Building is transactional —
+tiles are written into a shadow table and swapped in atomically, so readers
+never see a half-built pyramid (re-running `ST_BuildPyramid` rebuilds in place).
+
+**3. Fetch a tile** as MVT bytes with `ST_Tile(name, z, x, y)`:
+
+```sql
+-- arguments are (name, z, x, y); returns bytea (MVT), or NULL when the tile is empty
+SELECT ST_Tile('buildings', 14, 13488, 6210);
+```
+
+Tiles within `maxZoom` come from materialized storage; requests beyond
+`maxZoom` are sliced live from the source when `dynamicBeyondMaxZoom` is on
+(the default). See `demo/` for an end-to-end HTTP tile server + MapLibre viewer.
+
+**4. Inspect** metadata and per-zoom build statistics:
+
+```sql
+SELECT ST_Pyramid('buildings');     -- jsonb: config, tile_count, per-zoom stats
+SELECT * FROM ST_Pyramids();        -- list every pyramid
+```
+
+**5. Update** after the source changes — two complementary paths:
+
+```sql
+-- By predicate: rebuild only tiles intersecting the matched rows.
+SELECT ST_UpdatePyramid('buildings', 'name = ''City Hall''');
+-- Full rebuild when the clause is empty:
+SELECT ST_UpdatePyramid('buildings', '');
+
+-- By bbox (in the given SRID): re-slice the whole region from the CURRENT
+-- source. Unlike the predicate path this correctly handles deletes and
+-- cross-tile moves, since it does not depend on which rows a clause matches.
+SELECT ST_UpdatePyramidByExtent('buildings', 116.30, 39.90, 116.42, 39.99, 4326);
+```
+
+**6. Drop** the pyramid and its tile storage:
+
+```sql
+SELECT ST_DropPyramid('buildings');
+```
+
 ## Notes
 
 Pyramid, table, and column identifiers are capped at **45 characters** so
