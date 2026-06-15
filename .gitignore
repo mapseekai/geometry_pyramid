@@ -9,3 +9,6 @@ results/
 *.swp
 __pycache__/
 *.pyc
+.codegraph/
+.claude/
+.agents/
