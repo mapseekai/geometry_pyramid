@@ -769,6 +769,38 @@ mod tests {
         .unwrap();
         Spi::run("DROP TABLE _gp_ts0").unwrap();
     }
+
+    /// tileSize past the 16384 ceiling (would wrap negative when cast to i32)
+    /// and tileExtend >= tileSize are both rejected cleanly at build time.
+    #[pg_test]
+    fn build_rejects_out_of_range_tile_size() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_tsr (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
+        Spi::run("INSERT INTO _gp_tsr (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
+            .unwrap();
+        // Oversized tileSize is rejected.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM ST_BuildPyramid('_gp_tsr','geom','gid','{\"tileSize\":40000}'); \
+               RAISE EXCEPTION 'should have rejected oversized tileSize'; \
+             EXCEPTION WHEN others THEN \
+               IF SQLERRM LIKE '%should have rejected%' THEN RAISE; END IF; \
+             END $$",
+        )
+        .unwrap();
+        // tileExtend >= tileSize is rejected.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM ST_BuildPyramid('_gp_tsr','geom','gid','{\"tileSize\":256,\"tileExtend\":256}'); \
+               RAISE EXCEPTION 'should have rejected tileExtend>=tileSize'; \
+             EXCEPTION WHEN others THEN \
+               IF SQLERRM LIKE '%should have rejected%' THEN RAISE; END IF; \
+             END $$",
+        )
+        .unwrap();
+        Spi::run("DROP TABLE _gp_tsr").unwrap();
+    }
 }
 
 /// Required by `cargo pgrx test`.
