@@ -53,6 +53,33 @@ pub fn update(
     let arr: [f64; 4] = serde_json::from_str(&s)?;
     let (xmin_m, ymin_m, xmax_m, ymax_m) = (arr[0], arr[1], arr[2], arr[3]);
 
+    rebuild_extent(
+        pyramid_name,
+        source_table,
+        geom_column,
+        fid_column,
+        cfg,
+        xmin_m,
+        ymin_m,
+        xmax_m,
+        ymax_m,
+    )
+}
+
+/// Rebuild every tile intersecting the given tile-SRS bbox, across
+/// minZoom..=maxZoom: DELETE the dirty rectangle then re-slice it in place,
+/// refreshing per-zoom stats. Runs in the caller's transaction; rollback-safe.
+pub(crate) fn rebuild_extent(
+    pyramid_name: &str,
+    source_table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+    xmin_m: f64,
+    ymin_m: f64,
+    xmax_m: f64,
+    ymax_m: f64,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let storage_table = storage::tile_table_name(pyramid_name);
     let mut rebuilt: i64 = 0;
     for z in cfg.min_zoom..=cfg.max_zoom {
@@ -106,4 +133,48 @@ pub fn update(
         )?;
     }
     Ok(rebuilt)
+}
+
+/// Rebuild the tiles intersecting the caller-supplied bbox. The bbox is given
+/// in `srid`; it is transformed to the pyramid's tileSRS before computing the
+/// dirty rectangle. Unlike the where_clause path this re-slices the region from
+/// the CURRENT source, so it correctly reflects inserts, updates, deletes, and
+/// moves there. Returns the number of tiles rebuilt.
+pub fn update_extent(
+    pyramid_name: &str,
+    source_table: &str,
+    geom_column: &str,
+    fid_column: &str,
+    cfg: &PyramidConfig,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    srid: i32,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    // Transform the caller bbox from `srid` into tileSRS, taking the four
+    // edges. ST_MakeEnvelope normalizes min/max. CASE→NULL on a NULL transform
+    // result so get_one_with_args sees one row, never zero (pgrx 0.16 errors on
+    // a 0-row result inside a nested SPI context). NULL → no-op Ok(0).
+    let sql = r#"SELECT CASE WHEN g IS NOT NULL
+                       THEN json_build_array(ST_XMin(g), ST_YMin(g), ST_XMax(g), ST_YMax(g))::text
+                       ELSE NULL END
+                FROM (SELECT ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,$5), $6) AS g) s"#;
+    let row: Option<String> = Spi::get_one_with_args(
+        sql,
+        &[
+            xmin.into(),
+            ymin.into(),
+            xmax.into(),
+            ymax.into(),
+            srid.into(),
+            cfg.tile_srs.into(),
+        ],
+    )?;
+    let Some(s) = row else { return Ok(0) };
+    let arr: [f64; 4] = serde_json::from_str(&s)?;
+    rebuild_extent(
+        pyramid_name, source_table, geom_column, fid_column, cfg,
+        arr[0], arr[1], arr[2], arr[3],
+    )
 }
