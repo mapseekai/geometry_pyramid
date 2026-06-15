@@ -402,6 +402,104 @@ mod tests {
         Spi::run("DROP TABLE _gp_inc").unwrap();
     }
 
+    /// Range update re-slices a bbox region from the CURRENT source, so it
+    /// cleans a deleted feature's old tile — the case the where_clause path
+    /// cannot handle (a deleted row matches no clause). Tiles outside the bbox
+    /// stay byte-identical, and an unknown pyramid returns false (not an error).
+    #[pg_test]
+    fn update_by_extent_rebuilds_region() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_ext (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        // A eastern (+30,+40), B western (-100,-30): different tiles at z>0.
+        Spi::run(
+            "INSERT INTO _gp_ext (geom) VALUES \
+             (ST_SetSRID(ST_MakePoint(30, 40), 4326)), \
+             (ST_SetSRID(ST_MakePoint(-100, -30), 4326))",
+        )
+        .unwrap();
+        Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_ext','geom','gid','{\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0}')",
+        )
+        .unwrap();
+
+        // A at (30,40) occupies its own tile at z=6 (splitSize:0 materializes it).
+        let ax = Spi::get_one::<i32>(
+            "SELECT floor((ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(30,40),4326),3857)) \
+                    + 20037508.342789244) / (2*20037508.342789244) * pow(2,6))::int",
+        )
+        .unwrap()
+        .unwrap();
+        let ay = Spi::get_one::<i32>(
+            "SELECT floor((20037508.342789244 \
+                    - ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(30,40),4326),3857))) \
+                    / (2*20037508.342789244) * pow(2,6))::int",
+        )
+        .unwrap()
+        .unwrap();
+        let a_before = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('_gp_ext', 6, $1, $2)",
+            &[ax.into(), ay.into()],
+        )
+        .unwrap();
+        assert!(
+            a_before.as_ref().is_some_and(|v| !v.is_empty()),
+            "A's z6 tile must be materialized before deletion"
+        );
+        // Snapshot every tile to verify the western half is untouched.
+        Spi::run("CREATE TEMP TABLE _snap_ext AS SELECT z, x, y, mvt FROM _gp_tiles__gp_ext")
+            .unwrap();
+
+        // Delete A. A deleted row matches no where_clause — only a range update
+        // can clean its old tile.
+        Spi::run("DELETE FROM _gp_ext WHERE ST_X(geom) = 30").unwrap();
+        let ok = Spi::get_one_with_args::<bool>(
+            "SELECT ST_UpdatePyramidByExtent('_gp_ext', $1, $2, $3, $4, 4326)",
+            &[29.0_f64.into(), 39.0_f64.into(), 31.0_f64.into(), 41.0_f64.into()],
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        // A was deleted; range-updating its region re-slices A's z6 tile to
+        // empty, so it is no longer stored — a deleted feature's tile cleaned,
+        // which the where_clause path cannot do. (Byte-length on z0 would be a
+        // fragile proxy: MVT size is not strictly monotonic in feature count.)
+        let a_after = Spi::get_one_with_args::<Vec<u8>>(
+            "SELECT ST_Tile('_gp_ext', 6, $1, $2)",
+            &[ax.into(), ay.into()],
+        )
+        .unwrap();
+        assert!(
+            a_after.is_none(),
+            "A's z6 tile must be empty/NULL after deleting A and range-updating its region"
+        );
+
+        // Western tiles (x in the western half, z>0) are outside the eastern
+        // bbox and must be byte-unchanged. (z=0's single tile x=0 is excluded:
+        // (1<<0)/2 == 0, so x<0 is false.)
+        let west_changed = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _snap_ext s \
+             JOIN _gp_tiles__gp_ext t USING (z, x, y) \
+             WHERE s.x < (1 << s.z) / 2 AND s.mvt IS DISTINCT FROM t.mvt",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(west_changed, 0, "western tiles must be untouched by an eastern bbox update");
+
+        // Unknown pyramid → false (clean, not an error).
+        let unk = Spi::get_one_with_args::<bool>(
+            "SELECT ST_UpdatePyramidByExtent('no_such_pyr', $1, $2, $3, $4, 4326)",
+            &[0.0_f64.into(), 0.0_f64.into(), 1.0_f64.into(), 1.0_f64.into()],
+        )
+        .unwrap();
+        assert_eq!(unk, Some(false));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_ext')").unwrap();
+        Spi::run("DROP TABLE _gp_ext").unwrap();
+    }
+
     /// ST_Tile serves materialized tiles within maxZoom, slices on-demand above it
     /// (when enabled), returns NULL for unknown pyramids, and respects the
     /// dynamicBeyondMaxZoom switch.

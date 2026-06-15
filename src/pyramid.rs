@@ -118,18 +118,17 @@ fn st_drop_pyramid(
 ///   rows and is a no-op — the old tile is never cleaned. Use a clause that
 ///   matches by region (e.g. `ST_Intersects(geom_or_bbox, ...)` against a
 ///   captured old extent), or a full rebuild.
-#[pg_extern(name = "st_updatepyramid")]
-fn st_update_pyramid(
+/// Load and validate a pyramid's catalog row: (source_table, geom_column,
+/// fid_column, config). Returns `None` when the pyramid is unknown.
+///
+/// The MAX(...) wrapper guarantees exactly one row (NULL when unknown) so
+/// `get_one_with_args` never sees a 0-row result, which pgrx 0.16 surfaces as
+/// a "SpiTupleTable positioned before the start or after the end" error inside
+/// a nested SPI context. The three identifiers are re-validated before they
+/// ride into dynamic SQL — defense-in-depth, matching ST_BuildPyramid.
+pub(crate) fn catalog_meta(
     name: &str,
-    where_clause: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    validate_identifier(name)?;
-
-    // Pull catalog row as a single JSON blob to side-step pgrx's
-    // limited multi-column SPI accessors. MAX(...) guarantees exactly one row
-    // (NULL when the pyramid is unknown) so get_one_with_args never sees a
-    // 0-row result, which pgrx 0.16 surfaces as a "SpiTupleTable positioned
-    // before the start or after the end" error inside a nested SPI context.
+) -> Result<Option<(String, String, String, PyramidConfig)>, Box<dyn std::error::Error + Send + Sync>> {
     let row: Option<String> = Spi::get_one_with_args(
         "SELECT MAX(json_build_object( \
             'source_table', source_table, \
@@ -140,7 +139,7 @@ fn st_update_pyramid(
          FROM geometry_pyramid_catalog WHERE pyramid_name = $1",
         &[name.into()],
     )?;
-    let Some(json) = row else { return Ok(false) };
+    let Some(json) = row else { return Ok(None) };
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
     let source_table = parsed["source_table"]
         .as_str()
@@ -155,14 +154,22 @@ fn st_update_pyramid(
         .ok_or("catalog row has NULL fid_column")?
         .to_string();
     let cfg: PyramidConfig = serde_json::from_value(parsed["config"].clone())?;
-
-    // Re-validate catalog-sourced identifiers before they ride into dynamic
-    // SQL. They were validated at ST_BuildPyramid time, but the catalog is a
-    // plain table with no integrity trigger — defense-in-depth, matching the
-    // validation ST_BuildPyramid applies to the same three values.
     validate_identifier(&source_table)?;
     validate_identifier(&geom_column)?;
     validate_identifier(&fid_column)?;
+    Ok(Some((source_table, geom_column, fid_column, cfg)))
+}
+
+#[pg_extern(name = "st_updatepyramid")]
+fn st_update_pyramid(
+    name: &str,
+    where_clause: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    validate_identifier(name)?;
+
+    let Some((source_table, geom_column, fid_column, cfg)) = catalog_meta(name)? else {
+        return Ok(false);
+    };
 
     let total = if where_clause.trim().is_empty() {
         build::build(name, &source_table, &geom_column, &fid_column, &cfg)?
@@ -193,6 +200,56 @@ fn st_update_pyramid(
             total
         );
     }
+    Ok(true)
+}
+
+/// `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid) -> bool`
+///
+/// Range-based incremental refresh. Re-slices every tile intersecting the
+/// given bounding box — interpreted in `srid` and transformed to the pyramid's
+/// tileSRS — from the CURRENT source data, across minZoom..=maxZoom, in the
+/// caller's transaction (failure rolls back).
+///
+/// Unlike `ST_UpdatePyramid(name, where_clause)`, the rebuilt region is defined
+/// by the caller's bbox rather than by rows a clause matches *now*, so it
+/// correctly reflects inserts, updates, deletes, and cross-tile moves within
+/// that region — the pure-delete / move-out cases the where_clause path cannot
+/// clean. Returns `false` for an unknown pyramid; `true` on success (including a
+/// degenerate bbox that maps to no tiles).
+#[pg_extern(name = "st_updatepyramidbyextent")]
+fn st_update_pyramid_by_extent(
+    name: &str,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    srid: i32,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    validate_identifier(name)?;
+    let Some((source_table, geom_column, fid_column, cfg)) = catalog_meta(name)? else {
+        return Ok(false);
+    };
+    let total = crate::incremental::update_extent(
+        name,
+        &source_table,
+        &geom_column,
+        &fid_column,
+        &cfg,
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+        srid,
+    )?;
+    Spi::run_with_args(
+        "UPDATE geometry_pyramid_catalog SET built_at = now() WHERE pyramid_name = $1",
+        &[name.into()],
+    )?;
+    notice!(
+        "geometry_pyramid: pyramid '{}' range-refreshed ({} tiles)",
+        name,
+        total
+    );
     Ok(true)
 }
 

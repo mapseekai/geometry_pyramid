@@ -33,6 +33,7 @@ coalesce-densest, and Ganos `buildRules` (per-level rules) remain on the roadmap
 |---|---|
 | `ST_BuildPyramid(table, geom, fid, config) -> bool` | Register / build a pyramid. |
 | `ST_UpdatePyramid(name, where_clause) -> bool` | Refresh only the tiles intersecting rows matched by `where_clause` (full rebuild when the clause is empty). |
+| `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid) -> bool` | Re-slice every tile intersecting the bbox (given in `srid`) from the current source — correctly handles inserts/updates/deletes/moves in that region, unlike the where_clause path. |
 | `ST_DropPyramid(name) -> bool` | Remove a pyramid and its tile storage. |
 | `ST_Pyramid(name) -> jsonb` | Inspect a pyramid's metadata and per-zoom build statistics. |
 | `ST_Tile(name, z, x, y) -> bytea` | Fetch an MVT tile: materialized within maxZoom, sliced on-demand beyond it (NULL when absent or disabled). |
@@ -156,7 +157,7 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 7. **Coalesce-densest** — merge adjacent small polygons at low zoom (`ST_Union` / `ST_Buffer(0)`).
 8. ~~**Parallelism** — honour `parallel` config; partition tile range across workers using PG background workers.~~ ✅
 9. ~~**Incremental updates** — `ST_UpdatePyramid(name, where_clause)` rebuilds tiles intersecting matched rows.~~ ✅
-   - **Limitation:** incremental refresh rebuilds the tiles that intersect the rows matched by the `where_clause`. A feature that moved or was deleted leaves a stale tile at its **old** location unless the clause also covers that region. Pure-delete and move-out cases require either a clause that covers the old bounding area or a full rebuild.
+   - **Limitation:** incremental refresh rebuilds the tiles that intersect the rows matched by the `where_clause`. A feature that moved or was deleted leaves a stale tile at its **old** location unless the clause also covers that region. Pure-delete and move-out cases require either a clause that covers the old bounding area or a full rebuild. `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid)` covers these cases: it re-slices the given region from the current source regardless of which rows changed.
 10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
     server-side raster output, matching Ganos.
 11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
