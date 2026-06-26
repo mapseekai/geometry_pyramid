@@ -15,7 +15,7 @@ from pathlib import Path
 import psycopg
 
 DEMO_DIR = Path(__file__).resolve().parent
-PORT = int(os.environ.get("PORT", "8089"))
+PORT = int(os.environ.get("PORT", "8989"))
 
 # /tiles/<name>/<z>/<x>/<y>.pbf  — name limited to identifier chars.
 _TILE_RE = re.compile(r"^/tiles/([A-Za-z0-9_]+)/(\d+)/(\d+)/(\d+)\.pbf$")
