@@ -221,6 +221,27 @@ SELECT ST_BuildPyramid('buildings', 'geom', 'gid', '{"maxZoom":14}');
 SELECT ST_Pyramid('buildings');
 ```
 
+## Build-speed benchmark
+
+`bench/build_speed.sql` builds a deterministic mixed point/line/polygon dataset
+and runs a first full `ST_BuildPyramid`, printing the geometry distribution, a
+per-zoom `R(z)` tile-cell diagnostic, and per-zoom build stats. It is manual by
+design (it creates many geometries and records wall-clock timing) and is the
+baseline the build-speed work compares against.
+
+```bash
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench \
+  -v max_zoom=8 \
+  -v scale=1000000 \
+  -f bench/build_speed.sql
+```
+
+`scale` is the dense-point count (lines ≈ `scale/3`, polygons ≈ `scale/4`); raise
+it to `1e7`/`1e8` on target hardware. See `docs/build-speed-deep-dive.md` for the
+analysis and `docs/superpowers/plans/2026-06-26-build-speed-feature-major.md` for
+the staged plan.
+
 ## Generation rules
 
 For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:

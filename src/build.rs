@@ -460,13 +460,22 @@ pub(crate) fn build_zoom_level(
     let pipeline =
         tile_pipeline_from_sql(src.source_table, src.geom_column, src.fid_column, &attrs_inner, &attrs_outer);
     let split_size = cfg.split_size;
+    // Aggregate each tile's MVT exactly once. The previous form computed
+    // ST_AsMVT in both the SELECT and the HAVING, so the (expensive) tile
+    // encode ran twice per group. Group once in a CTE, then filter the already
+    // computed columns — same output, same splitSize semantics, half the encode.
     let sql = format!(
-        r#"INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
-           SELECT $1::smallint, t.x, t.y, 'pbf'::text, $8::integer,
-                  ST_AsMVT(features.*, $2, $3, 'geom', 'fid')
-           {pipeline}
-           GROUP BY t.x, t.y
-           HAVING count(*) >= {split_size} AND ST_AsMVT(features.*, $2, $3, 'geom', 'fid') IS NOT NULL"#
+        r#"WITH grouped AS (
+             SELECT t.x AS x, t.y AS y,
+                    count(*) AS feature_count,
+                    ST_AsMVT(features.*, $2, $3, 'geom', 'fid') AS mvt
+             {pipeline}
+             GROUP BY t.x, t.y
+           )
+           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
+           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
+           FROM grouped
+           WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
     );
 
     let inserted_before = inserted_count(storage_table, z)?;
