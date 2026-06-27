@@ -97,6 +97,63 @@ depth (used by the test suite to exercise the path cheaply).
 > cheap proxy, not a precise one. A future refinement could estimate `R(maxZoom)`
 > from the source bbox and compare it to the row count.
 
+## Feature-driven enumeration generalizes feature-major to all geometries
+
+Feature-major only fixes **points**. The same O(R(z)) → O(features) win is available
+for lines and polygons by deriving candidate tiles from each feature's **envelope**
+tile-range (a superset) and reusing the *identical* `ST_AsMVTGeom(...) IS NOT NULL`
+clip — so the output is provably unchanged.
+
+The opportunity is bounded by the bbox **fill ratio**, measured as
+`candidate tiles / R(z)`:
+
+| bbox shape | z14 R(z) | candidate tiles | non-empty | ceiling |
+|------------|----------|-----------------|-----------|---------|
+| tight (dense city extent) | 266 | 266 | 100% | **1.0×** |
+| wide (dense core + outliers) | 1,403,272 | 316 | 0.02% | **4441×** |
+
+On a **dense** extent every cell is occupied — feature-driven enumeration produces
+the identical set and buys nothing. The win exists only when the bbox is sparse
+(the same regime feature-major already exploits for points, and the shape
+`bench/build_speed.sql` deliberately creates with its scattered `sparse_point`s).
+
+**Measured A/B** (z14, wide bbox, 125k mixed feats, prepared+GiST, `margin=0`,
+`splitSize=1`):
+
+| form | cells enumerated | wall (run 2) |
+|------|------------------|--------------|
+| full-lattice (current) | 1,403,272 | 4,780 ms |
+| feature-driven | 127,882 pairs (≈1.02/feat) | **74 ms** |
+
+**~65× faster, byte-identical output** (316 = 316 tiles, set-diff 0 both ways on
+tile set *and* per-tile feature_count). The win is removing the ~1.4M empty GiST
+probes (~4.7 s); the surviving 74 ms is the real `O(features)` clip+group that
+both forms must pay. So the saving is roughly a **fixed** cost (empty-probe count ×
+per-probe time) — its *relative* size shrinks as feature density rises and grows
+with the `R(z)/features` ratio (sparser data, higher zoom).
+
+> **Worst case.** Candidate pairs = Σ per-feature envelope tile-span, so a geometry
+> whose envelope covers the whole bbox (a bbox-spanning line) regenerates `R(z)`
+> by itself. A real implementation should cap per-feature span and fall back to the
+> `&&`-join for over-large features. For typical small features (the bench: short
+> lines, small polys) the span is ~1 tile, so pairs ≈ feature count.
+
+**Implemented** as `featureDrivenEnum` (`preparedBuild=true`, `parallel=1`,
+`tileSRS=3857`). It is self-gating, so turning it on is always safe:
+
+- A one-time prep scan computes the row count and the feature-tile pair count the
+  explode would enumerate at `maxZoom`. If that is **not** below `R(maxZoom)` the
+  path is disabled — this single check rules out both dense extents (every cell
+  occupied) and a handful of bbox-spanning features (whose explode alone rivals
+  the lattice), falling back to prepared tile-major with a `NOTICE`.
+- Per zoom it engages only above the `R(z) > 2·rows` crossover, so the cheap
+  shallow levels still run tile-major and only the sparse/high-zoom levels — where
+  empty-cell enumeration explodes — take the feature-driven path.
+
+Equivalence is covered by a `pg_test` at the default (nonzero) `tileExtend`, with
+mixed geometry types, `simplifyPixels>0` and attributes, asserting an identical
+tile set and encoded size against the tile-major path across the crossover.
+
 ## The single-pass MVT refactor was a no-op
 
 Commit `4cc10ff` ("single-pass MVT aggregation") moved `ST_AsMVT` out of a

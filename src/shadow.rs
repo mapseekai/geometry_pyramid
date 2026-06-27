@@ -16,7 +16,11 @@ use pgrx::prelude::*;
 pub const SHADOW_SUFFIX: &str = "__shadow";
 
 pub fn shadow_table_name(pyramid_name: &str) -> String {
-    format!("{}{}", storage::tile_table_name(pyramid_name), SHADOW_SUFFIX)
+    format!(
+        "{}{}",
+        storage::tile_table_name(pyramid_name),
+        SHADOW_SUFFIX
+    )
 }
 
 /// SQL that (re)creates the shadow table. Factored out so the parallel

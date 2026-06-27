@@ -35,10 +35,19 @@ impl TileRect {
         self.xmax - self.xmin + 1
     }
 
+    /// Number of tile cells in the rectangle — `R(z)` for the data bbox, i.e. how
+    /// many cells the full-lattice tile-major build enumerates at this zoom.
+    pub fn cell_count(&self) -> i64 {
+        self.width() * (self.ymax - self.ymin + 1)
+    }
+
     /// Split into at most `parts` disjoint x-strips that exactly cover
     /// `self`. Degrades to one strip per column when `parts > width`.
     pub fn split_x(&self, parts: u32) -> Vec<TileRect> {
-        debug_assert!(self.xmin <= self.xmax, "TileRect invariant violated: xmin > xmax");
+        debug_assert!(
+            self.xmin <= self.xmax,
+            "TileRect invariant violated: xmin > xmax"
+        );
         let parts = (parts as i64).clamp(1, self.width());
         let base = self.width() / parts;
         let extra = self.width() % parts;
@@ -67,8 +76,10 @@ mod tests {
     fn z0_full_world_is_single_tile() {
         let r = TileRect::from_bbox_m(
             0,
-            -WEBMERC_HALF_EXTENT, -WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT, WEBMERC_HALF_EXTENT,
+            -WEBMERC_HALF_EXTENT,
+            -WEBMERC_HALF_EXTENT,
+            WEBMERC_HALF_EXTENT,
+            WEBMERC_HALF_EXTENT,
         );
         assert_eq!((r.xmin, r.ymin, r.xmax, r.ymax), (0, 0, 0, 0));
     }
@@ -77,16 +88,23 @@ mod tests {
     fn z1_full_world_is_four_tiles() {
         let r = TileRect::from_bbox_m(
             1,
-            -WEBMERC_HALF_EXTENT + 1.0, -WEBMERC_HALF_EXTENT + 1.0,
-            WEBMERC_HALF_EXTENT - 1.0, WEBMERC_HALF_EXTENT - 1.0,
+            -WEBMERC_HALF_EXTENT + 1.0,
+            -WEBMERC_HALF_EXTENT + 1.0,
+            WEBMERC_HALF_EXTENT - 1.0,
+            WEBMERC_HALF_EXTENT - 1.0,
         );
         assert_eq!((r.xmin, r.ymin, r.xmax, r.ymax), (0, 0, 1, 1));
         let exact = TileRect::from_bbox_m(
             1,
-            -WEBMERC_HALF_EXTENT, -WEBMERC_HALF_EXTENT,
-            WEBMERC_HALF_EXTENT, WEBMERC_HALF_EXTENT,
+            -WEBMERC_HALF_EXTENT,
+            -WEBMERC_HALF_EXTENT,
+            WEBMERC_HALF_EXTENT,
+            WEBMERC_HALF_EXTENT,
         );
-        assert_eq!((exact.xmin, exact.ymin, exact.xmax, exact.ymax), (0, 0, 1, 1));
+        assert_eq!(
+            (exact.xmin, exact.ymin, exact.xmax, exact.ymax),
+            (0, 0, 1, 1)
+        );
     }
 
     #[test]
@@ -101,7 +119,13 @@ mod tests {
 
     #[test]
     fn split_x_covers_exactly_without_overlap() {
-        let r = TileRect { z: 10, xmin: 3, ymin: 0, xmax: 17, ymax: 5 };
+        let r = TileRect {
+            z: 10,
+            xmin: 3,
+            ymin: 0,
+            xmax: 17,
+            ymax: 5,
+        };
         let parts = r.split_x(4);
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[0].xmin, 3);
@@ -111,19 +135,33 @@ mod tests {
         }
         let total: i64 = parts.iter().map(|p| p.width()).sum();
         assert_eq!(total, r.width());
-        assert!(parts.iter().all(|p| p.z == 10 && p.ymin == 0 && p.ymax == 5));
+        assert!(parts
+            .iter()
+            .all(|p| p.z == 10 && p.ymin == 0 && p.ymax == 5));
     }
 
     #[test]
     fn split_x_more_parts_than_width_degrades() {
-        let r = TileRect { z: 3, xmin: 0, ymin: 0, xmax: 2, ymax: 2 }; // width 3
+        let r = TileRect {
+            z: 3,
+            xmin: 0,
+            ymin: 0,
+            xmax: 2,
+            ymax: 2,
+        }; // width 3
         let parts = r.split_x(10);
         assert_eq!(parts.len(), 3);
     }
 
     #[test]
     fn split_x_one_part_is_identity() {
-        let r = TileRect { z: 3, xmin: 0, ymin: 0, xmax: 7, ymax: 7 };
+        let r = TileRect {
+            z: 3,
+            xmin: 0,
+            ymin: 0,
+            xmax: 7,
+            ymax: 7,
+        };
         assert_eq!(r.split_x(1), vec![r]);
     }
 }

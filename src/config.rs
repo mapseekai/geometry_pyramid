@@ -12,6 +12,7 @@ pub const DEFAULT_PREPARED_BUILD: bool = false;
 pub const DEFAULT_FEATURE_MAJOR_POINTS: bool = false;
 /// Minimum `maxZoom` at which `featureMajorPoints` engages (see the field doc).
 pub const DEFAULT_FEATURE_MAJOR_MIN_ZOOM: u8 = 13;
+pub const DEFAULT_FEATURE_DRIVEN_ENUM: bool = false;
 pub const DEFAULT_SOURCE_SRS: i32 = 4326;
 pub const DEFAULT_TILE_SRS: i32 = 3857;
 
@@ -125,6 +126,19 @@ pub struct PyramidConfig {
     )]
     pub feature_major_min_zoom: u8,
 
+    /// Generalizes the `featureMajorPoints` idea to **all** geometry types: per
+    /// zoom, candidate tiles are derived from each feature's envelope tile-range
+    /// (arithmetic) instead of enumerating + GiST-probing every cell in the source
+    /// bbox. Requires preparedBuild, parallel=1 and tileSRS=3857. Output is
+    /// identical to the tile-major path (same `ST_AsMVTGeom` clip). It only
+    /// engages where it pays off — a one-time prep check disables it when the
+    /// per-feature explode would enumerate more than the full lattice (dense
+    /// extents, or a few bbox-spanning features), and per zoom it is used only
+    /// when R(z) exceeds a small multiple of the row count (sparse / high zoom).
+    /// Below that crossover the dense tile-major path runs instead.
+    #[serde(default = "default_feature_driven_enum", rename = "featureDrivenEnum")]
+    pub feature_driven_enum: bool,
+
     /// Optional list of attribute columns to include in MVT features.
     #[serde(default)]
     pub attributes: Vec<String>,
@@ -139,7 +153,10 @@ pub struct PyramidConfig {
     /// Minimum visual feature size in tile pixels. At each zoom, polygons
     /// whose area `< (size_px)²` and lines whose length `< size_px` are
     /// filtered out before MVT encoding. 0 disables.
-    #[serde(default = "default_min_feature_pixels", rename = "minFeatureSizePixels")]
+    #[serde(
+        default = "default_min_feature_pixels",
+        rename = "minFeatureSizePixels"
+    )]
     pub min_feature_size_px: f64,
 
     /// Tippecanoe-style point drop rate: at zoom z, retain
@@ -152,12 +169,18 @@ pub struct PyramidConfig {
     /// any tile at a zoom exceeds this size after the initial INSERT, the
     /// zoom is wiped and rebuilt with tighter simplify / min-size / drop
     /// knobs. 0 disables the retry loop.
-    #[serde(default = "default_tile_size_budget_bytes", rename = "tileSizeBudgetBytes")]
+    #[serde(
+        default = "default_tile_size_budget_bytes",
+        rename = "tileSizeBudgetBytes"
+    )]
     pub tile_size_budget_bytes: i64,
 
     /// Cap on retry rounds per zoom when chasing the byte budget. The build
     /// gives up and emits whatever it has after this many attempts.
-    #[serde(default = "default_max_tile_size_attempts", rename = "maxTileSizeAttempts")]
+    #[serde(
+        default = "default_max_tile_size_attempts",
+        rename = "maxTileSizeAttempts"
+    )]
     pub max_tile_size_attempts: u32,
 
     /// Tiles whose feature count is below splitSize are NOT materialized at
@@ -173,7 +196,10 @@ pub struct PyramidConfig {
 
     /// When a requested tile has z > maxZoom, slice it live from the source
     /// table instead of returning NULL. Default true (mirrors Ganos maxLevel).
-    #[serde(default = "default_dynamic_beyond_max_zoom", rename = "dynamicBeyondMaxZoom")]
+    #[serde(
+        default = "default_dynamic_beyond_max_zoom",
+        rename = "dynamicBeyondMaxZoom"
+    )]
     pub dynamic_beyond_max_zoom: bool,
 }
 
@@ -229,6 +255,7 @@ impl Default for PyramidConfig {
             prepared_build: DEFAULT_PREPARED_BUILD,
             feature_major_points: DEFAULT_FEATURE_MAJOR_POINTS,
             feature_major_min_zoom: DEFAULT_FEATURE_MAJOR_MIN_ZOOM,
+            feature_driven_enum: DEFAULT_FEATURE_DRIVEN_ENUM,
             attributes: Vec::new(),
             simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
             min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
@@ -323,6 +350,9 @@ fn default_feature_major_points() -> bool {
 fn default_feature_major_min_zoom() -> u8 {
     DEFAULT_FEATURE_MAJOR_MIN_ZOOM
 }
+fn default_feature_driven_enum() -> bool {
+    DEFAULT_FEATURE_DRIVEN_ENUM
+}
 fn default_simplify_pixels() -> f64 {
     DEFAULT_SIMPLIFY_PIXELS
 }
@@ -366,11 +396,28 @@ mod tests {
     #[test]
     fn validate_rejects_broken_invariants() {
         let cases = [
-            PyramidConfig { min_zoom: 5, max_zoom: 3, ..Default::default() },
-            PyramidConfig { max_zoom: 30, ..Default::default() },
-            PyramidConfig { tile_size: 0, ..Default::default() },
-            PyramidConfig { tile_size: 40000, ..Default::default() },
-            PyramidConfig { tile_size: 256, tile_extend: 256, ..Default::default() },
+            PyramidConfig {
+                min_zoom: 5,
+                max_zoom: 3,
+                ..Default::default()
+            },
+            PyramidConfig {
+                max_zoom: 30,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 0,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 40000,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 256,
+                tile_extend: 256,
+                ..Default::default()
+            },
         ];
         for cfg in cases {
             assert!(cfg.validate().is_err(), "expected rejection for {cfg:?}");

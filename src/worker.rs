@@ -111,7 +111,13 @@ mod tests {
                     min_len_m: 3.0,
                     drop_threshold: 0.4,
                 },
-                strips: vec![TileRect { z: 3, xmin: 0, ymin: 0, xmax: 1, ymax: 7 }],
+                strips: vec![TileRect {
+                    z: 3,
+                    xmin: 0,
+                    ymin: 0,
+                    xmax: 1,
+                    ymax: 7,
+                }],
             },
         };
         let json = serde_json::to_string(&spec).unwrap();
@@ -175,10 +181,7 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
         }
     };
 
-    BackgroundWorker::connect_worker_to_spi_by_oid(
-        Some(pg_sys::Oid::from(spec.db_oid)),
-        None,
-    );
+    BackgroundWorker::connect_worker_to_spi_by_oid(Some(pg_sys::Oid::from(spec.db_oid)), None);
 
     match run_spec(&spec) {
         Ok(()) => {
@@ -217,10 +220,9 @@ fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + 
                 cfg: config,
             };
             for rect in strips {
-                let result: Result<i64, pgrx::spi::Error> =
-                    BackgroundWorker::transaction(|| {
-                        crate::build::build_zoom_level(src, storage_table, rect, &k)
-                    });
+                let result: Result<i64, pgrx::spi::Error> = BackgroundWorker::transaction(|| {
+                    crate::build::build_zoom_level(src, storage_table, rect, &k)
+                });
                 result?;
             }
             Ok(())
@@ -252,7 +254,9 @@ pub(crate) fn exec_sql_autonomous(
     let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, next_spec_idx());
     let spec = WorkerSpec {
         db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
-        mode: WorkerMode::ExecSql { sql: sql.to_string() },
+        mode: WorkerMode::ExecSql {
+            sql: sql.to_string(),
+        },
     };
     let path = write_spec(&filename, &spec)?;
     let _handle = spawn(&filename)?;

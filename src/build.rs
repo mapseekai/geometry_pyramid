@@ -124,15 +124,32 @@ fn build_into(
         false
     };
 
+    // Feature-driven enumeration (the all-geometry generalization of
+    // feature-major): decided once here. The prep check tells us whether it can
+    // pay off at all; `rows` is hoisted out of the zoom loop because the per-zoom
+    // gate consults it on every iteration. Feature-major (points) wins outright
+    // when it applies, so the two are mutually exclusive.
+    let (feature_driven_allowed, feature_driven_rows) = match prepared.as_ref() {
+        Some(prepared) if !feature_major_points => {
+            should_use_feature_driven(src, prepared, (xmin_m, ymin_m, xmax_m, ymax_m))?
+        }
+        _ => (false, 0),
+    };
+
     let mut total: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
+        // Below the R(z) > C·rows crossover the dense tile-major path is as fast,
+        // so feature-driven engages only on the sparse/high-zoom levels.
+        let feature_driven =
+            feature_driven_allowed && feature_driven_zoom_beneficial(&rect, feature_driven_rows);
         let result = build_zoom_level_with_budget(
             src,
             storage_table,
             &rect,
             prepared.as_ref(),
             feature_major_points,
+            feature_driven,
         )?;
         crate::stats::upsert_zoom_stats(src.name, &result)?;
         total += result.tiles;
@@ -209,6 +226,101 @@ fn prepared_table_is_point_only(
     .map(|opt| opt.unwrap_or(false))
 }
 
+/// Per-zoom gate for feature-driven enumeration: engage only when the full tile
+/// lattice `R(z)` exceeds this multiple of the source row count — i.e. the bbox
+/// is sparse enough at this zoom that empty-cell enumeration dominates. Below it,
+/// the dense tile-major path is as fast and avoids the per-feature explode. The
+/// guard, not this constant, is what makes the knob safe, so it is not tuned hard.
+const FEATURE_DRIVEN_MIN_FILL_RATIO: f64 = 2.0;
+
+fn config_allows_feature_driven(cfg: &PyramidConfig) -> bool {
+    uses_prepared_build(cfg) && cfg.feature_driven_enum && cfg.tile_srs == 3857
+}
+
+/// Cheap one-pass prep stats: `(row_count, feature_tile_pairs_at_maxZoom)`. The
+/// second value is exactly what the feature-driven path would enumerate at the
+/// most favorable zoom (largest `R(z)`); comparing it to `R(maxZoom)` decides
+/// whether the explode is ever worth it.
+fn feature_driven_prep_stats(
+    prepared: &crate::prepared::PreparedBuildSource,
+    max_zoom: u8,
+) -> Result<(i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+    // `tw` (tile side in metres at maxZoom) is computed in SQL from the integer
+    // zoom so no float is interpolated into the statement.
+    let sql = format!(
+        r#"SELECT json_build_array(
+               count(*),
+               COALESCE(sum(
+                 (floor((ST_XMax(geom_tile) + 20037508.342789244) / tw.w)
+                - floor((ST_XMin(geom_tile) + 20037508.342789244) / tw.w) + 1)
+               * (floor((20037508.342789244 - ST_YMin(geom_tile)) / tw.w)
+                - floor((20037508.342789244 - ST_YMax(geom_tile)) / tw.w) + 1)
+               ), 0)::bigint)::text
+           FROM "{table}",
+                (SELECT 40075016.685578488 / power(2.0, {max_zoom}::float8) AS w) tw
+           WHERE geom_tile IS NOT NULL"#,
+        table = prepared.table
+    );
+    let row: Option<String> = Spi::get_one(&sql)?;
+    let s = row.ok_or("feature_driven_prep_stats returned no row")?;
+    let arr: [i64; 2] = serde_json::from_str(&s)?;
+    Ok((arr[0], arr[1]))
+}
+
+/// Decide whether feature-driven enumeration may run for this build, returning
+/// `(allowed, row_count)`. It is allowed only when `featureDrivenEnum` is on,
+/// `tileSRS=3857`, and the envelope explode at maxZoom enumerates **fewer**
+/// feature-tile pairs than the full lattice `R(maxZoom)`. That single check
+/// rules out both dense extents (every cell occupied) and a handful of
+/// bbox-spanning features (whose explode alone rivals the lattice) — so turning
+/// the knob on is always safe; at worst it falls back to prepared tile-major.
+fn should_use_feature_driven(
+    src: PyramidSource,
+    prepared: &crate::prepared::PreparedBuildSource,
+    bbox_m: (f64, f64, f64, f64),
+) -> Result<(bool, i64), Box<dyn std::error::Error + Send + Sync>> {
+    if !src.cfg.feature_driven_enum {
+        return Ok((false, 0));
+    }
+    if !config_allows_feature_driven(src.cfg) {
+        if src.cfg.tile_srs != 3857 {
+            notice!(
+                "geometry_pyramid: featureDrivenEnum=true requires tileSRS=3857; using prepared tile-major path"
+            );
+        }
+        return Ok((false, 0));
+    }
+
+    let (rows, pairs_at_maxzoom) = feature_driven_prep_stats(prepared, src.cfg.max_zoom)?;
+    let (xmin_m, ymin_m, xmax_m, ymax_m) = bbox_m;
+    let r_maxzoom =
+        TileRect::from_bbox_m(src.cfg.max_zoom, xmin_m, ymin_m, xmax_m, ymax_m).cell_count();
+
+    if rows <= 0 || pairs_at_maxzoom >= r_maxzoom {
+        notice!(
+            "geometry_pyramid: featureDrivenEnum=true skipped — envelope explode ({} feature-tile pairs at maxZoom) is not below the full lattice R({})={}; using prepared tile-major path",
+            pairs_at_maxzoom,
+            src.cfg.max_zoom,
+            r_maxzoom
+        );
+        return Ok((false, rows.max(0)));
+    }
+
+    notice!(
+        "geometry_pyramid: featureDrivenEnum=true enabled for pyramid '{}' (R({})={} vs {} feature-tile pairs at maxZoom)",
+        src.name,
+        src.cfg.max_zoom,
+        r_maxzoom,
+        pairs_at_maxzoom
+    );
+    Ok((true, rows))
+}
+
+/// Per-zoom gate: `R(z) > C·rows`. See [`FEATURE_DRIVEN_MIN_FILL_RATIO`].
+fn feature_driven_zoom_beneficial(rect: &TileRect, rows: i64) -> bool {
+    rows > 0 && (rect.cell_count() as f64) > FEATURE_DRIVEN_MIN_FILL_RATIO * (rows as f64)
+}
+
 /// Tippecanoe-style `--drop-densest-as-needed` loop. Build the zoom once,
 /// then while any tile breaches the byte budget, wipe and rebuild with
 /// tighter knobs (more simplification, larger minimum-feature size, lower
@@ -219,6 +331,7 @@ fn build_zoom_level_with_budget(
     rect: &TileRect,
     prepared: Option<&crate::prepared::PreparedBuildSource>,
     feature_major_points: bool,
+    feature_driven: bool,
 ) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = src.cfg;
     let started = std::time::Instant::now();
@@ -245,6 +358,14 @@ fn build_zoom_level_with_budget(
         if let Some(prepared) = prepared {
             if feature_major_points {
                 build_zoom_level_prepared_points_feature_major(
+                    src,
+                    storage_table,
+                    rect,
+                    &knobs,
+                    prepared,
+                )?;
+            } else if feature_driven {
+                build_zoom_level_prepared_feature_driven(
                     src,
                     storage_table,
                     rect,
@@ -663,6 +784,100 @@ pub(crate) fn point_feature_major_pipeline_sql(
     )
 }
 
+/// Feature-driven candidate-tile pipeline — the all-geometry generalization of
+/// [`point_feature_major_pipeline_sql`]. Each prepared feature derives its own
+/// candidate tile range from its envelope, expanded by the same `margin=$9/$3`
+/// the tile-major `&&` prefilter uses (plus a ±1 float-safety pad), explodes it
+/// with `generate_series`, and clamps to the build rect (`$4..$7`). Every step
+/// after that — per-zoom simplify, min-size + point-drop filters, `ST_AsMVTGeom`,
+/// the `IS NOT NULL` membership test, `ST_AsMVT` — is identical to
+/// [`tile_pipeline_from_prepared_sql`], so the emitted tile set is provably the
+/// same. Per-feature work (simplify + min-size filters) runs once here, before
+/// the explode, rather than once per overlapping cell as in the tile-major path.
+///
+/// The four attribute fragments project the optional attribute columns through
+/// the CTE chain: `prep_src -> prepped -> kept -> features(f)`.
+pub(crate) fn feature_driven_pipeline_sql(
+    prepared_table: &str,
+    attrs_inner: &str,        // , prep_src."col" AS "col"
+    attrs_from_prepped: &str, // , prepped."col"
+    attrs_from_kept: &str,    // , kept."col"
+    attrs_mvt: &str,          // , f."col"
+) -> String {
+    format!(
+        r#"WITH prepped AS (
+             SELECT
+                CASE
+                   WHEN $11::float8 > 0
+                        AND prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
+                      THEN ST_SimplifyPreserveTopology(prep_src.geom_tile, $11::float8)
+                   ELSE prep_src.geom_tile
+                END AS gtile,
+                prep_src.geom_type,
+                prep_src.fid
+                {attrs_inner},
+                floor((ST_XMin(prep_src.geom_tile) - k.mm + 20037508.342789244) / k.tw)::int - 1 AS tx0,
+                floor((ST_XMax(prep_src.geom_tile) + k.mm + 20037508.342789244) / k.tw)::int + 1 AS tx1,
+                floor((20037508.342789244 - ST_YMax(prep_src.geom_tile) - k.mm) / k.tw)::int - 1 AS ty0,
+                floor((20037508.342789244 - ST_YMin(prep_src.geom_tile) + k.mm) / k.tw)::int + 1 AS ty1
+             FROM "{prepared_table}" prep_src
+             CROSS JOIN (
+                SELECT 40075016.685578488 / power(2.0, $1::float8) AS tw,
+                       ($9::float8 / $3::float8)
+                       * (40075016.685578488 / power(2.0, $1::float8)) AS mm
+             ) k
+             WHERE prep_src.geom_tile IS NOT NULL
+               AND ($14::float8 >= 1.0
+                    OR prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
+                    OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
+                       / 1000000.0 < $14::float8)
+           ),
+           kept AS (
+             SELECT
+                prepped.gtile,
+                prepped.geom_type,
+                prepped.fid
+                {attrs_from_prepped},
+                prepped.tx0, prepped.tx1, prepped.ty0, prepped.ty1
+             FROM prepped
+             WHERE
+                ($12::float8 <= 0
+                 OR prepped.geom_type NOT IN ('POLYGON','MULTIPOLYGON')
+                 OR ST_Area(prepped.gtile) >= $12::float8)
+                AND ($13::float8 <= 0
+                     OR prepped.geom_type NOT IN ('LINESTRING','MULTILINESTRING')
+                     OR ST_Length(prepped.gtile) >= $13::float8)
+           ),
+           features AS (
+             SELECT
+                gx AS x,
+                gy AS y,
+                ST_AsMVTGeom(kept.gtile, ST_TileEnvelope($1, gx, gy), $3, $9, true) AS geom,
+                kept.fid
+                {attrs_from_kept}
+             FROM kept
+             CROSS JOIN LATERAL
+                generate_series(GREATEST(kept.tx0, $4::int), LEAST(kept.tx1, $5::int)) AS gx
+             CROSS JOIN LATERAL
+                generate_series(GREATEST(kept.ty0, $6::int), LEAST(kept.ty1, $7::int)) AS gy
+             WHERE gx >= 0 AND gx < power(2.0, $1::float8)::int
+               AND gy >= 0 AND gy < power(2.0, $1::float8)::int
+           ),
+           grouped AS (
+             SELECT f.x AS x, f.y AS y,
+                    count(*) AS feature_count,
+                    ST_AsMVT(mvt_features.*, $2, $3, 'geom', 'fid') AS mvt
+             FROM features f
+             CROSS JOIN LATERAL (
+                SELECT f.geom, f.fid
+                {attrs_mvt}
+             ) mvt_features
+             WHERE f.geom IS NOT NULL
+             GROUP BY f.x, f.y
+           )"#
+    )
+}
+
 pub(crate) fn build_zoom_level(
     src: PyramidSource,
     storage_table: &str,
@@ -837,6 +1052,60 @@ fn build_zoom_level_prepared_points_feature_major(
     Ok(inserted_after - inserted_before)
 }
 
+fn build_zoom_level_prepared_feature_driven(
+    src: PyramidSource,
+    storage_table: &str,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+    prepared: &crate::prepared::PreparedBuildSource,
+) -> Result<i64, spi::Error> {
+    let cfg = src.cfg;
+    let z = rect.z;
+    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
+    let (attrs_inner, attrs_from_prepped) = attribute_projections_for(cfg, "prep_src", "prepped");
+    let (_, attrs_from_kept) = attribute_projections_for(cfg, "x", "kept");
+    let (_, attrs_mvt) = attribute_projections_for(cfg, "x", "f");
+    let pipeline = feature_driven_pipeline_sql(
+        &prepared.table,
+        &attrs_inner,
+        &attrs_from_prepped,
+        &attrs_from_kept,
+        &attrs_mvt,
+    );
+    let split_size = cfg.split_size;
+    let sql = format!(
+        r#"{pipeline}
+           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
+           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
+           FROM grouped
+           WHERE feature_count >= {split_size}
+             AND mvt IS NOT NULL"#
+    );
+
+    let inserted_before = inserted_count(storage_table, z)?;
+    Spi::run_with_args(
+        &sql,
+        &[
+            (z as i32).into(),
+            src.name.into(),
+            (cfg.tile_size as i32).into(),
+            (xmin_t as i32).into(),
+            (xmax_t as i32).into(),
+            (ymin_t as i32).into(),
+            (ymax_t as i32).into(),
+            cfg.tile_srs.into(),
+            (cfg.tile_extend as i32).into(),
+            cfg.source_srs.into(),
+            knobs.simplify_tol_m.into(),
+            knobs.min_area_m2.into(),
+            knobs.min_len_m.into(),
+            knobs.drop_threshold.into(),
+        ],
+    )?;
+    let inserted_after = inserted_count(storage_table, z)?;
+    Ok(inserted_after - inserted_before)
+}
+
 fn inserted_count(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
     Spi::get_one_with_args(
         &format!(r#"SELECT count(*)::bigint FROM "{storage_table}" WHERE z = $1"#),
@@ -968,17 +1237,27 @@ mod tests {
         let min = crate::config::DEFAULT_FEATURE_MAJOR_MIN_ZOOM;
 
         // Shallow pyramids regress under feature-major; gate them out.
-        let shallow = PyramidConfig { max_zoom: min - 1, ..Default::default() };
+        let shallow = PyramidConfig {
+            max_zoom: min - 1,
+            ..Default::default()
+        };
         assert!(!feature_major_zoom_sufficient(&shallow));
 
-        let at_threshold = PyramidConfig { max_zoom: min, ..Default::default() };
+        let at_threshold = PyramidConfig {
+            max_zoom: min,
+            ..Default::default()
+        };
         assert!(feature_major_zoom_sufficient(&at_threshold));
 
         // Default pyramids are deep (maxZoom 18), so feature-major stays enabled.
         assert!(feature_major_zoom_sufficient(&PyramidConfig::default()));
 
         // The knob can force feature-major on for shallow pyramids (e.g. tests).
-        let forced = PyramidConfig { max_zoom: 2, feature_major_min_zoom: 0, ..Default::default() };
+        let forced = PyramidConfig {
+            max_zoom: 2,
+            feature_major_min_zoom: 0,
+            ..Default::default()
+        };
         assert!(feature_major_zoom_sufficient(&forced));
     }
 
@@ -990,6 +1269,58 @@ mod tests {
             "point feature-major path must not enumerate bbox tile cells"
         );
         assert!(sql.contains("ST_X(prep_src.geom_tile)"));
+        assert!(sql.contains("GROUP BY f.x, f.y"));
+    }
+
+    #[test]
+    fn feature_driven_gate_requires_sparse_lattice() {
+        // Dense extent: few cells, many rows -> tile-major is as fast, skip.
+        let dense = TileRect {
+            z: 6,
+            xmin: 0,
+            ymin: 0,
+            xmax: 4,
+            ymax: 4,
+        }; // 25 cells
+        assert!(!feature_driven_zoom_beneficial(&dense, 1000));
+
+        // Sparse / high zoom: R(z) >> rows -> feature-driven pays off.
+        let sparse = TileRect {
+            z: 14,
+            xmin: 0,
+            ymin: 0,
+            xmax: 999,
+            ymax: 999,
+        }; // 1e6 cells
+        assert!(feature_driven_zoom_beneficial(&sparse, 30));
+
+        // Right at the crossover the gate stays closed (strict `>` C·rows).
+        let at_ratio = TileRect {
+            z: 6,
+            xmin: 0,
+            ymin: 0,
+            xmax: 9,
+            ymax: 9,
+        }; // 100 cells
+        assert!(!feature_driven_zoom_beneficial(&at_ratio, 50)); // 100 == 2*50
+
+        // No rows -> never (avoids div-by-nothing and a pointless explode).
+        assert!(!feature_driven_zoom_beneficial(&sparse, 0));
+    }
+
+    #[test]
+    fn feature_driven_pipeline_derives_tiles_from_envelopes() {
+        let sql = feature_driven_pipeline_sql("_gp_prep_test", "", "", "", "");
+        // Derives a candidate tile range per feature from its envelope...
+        assert!(sql.contains("ST_XMin(prep_src.geom_tile)"));
+        assert!(sql.contains("ST_YMax(prep_src.geom_tile)"));
+        // ...then explodes + clamps to the build rect ($4..$7), never the full
+        // unconditional lattice the tile-major path enumerates.
+        assert!(sql.contains("generate_series(GREATEST(kept.tx0, $4::int)"));
+        assert!(sql.contains("LEAST(kept.tx1, $5::int)"));
+        // ...and reuses the identical clip + membership test for equivalence.
+        assert!(sql.contains("ST_AsMVTGeom(kept.gtile, ST_TileEnvelope($1, gx, gy)"));
+        assert!(sql.contains("WHERE f.geom IS NOT NULL"));
         assert!(sql.contains("GROUP BY f.x, f.y"));
     }
 }

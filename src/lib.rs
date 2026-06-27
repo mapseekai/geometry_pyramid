@@ -200,12 +200,145 @@ mod tests {
     }
 
     #[pg_test]
-    fn feature_major_points_skips_prepared_geom_index_for_point_sources() {
+    fn feature_driven_enum_matches_default_for_mixed_geometries() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run(
-            "CREATE TABLE _gp_fm_noidx (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+            "CREATE TABLE _gp_fd_cmp (gid serial PRIMARY KEY, kind text, rank int, \
+             geom geometry(Geometry, 4326))",
         )
         .unwrap();
+        // A small mixed cluster spanning several z6 tiles — so points, lines and
+        // polygons straddle tile boundaries and the (default, nonzero) tileExtend
+        // margin band is actually exercised...
+        Spi::run(
+            "INSERT INTO _gp_fd_cmp (kind, rank, geom) \
+             SELECT 'point', i, ST_SetSRID(ST_MakePoint(110.0 + i*0.7, 35.0 + i*0.4), 4326) \
+             FROM generate_series(1, 12) AS i",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fd_cmp (kind, rank, geom) \
+             SELECT 'line', 100+i, ST_SetSRID(ST_MakeLine( \
+                 ST_MakePoint(108.0 + i*0.9, 36.0 + i*0.6), \
+                 ST_MakePoint(108.0 + i*0.9 + 2.0, 36.0 + i*0.6 + 1.5)), 4326) \
+             FROM generate_series(1, 8) AS i",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fd_cmp (kind, rank, geom) \
+             SELECT 'polygon', 200+i, ST_SetSRID(ST_MakeEnvelope( \
+                 109.0 + i*0.8, 34.0 + i*0.5, 109.0 + i*0.8 + 1.7, 34.0 + i*0.5 + 1.1, 4326), 4326) \
+             FROM generate_series(1, 8) AS i",
+        )
+        .unwrap();
+        // ...plus two world-corner outliers that inflate the bbox so R(z) >> rows
+        // and feature-driven actually engages (high zooms) while shallow zooms
+        // still run tile-major — both paths exercised in one build.
+        Spi::run(
+            "INSERT INTO _gp_fd_cmp (kind, rank, geom) VALUES \
+             ('outlier', 9001, ST_SetSRID(ST_MakePoint(-170, -75), 4326)), \
+             ('outlier', 9002, ST_SetSRID(ST_MakePoint(170, 78), 4326))",
+        )
+        .unwrap();
+
+        // Default tile-major, with simplification + attributes + default tileExtend.
+        let default_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fd_cmp','geom','gid', \
+             '{\"name\":\"fd_base\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"]}')",
+        )
+        .unwrap();
+        assert_eq!(default_ok, Some(true));
+
+        // Same knobs + preparedBuild + featureDrivenEnum.
+        let fd_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fd_cmp','geom','gid', \
+             '{\"name\":\"fd_fast\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(fd_ok, Some(true));
+
+        let default_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_fd_base")
+            .unwrap()
+            .unwrap();
+        assert!(default_tiles > 0, "default mixed build produced no tiles");
+
+        // FULL JOIN on (z,x,y): a tile present on only one side leaves a NULL
+        // octet_length on the other -> counted. So mismatches==0 proves identical
+        // tile *set* and identical encoded size across the margin/simplify/attrs.
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_fd_base a \
+             FULL JOIN _gp_tiles_fd_fast b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "feature-driven tiles must match default tile-major (set + encoded size)"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('fd_base')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('fd_fast')").unwrap();
+        Spi::run("DROP TABLE _gp_fd_cmp").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_driven_enum_falls_back_on_dense_extent() {
+        // A dense extent (no bbox-inflating outliers) has R(z) ~ non-empty tiles,
+        // so the prep guard must DISABLE feature-driven and fall back to prepared
+        // tile-major — turning the knob on stays safe, output unchanged.
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_fd_dense (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fd_dense (geom) \
+             SELECT ST_SetSRID(ST_MakePoint(116.0 + (i % 20) * 0.01, \
+                                            39.5 + (i / 20) * 0.01), 4326) \
+             FROM generate_series(1, 400) AS i",
+        )
+        .unwrap();
+
+        let base_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fd_dense','geom','gid', \
+             '{\"name\":\"fdd_base\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true}')",
+        )
+        .unwrap();
+        assert_eq!(base_ok, Some(true));
+
+        let fd_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fd_dense','geom','gid', \
+             '{\"name\":\"fdd_fast\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(fd_ok, Some(true));
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_fdd_base a \
+             FULL JOIN _gp_tiles_fdd_fast b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "dense fallback must match prepared tile-major"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('fdd_base')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('fdd_fast')").unwrap();
+        Spi::run("DROP TABLE _gp_fd_dense").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_major_points_skips_prepared_geom_index_for_point_sources() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_fm_noidx (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         Spi::run(
             "INSERT INTO _gp_fm_noidx (geom) \
              SELECT ST_SetSRID(ST_MakePoint(116.0 + i * 0.001, 39.0), 4326) \
@@ -306,7 +439,11 @@ mod tests {
         let info = Spi::get_one::<pgrx::JsonB>("SELECT ST_Pyramid('_gp_stats_t')")
             .unwrap()
             .expect("metadata should exist");
-        let stats = info.0.get("stats").and_then(|v| v.as_array()).expect("stats array");
+        let stats = info
+            .0
+            .get("stats")
+            .and_then(|v| v.as_array())
+            .expect("stats array");
         assert_eq!(stats.len(), 4);
         assert!(stats[0].get("tileCount").is_some());
         Spi::run("SELECT ST_DropPyramid('_gp_stats_t')").unwrap();
@@ -494,11 +631,9 @@ mod tests {
 
         // Guard against both builds silently producing zero tiles (which would
         // make the comparison below pass vacuously).
-        let serial_tiles = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles_build_ser",
-        )
-        .unwrap()
-        .unwrap();
+        let serial_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_build_ser")
+            .unwrap()
+            .unwrap();
         assert!(serial_tiles > 0, "serial build produced no tiles");
 
         // A single FULL JOIN catches a coverage gap (a missing/empty worker
@@ -552,8 +687,7 @@ mod tests {
         .unwrap();
 
         // Snapshot every tile.
-        Spi::run("CREATE TEMP TABLE _snap AS SELECT z, x, y, mvt FROM _gp_tiles__gp_inc")
-            .unwrap();
+        Spi::run("CREATE TEMP TABLE _snap AS SELECT z, x, y, mvt FROM _gp_tiles__gp_inc").unwrap();
 
         // Move the eastern point (stays eastern), mark touched.
         Spi::run(
@@ -561,8 +695,8 @@ mod tests {
              touched = true WHERE gid = 1",
         )
         .unwrap();
-        let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('_gp_inc', 'touched = true')")
-            .unwrap();
+        let ok =
+            Spi::get_one::<bool>("SELECT ST_UpdatePyramid('_gp_inc', 'touched = true')").unwrap();
         assert_eq!(ok, Some(true));
 
         // Western tiles (x in the western half) must be byte-unchanged.
@@ -573,7 +707,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(west_changed, 0, "western tiles must be untouched by an eastern-only update");
+        assert_eq!(
+            west_changed, 0,
+            "western tiles must be untouched by an eastern-only update"
+        );
 
         // Empty match → no-op, returns true.
         let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('_gp_inc', 'false')").unwrap();
@@ -601,10 +738,8 @@ mod tests {
     #[pg_test]
     fn update_by_extent_rebuilds_region() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_ext (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_ext (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         // A eastern (+30,+40), B western (-100,-30): different tiles at z>0.
         Spi::run(
             "INSERT INTO _gp_ext (geom) VALUES \
@@ -649,7 +784,12 @@ mod tests {
         Spi::run("DELETE FROM _gp_ext WHERE ST_X(geom) = 30").unwrap();
         let ok = Spi::get_one_with_args::<bool>(
             "SELECT ST_UpdatePyramidByExtent('_gp_ext', $1, $2, $3, $4, 4326)",
-            &[29.0_f64.into(), 39.0_f64.into(), 31.0_f64.into(), 41.0_f64.into()],
+            &[
+                29.0_f64.into(),
+                39.0_f64.into(),
+                31.0_f64.into(),
+                41.0_f64.into(),
+            ],
         )
         .unwrap();
         assert_eq!(ok, Some(true));
@@ -678,12 +818,20 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(west_changed, 0, "western tiles must be untouched by an eastern bbox update");
+        assert_eq!(
+            west_changed, 0,
+            "western tiles must be untouched by an eastern bbox update"
+        );
 
         // Unknown pyramid → false (clean, not an error).
         let unk = Spi::get_one_with_args::<bool>(
             "SELECT ST_UpdatePyramidByExtent('no_such_pyr', $1, $2, $3, $4, 4326)",
-            &[0.0_f64.into(), 0.0_f64.into(), 1.0_f64.into(), 1.0_f64.into()],
+            &[
+                0.0_f64.into(),
+                0.0_f64.into(),
+                1.0_f64.into(),
+                1.0_f64.into(),
+            ],
         )
         .unwrap();
         assert_eq!(unk, Some(false));
@@ -698,10 +846,8 @@ mod tests {
     #[pg_test]
     fn dynamic_tile_beyond_max_zoom() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_dyn (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_dyn (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         // A point well inside one tile (avoids tile-boundary ambiguity).
         Spi::run("INSERT INTO _gp_dyn (geom) VALUES (ST_SetSRID(ST_MakePoint(30, 40), 4326))")
             .unwrap();
@@ -713,8 +859,12 @@ mod tests {
         .unwrap();
 
         // Unknown pyramid -> NULL (regression: used to error on missing table).
-        let unknown = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('no_such_pyramid', 0, 0, 0)").unwrap();
-        assert!(unknown.is_none(), "unknown pyramid must return NULL, not error");
+        let unknown =
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('no_such_pyramid', 0, 0, 0)").unwrap();
+        assert!(
+            unknown.is_none(),
+            "unknown pyramid must return NULL, not error"
+        );
 
         // Materialized hit: z=0 is the whole world, the point is in tile (0,0,0).
         let z0 = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('dyn', 0, 0, 0)").unwrap();
@@ -740,7 +890,10 @@ mod tests {
             &[tx.into(), ty.into()],
         )
         .unwrap();
-        assert!(dyn_hit.is_some(), "z=6 tile over the point must be sliced on-demand");
+        assert!(
+            dyn_hit.is_some(),
+            "z=6 tile over the point must be sliced on-demand"
+        );
         assert!(!dyn_hit.unwrap().is_empty());
 
         // Dynamic miss: a z=6 tile far from the point has no data -> NULL.
@@ -763,7 +916,10 @@ mod tests {
             &[tx.into(), ty.into()],
         )
         .unwrap();
-        assert!(off.is_none(), "dynamicBeyondMaxZoom=false must return NULL beyond maxZoom");
+        assert!(
+            off.is_none(),
+            "dynamicBeyondMaxZoom=false must return NULL beyond maxZoom"
+        );
 
         Spi::run("SELECT ST_DropPyramid('dyn')").unwrap();
         Spi::run("SELECT ST_DropPyramid('dynoff')").unwrap();
@@ -776,10 +932,8 @@ mod tests {
     #[pg_test]
     fn split_size_defers_sparse_tiles() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_sp (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_sp (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         // 5 scattered points; at maxZoom=4 each lands in its own tile with 1 feature.
         Spi::run(
             "INSERT INTO _gp_sp (geom) VALUES \
@@ -796,12 +950,13 @@ mod tests {
              '{\"name\":\"sparse\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":100}')",
         )
         .unwrap();
-        let materialized = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles_sparse",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(materialized, 0, "splitSize=100 must skip all sub-threshold tiles");
+        let materialized = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_sparse")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            materialized, 0,
+            "splitSize=100 must skip all sub-threshold tiles"
+        );
 
         let tx = Spi::get_one::<i32>(
             "SELECT floor((ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(30,40),4326),3857)) \
@@ -821,7 +976,10 @@ mod tests {
             &[tx.into(), ty.into()],
         )
         .unwrap();
-        assert!(sparse_hit.is_some(), "sparse tile must be sliced on-demand within maxZoom");
+        assert!(
+            sparse_hit.is_some(),
+            "sparse tile must be sliced on-demand within maxZoom"
+        );
         assert!(!sparse_hit.unwrap().is_empty());
 
         let far_x = if tx > 0 { 0 } else { 15 };
@@ -837,18 +995,20 @@ mod tests {
              '{\"name\":\"dense\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":0}')",
         )
         .unwrap();
-        let dense_materialized = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles_dense",
-        )
-        .unwrap()
-        .unwrap();
+        let dense_materialized =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_dense")
+                .unwrap()
+                .unwrap();
         assert!(dense_materialized > 0, "splitSize=0 must materialize tiles");
         let dense_hit = Spi::get_one_with_args::<Vec<u8>>(
             "SELECT ST_Tile('dense', 4, $1, $2)",
             &[tx.into(), ty.into()],
         )
         .unwrap();
-        assert!(dense_hit.is_some(), "materialized tile must be served from storage");
+        assert!(
+            dense_hit.is_some(),
+            "materialized tile must be served from storage"
+        );
 
         Spi::run("SELECT ST_DropPyramid('sparse')").unwrap();
         Spi::run("SELECT ST_DropPyramid('dense')").unwrap();
@@ -859,10 +1019,8 @@ mod tests {
     #[pg_test]
     fn tile_table_has_id_format_srid() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_cols (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_cols (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         Spi::run("INSERT INTO _gp_cols (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
             .unwrap();
         Spi::get_one::<bool>(
@@ -871,23 +1029,23 @@ mod tests {
         )
         .unwrap();
 
-        let format = Spi::get_one::<String>(
-            "SELECT format FROM _gp_tiles__gp_cols LIMIT 1",
-        )
-        .unwrap()
-        .unwrap();
+        let format = Spi::get_one::<String>("SELECT format FROM _gp_tiles__gp_cols LIMIT 1")
+            .unwrap()
+            .unwrap();
         assert_eq!(format, "pbf", "format column must be 'pbf'");
 
         let srid = Spi::get_one::<i32>("SELECT srid FROM _gp_tiles__gp_cols LIMIT 1")
             .unwrap()
             .unwrap();
-        assert_eq!(srid, 3857, "srid column must equal the default tileSRS (3857)");
+        assert_eq!(
+            srid, 3857,
+            "srid column must equal the default tileSRS (3857)"
+        );
 
-        let null_ids = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM _gp_tiles__gp_cols WHERE id IS NULL",
-        )
-        .unwrap()
-        .unwrap();
+        let null_ids =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles__gp_cols WHERE id IS NULL")
+                .unwrap()
+                .unwrap();
         assert_eq!(null_ids, 0, "id column must be populated by bigserial");
 
         Spi::run("SELECT ST_DropPyramid('_gp_cols')").unwrap();
@@ -900,10 +1058,8 @@ mod tests {
     #[pg_test]
     fn bbox_filter_and_margin_render() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_bbox (gid serial PRIMARY KEY, geom geometry(Polygon, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_bbox (gid serial PRIMARY KEY, geom geometry(Polygon, 4326))")
+            .unwrap();
         Spi::run(
             "INSERT INTO _gp_bbox (geom) VALUES \
              (ST_SetSRID(ST_MakeEnvelope(-1, -1, 1, 1), 4326))",
@@ -916,7 +1072,10 @@ mod tests {
         .unwrap();
 
         let z0 = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_bbox', 0, 0, 0)").unwrap();
-        assert!(z0.is_some() && !z0.unwrap().is_empty(), "z0 tile must contain the polygon");
+        assert!(
+            z0.is_some() && !z0.unwrap().is_empty(),
+            "z0 tile must contain the polygon"
+        );
 
         let empty = Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_bbox', 3, 0, 0)").unwrap();
         assert!(empty.is_none(), "empty region tile must be NULL");
@@ -932,9 +1091,16 @@ mod tests {
     fn unknown_pyramid_returns_cleanly() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         let info = Spi::get_one::<pgrx::JsonB>("SELECT ST_Pyramid('no_such_pyr')").unwrap();
-        assert!(info.is_none(), "ST_Pyramid(unknown) must be NULL, not error");
+        assert!(
+            info.is_none(),
+            "ST_Pyramid(unknown) must be NULL, not error"
+        );
         let ok = Spi::get_one::<bool>("SELECT ST_UpdatePyramid('no_such_pyr', '')").unwrap();
-        assert_eq!(ok, Some(false), "ST_UpdatePyramid(unknown) must return false, not error");
+        assert_eq!(
+            ok,
+            Some(false),
+            "ST_UpdatePyramid(unknown) must return false, not error"
+        );
     }
 
     /// tileSize=0 is rejected (it is the MVT extent and a divisor in the
@@ -942,12 +1108,9 @@ mod tests {
     #[pg_test]
     fn build_rejects_zero_tile_size() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_ts0 (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
-        Spi::run("INSERT INTO _gp_ts0 (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
+        Spi::run("CREATE TABLE _gp_ts0 (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
             .unwrap();
+        Spi::run("INSERT INTO _gp_ts0 (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))").unwrap();
         // The error is raised inside a subtransaction so the test can assert it
         // without aborting; a clean 'tileSize must be > 0' (not a div-by-zero).
         Spi::run(
@@ -969,8 +1132,7 @@ mod tests {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run("CREATE TABLE _gp_tsr (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
             .unwrap();
-        Spi::run("INSERT INTO _gp_tsr (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))")
-            .unwrap();
+        Spi::run("INSERT INTO _gp_tsr (geom) VALUES (ST_SetSRID(ST_MakePoint(0,0),4326))").unwrap();
         // Oversized tileSize is rejected.
         Spi::run(
             "DO $$ BEGIN \
