@@ -8,6 +8,10 @@ pub const DEFAULT_TILE_EXTEND: u32 = 8;
 pub const DEFAULT_MIN_ZOOM: u8 = 0;
 pub const DEFAULT_MAX_ZOOM: u8 = 18;
 pub const DEFAULT_PARALLEL: u32 = 1;
+pub const DEFAULT_PREPARED_BUILD: bool = false;
+pub const DEFAULT_FEATURE_MAJOR_POINTS: bool = false;
+/// Minimum `maxZoom` at which `featureMajorPoints` engages (see the field doc).
+pub const DEFAULT_FEATURE_MAJOR_MIN_ZOOM: u8 = 13;
 pub const DEFAULT_SOURCE_SRS: i32 = 4326;
 pub const DEFAULT_TILE_SRS: i32 = 3857;
 
@@ -88,6 +92,38 @@ pub struct PyramidConfig {
     /// Number of parallel workers used to build the pyramid.
     #[serde(default = "default_parallel")]
     pub parallel: u32,
+
+    /// Opt-in first-full-build speed path. When true and parallel=1, the build
+    /// pre-projects source geometries into a temporary indexed table before
+    /// slicing tiles. With parallel>1 the first implementation falls back to
+    /// the existing worker path.
+    #[serde(default = "default_prepared_build", rename = "preparedBuild")]
+    pub prepared_build: bool,
+
+    /// Experimental Ganos-like sparse path for pure POINT sources. When enabled
+    /// together with preparedBuild and parallel=1, the builder groups points by
+    /// their computed tile id instead of probing every tile in the source bbox.
+    #[serde(
+        default = "default_feature_major_points",
+        rename = "featureMajorPoints"
+    )]
+    pub feature_major_points: bool,
+
+    /// Minimum `maxZoom` at which `featureMajorPoints` actually engages.
+    /// Feature-major cost is ~flat per zoom (O(features)) while tile-major cost
+    /// grows ~4x per zoom (O(R(z)) bbox-cell enumerate + probe), so feature-major
+    /// only wins for deep pyramids — benchmarks (PG17/PostGIS3.6) put the total
+    /// break-even between z12 and z13 even on an FM-favorable wide-bbox dataset,
+    /// so the default (13) errs toward enabling. Below this, eligible point builds
+    /// fall back to prepared tile-major so shallow pyramids don't regress. Set 0
+    /// to always use feature-major when otherwise eligible. NOTE: the true driver
+    /// is bbox-spread vs feature-count; this maxZoom proxy is a coarse, cheap
+    /// heuristic — tight-bbox sources may want it higher.
+    #[serde(
+        default = "default_feature_major_min_zoom",
+        rename = "featureMajorMinZoom"
+    )]
+    pub feature_major_min_zoom: u8,
 
     /// Optional list of attribute columns to include in MVT features.
     #[serde(default)]
@@ -190,6 +226,9 @@ impl Default for PyramidConfig {
             min_zoom: DEFAULT_MIN_ZOOM,
             max_zoom: DEFAULT_MAX_ZOOM,
             parallel: DEFAULT_PARALLEL,
+            prepared_build: DEFAULT_PREPARED_BUILD,
+            feature_major_points: DEFAULT_FEATURE_MAJOR_POINTS,
+            feature_major_min_zoom: DEFAULT_FEATURE_MAJOR_MIN_ZOOM,
             attributes: Vec::new(),
             simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
             min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
@@ -275,6 +314,15 @@ fn default_max_zoom() -> u8 {
 fn default_parallel() -> u32 {
     DEFAULT_PARALLEL
 }
+fn default_prepared_build() -> bool {
+    DEFAULT_PREPARED_BUILD
+}
+fn default_feature_major_points() -> bool {
+    DEFAULT_FEATURE_MAJOR_POINTS
+}
+fn default_feature_major_min_zoom() -> u8 {
+    DEFAULT_FEATURE_MAJOR_MIN_ZOOM
+}
 fn default_simplify_pixels() -> f64 {
     DEFAULT_SIMPLIFY_PIXELS
 }
@@ -307,6 +355,7 @@ mod tests {
         assert_eq!(cfg.tile_size, DEFAULT_TILE_SIZE);
         assert_eq!(cfg.source_srs, 4326);
         assert_eq!(cfg.tile_srs, 3857);
+        assert!(!cfg.feature_major_points);
     }
 
     #[test]
@@ -331,13 +380,14 @@ mod tests {
     #[test]
     fn parses_known_keys() {
         let cfg = PyramidConfig::parse(
-            r#"{"sourceSRS":4490,"tileSize":512,"maxZoom":14,"parallel":4}"#,
+            r#"{"sourceSRS":4490,"tileSize":512,"maxZoom":14,"parallel":4,"featureMajorPoints":true}"#,
         )
         .unwrap();
         assert_eq!(cfg.source_srs, 4490);
         assert_eq!(cfg.tile_size, 512);
         assert_eq!(cfg.max_zoom, 14);
         assert_eq!(cfg.parallel, 4);
+        assert!(cfg.feature_major_points);
     }
 
     #[test]
@@ -391,5 +441,12 @@ mod tests {
         assert_eq!(c.split_size, 0);
         let c2 = PyramidConfig::parse(r#"{"splitSize":250}"#).unwrap();
         assert_eq!(c2.split_size, 250);
+    }
+
+    #[test]
+    fn prepared_build_defaults_false_and_parses() {
+        assert!(!PyramidConfig::default().prepared_build);
+        let cfg = PyramidConfig::parse(r#"{"preparedBuild":true}"#).unwrap();
+        assert!(cfg.prepared_build);
     }
 }

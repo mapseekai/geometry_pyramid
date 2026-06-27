@@ -55,6 +55,9 @@ keys mirror Ganos:
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
 | `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
+| `preparedBuild` | `false` | Opt-in first full-build speed path for `parallel=1`: pre-project source geometries into a session-local indexed temp table before slicing. With `parallel>1`, it falls back to the existing worker path. |
+| `featureMajorPoints` | `false` | Experimental sparse path for pure `POINT` sources. Requires `preparedBuild=true`, `parallel=1`, and `tileSRS=3857`; the builder computes tile ids per point instead of probing every bbox tile. Mixed, line, polygon, or non-Web-Mercator builds fall back to prepared tile-major. |
+| `featureMajorMinZoom` | `13` | Minimum `maxZoom` at which `featureMajorPoints` engages — it only wins once the high zoom levels (where tile-major's empty-cell probing explodes) dominate the build, and slightly regresses shallow pyramids. Below this, eligible point builds fall back to prepared tile-major (with a `NOTICE`). Set `0` to always use feature-major when eligible. |
 | `attributes` | `[]` | Columns to include in MVT features. |
 | `simplifyPixels` | `1.0` | DP tolerance in tile pixels (≈1 px ≈ tippecanoe default). 0 disables. |
 | `minFeatureSizePixels` | `0.0` | Drop polygons whose area `<` and lines `<` this many tile pixels. 0 disables. |
@@ -231,16 +234,33 @@ baseline the build-speed work compares against.
 
 ```bash
 psql "$DATABASE_URL" \
-  -v pyramid_name=gp_bench \
+  -v pyramid_name=gp_bench_baseline \
   -v max_zoom=8 \
   -v scale=1000000 \
+  -v prepared_build=false \
+  -f bench/build_speed.sql
+
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_prepared \
+  -v max_zoom=8 \
+  -v scale=1000000 \
+  -v prepared_build=true \
+  -f bench/build_speed.sql
+
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_points_fm \
+  -v max_zoom=8 \
+  -v scale=1000000 \
+  -v point_only=true \
+  -v prepared_build=true \
+  -v feature_major_points=true \
   -f bench/build_speed.sql
 ```
 
 `scale` is the dense-point count (lines ≈ `scale/3`, polygons ≈ `scale/4`); raise
-it to `1e7`/`1e8` on target hardware. See `docs/build-speed-deep-dive.md` for the
-analysis and `docs/superpowers/plans/2026-06-26-build-speed-feature-major.md` for
-the staged plan.
+it to `1e7`/`1e8` on target hardware. `featureMajorPoints` is useful only with
+`point_only=true` or another pure `POINT` source; mixed data deliberately falls
+back to the prepared tile-major path.
 
 ## Generation rules
 

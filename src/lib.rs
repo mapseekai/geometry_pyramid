@@ -12,6 +12,7 @@ mod build;
 mod config;
 mod dynamic;
 mod incremental;
+mod prepared;
 mod pyramid;
 mod shadow;
 mod source;
@@ -83,6 +84,196 @@ mod tests {
         let dropped = Spi::get_one::<bool>("SELECT ST_DropPyramid('_gp_smoke')").unwrap();
         assert_eq!(dropped, Some(true));
         Spi::run("DROP TABLE _gp_smoke").unwrap();
+    }
+
+    #[pg_test]
+    fn prepared_build_matches_default_for_mixed_geometries() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_prep_cmp (gid serial PRIMARY KEY, kind text, rank int, \
+             geom geometry(Geometry, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_prep_cmp (kind, rank, geom) VALUES \
+             ('point', 1, ST_SetSRID(ST_MakePoint(116.4, 39.9), 4326)), \
+             ('point', 2, ST_SetSRID(ST_MakePoint(116.45, 39.95), 4326)), \
+             ('line', 3, ST_SetSRID(ST_MakeLine(ST_MakePoint(116.3,39.8), ST_MakePoint(116.6,40.1)), 4326)), \
+             ('polygon', 4, ST_SetSRID(ST_MakeEnvelope(116.2,39.7,116.7,40.2), 4326))",
+        )
+        .unwrap();
+
+        let default_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_prep_cmp','geom','gid', \
+             '{\"name\":\"prep_def\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":0, \
+                \"attributes\":[\"kind\",\"rank\"]}')",
+        )
+        .unwrap();
+        assert_eq!(default_ok, Some(true));
+
+        let prepared_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_prep_cmp','geom','gid', \
+             '{\"name\":\"prep_opt\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":0, \
+                \"attributes\":[\"kind\",\"rank\"],\"preparedBuild\":true}')",
+        )
+        .unwrap();
+        assert_eq!(prepared_ok, Some(true));
+
+        let default_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_prep_def")
+            .unwrap()
+            .unwrap();
+        assert!(default_tiles > 0, "default build produced no tiles");
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_prep_def a \
+             FULL JOIN _gp_tiles_prep_opt b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mismatches, 0, "prepared tiles must match default tiles");
+
+        Spi::run("SELECT ST_DropPyramid('prep_def')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('prep_opt')").unwrap();
+        Spi::run("DROP TABLE _gp_prep_cmp").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_major_points_matches_default_for_point_sources() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_fm_points (gid serial PRIMARY KEY, kind text, rank int, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fm_points (kind, rank, geom) \
+             SELECT 'dense', i, ST_SetSRID(ST_MakePoint(116.0 + (i % 30) * 0.001, \
+                                                        39.5 + (i / 30) * 0.001), 4326) \
+             FROM generate_series(1, 300) AS i",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fm_points (kind, rank, geom) VALUES \
+             ('sparse', 1001, ST_SetSRID(ST_MakePoint(-100, 30), 4326)), \
+             ('sparse', 1002, ST_SetSRID(ST_MakePoint(100, -30), 4326))",
+        )
+        .unwrap();
+
+        let default_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fm_points','geom','gid', \
+             '{\"name\":\"fm_base\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":0, \
+                \"attributes\":[\"kind\",\"rank\"]}')",
+        )
+        .unwrap();
+        assert_eq!(default_ok, Some(true));
+
+        let feature_major_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fm_points','geom','gid', \
+             '{\"name\":\"fm_fast\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":0, \
+                \"attributes\":[\"kind\",\"rank\"],\"preparedBuild\":true, \
+                \"featureMajorMinZoom\":0,\"featureMajorPoints\":true}')",
+        )
+        .unwrap();
+        assert_eq!(feature_major_ok, Some(true));
+
+        let default_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_fm_base")
+            .unwrap()
+            .unwrap();
+        assert!(default_tiles > 0, "default point build produced no tiles");
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_fm_base a \
+             FULL JOIN _gp_tiles_fm_fast b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "feature-major point tiles must match default coverage and encoded size"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('fm_base')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('fm_fast')").unwrap();
+        Spi::run("DROP TABLE _gp_fm_points").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_major_points_skips_prepared_geom_index_for_point_sources() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_fm_noidx (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fm_noidx (geom) \
+             SELECT ST_SetSRID(ST_MakePoint(116.0 + i * 0.001, 39.0), 4326) \
+             FROM generate_series(1, 100) AS i",
+        )
+        .unwrap();
+
+        let before = prepared_geom_index_count();
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fm_noidx','geom','gid', \
+             '{\"name\":\"fm_noidx\",\"minZoom\":0,\"maxZoom\":2,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureMajorMinZoom\":0,\"featureMajorPoints\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+        let after = prepared_geom_index_count();
+        assert_eq!(
+            after, before,
+            "pure POINT feature-major builds must not create the unused prepared GiST index"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('fm_noidx')").unwrap();
+        Spi::run("DROP TABLE _gp_fm_noidx").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_major_points_fallback_indexes_mixed_sources() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_fm_mixed_idx (gid serial PRIMARY KEY, geom geometry(Geometry, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_fm_mixed_idx (geom) VALUES \
+             (ST_SetSRID(ST_MakePoint(116.0, 39.0), 4326)), \
+             (ST_SetSRID(ST_MakeLine(ST_MakePoint(116.0,39.0), ST_MakePoint(116.1,39.1)), 4326))",
+        )
+        .unwrap();
+
+        let before = prepared_geom_index_count();
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_fm_mixed_idx','geom','gid', \
+             '{\"name\":\"fm_mixed_idx\",\"minZoom\":0,\"maxZoom\":2,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureMajorMinZoom\":0,\"featureMajorPoints\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+        let after = prepared_geom_index_count();
+        assert!(
+            after > before,
+            "mixed fallback must create the prepared GiST index before using tile-major prepared build"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('fm_mixed_idx')").unwrap();
+        Spi::run("DROP TABLE _gp_fm_mixed_idx").unwrap();
+    }
+
+    fn prepared_geom_index_count() -> i64 {
+        Spi::get_one::<i64>(
+            "SELECT count(*)::bigint \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.oid = pg_my_temp_schema() \
+               AND c.relkind = 'i' \
+               AND c.relname LIKE '_gp_prep_%_geom_tile_idx'",
+        )
+        .unwrap()
+        .unwrap()
     }
 
     /// Stats rows must be written per zoom and removed on drop.

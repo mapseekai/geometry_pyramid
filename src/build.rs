@@ -103,14 +103,110 @@ fn build_into(
         return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
+    let mut prepared = if uses_prepared_build(src.cfg) {
+        let options = if config_allows_feature_major_points(src.cfg) {
+            crate::prepared::PreparedBuildOptions::without_geom_tile_index()
+        } else {
+            crate::prepared::PreparedBuildOptions::with_geom_tile_index()
+        };
+        Some(crate::prepared::prepare_source_for_build(src, options)?)
+    } else {
+        if src.cfg.prepared_build {
+            notice!(
+                "geometry_pyramid: preparedBuild=true is ignored when parallel > 1; using existing parallel build path"
+            );
+        }
+        None
+    };
+    let feature_major_points = if let Some(prepared) = prepared.as_mut() {
+        should_use_feature_major_points(src, prepared)?
+    } else {
+        false
+    };
+
     let mut total: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
-        let result = build_zoom_level_with_budget(src, storage_table, &rect)?;
+        let result = build_zoom_level_with_budget(
+            src,
+            storage_table,
+            &rect,
+            prepared.as_ref(),
+            feature_major_points,
+        )?;
         crate::stats::upsert_zoom_stats(src.name, &result)?;
         total += result.tiles;
     }
     Ok(total)
+}
+
+fn uses_prepared_build(cfg: &PyramidConfig) -> bool {
+    cfg.prepared_build && cfg.parallel.max(1) == 1
+}
+
+fn config_allows_feature_major_points(cfg: &PyramidConfig) -> bool {
+    uses_prepared_build(cfg) && cfg.feature_major_points && cfg.tile_srs == 3857
+}
+
+/// `featureMajorPoints` only pays off when the pyramid is deep enough that the
+/// top zoom levels dominate the build. Feature-major cost is ~flat per zoom
+/// (O(features)), while tile-major cost grows ~4x per zoom (O(R(z)) bbox-cell
+/// enumerate + GiST-probe), so for shallow pyramids the many cheap low zooms —
+/// where feature-major's fixed per-feature binning is the slower path — dominate
+/// the build. The `featureMajorMinZoom` knob (default 13) gates this; below it we
+/// fall back to prepared tile-major so shallow pyramids don't regress.
+fn feature_major_zoom_sufficient(cfg: &PyramidConfig) -> bool {
+    cfg.max_zoom >= cfg.feature_major_min_zoom
+}
+
+fn should_use_feature_major_points(
+    src: PyramidSource,
+    prepared: &mut crate::prepared::PreparedBuildSource,
+) -> Result<bool, spi::Error> {
+    if !config_allows_feature_major_points(src.cfg) {
+        if src.cfg.feature_major_points && src.cfg.tile_srs != 3857 {
+            notice!(
+                "geometry_pyramid: featureMajorPoints=true requires tileSRS=3857; using prepared tile-major path"
+            );
+        }
+        return Ok(false);
+    }
+
+    if !feature_major_zoom_sufficient(src.cfg) {
+        notice!(
+            "geometry_pyramid: featureMajorPoints=true skipped — maxZoom {} is below featureMajorMinZoom {} where it pays off; using prepared tile-major path",
+            src.cfg.max_zoom,
+            src.cfg.feature_major_min_zoom
+        );
+        crate::prepared::ensure_geom_tile_index(prepared)?;
+        return Ok(false);
+    }
+
+    if !prepared_table_is_point_only(prepared)? {
+        notice!(
+            "geometry_pyramid: featureMajorPoints=true requires a pure POINT source; using prepared tile-major path"
+        );
+        crate::prepared::ensure_geom_tile_index(prepared)?;
+        return Ok(false);
+    }
+
+    notice!(
+        "geometry_pyramid: featureMajorPoints=true enabled for pyramid '{}'",
+        src.name
+    );
+    Ok(true)
+}
+
+fn prepared_table_is_point_only(
+    prepared: &crate::prepared::PreparedBuildSource,
+) -> Result<bool, spi::Error> {
+    Spi::get_one::<bool>(&format!(
+        r#"SELECT COALESCE(bool_and(geom_type = 'POINT'), false)
+           FROM "{table}"
+           WHERE geom_tile IS NOT NULL"#,
+        table = prepared.table
+    ))
+    .map(|opt| opt.unwrap_or(false))
 }
 
 /// Tippecanoe-style `--drop-densest-as-needed` loop. Build the zoom once,
@@ -121,6 +217,8 @@ fn build_zoom_level_with_budget(
     src: PyramidSource,
     storage_table: &str,
     rect: &TileRect,
+    prepared: Option<&crate::prepared::PreparedBuildSource>,
+    feature_major_points: bool,
 ) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = src.cfg;
     let started = std::time::Instant::now();
@@ -144,7 +242,21 @@ fn build_zoom_level_with_budget(
         // visible to subsequent worker txns only after coordinator commit). For
         // the default tile_size_budget_bytes=0 there are no retries, so this is
         // a non-issue in the common path.
-        run_zoom_strips(src, storage_table, rect, &knobs)?;
+        if let Some(prepared) = prepared {
+            if feature_major_points {
+                build_zoom_level_prepared_points_feature_major(
+                    src,
+                    storage_table,
+                    rect,
+                    &knobs,
+                    prepared,
+                )?;
+            } else {
+                build_zoom_level_prepared(src, storage_table, rect, &knobs, prepared)?;
+            }
+        } else {
+            run_zoom_strips(src, storage_table, rect, &knobs)?;
+        }
 
         let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         notice!(
@@ -360,7 +472,11 @@ fn run_zoom_strips(
 /// empty; they are spliced after a fixed column list. Column names are
 /// revalidated defensively because they ride into dynamic SQL — a name failing
 /// the validation is skipped with a notice rather than silently dropped.
-pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
+pub(crate) fn attribute_projections_for(
+    cfg: &PyramidConfig,
+    inner_alias: &str,
+    outer_alias: &str,
+) -> (String, String) {
     let mut inner = String::new();
     let mut outer = String::new();
     for col in &cfg.attributes {
@@ -371,10 +487,14 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
             );
             continue;
         }
-        inner.push_str(&format!(r#", src."{col}" AS "{col}""#));
-        outer.push_str(&format!(r#", prep."{col}""#));
+        inner.push_str(&format!(r#", {inner_alias}."{col}" AS "{col}""#));
+        outer.push_str(&format!(r#", {outer_alias}."{col}""#));
     }
     (inner, outer)
+}
+
+pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
+    attribute_projections_for(cfg, "src", "prep")
 }
 
 /// The shared `FROM … features` block of the MVT pipeline: a 2-D tile grid
@@ -438,6 +558,111 @@ pub(crate) fn tile_pipeline_from_sql(
     )
 }
 
+/// Prepared-build variant of the shared `FROM ... features` block. The source
+/// rows have already been transformed into tile SRS and indexed on `geom_tile`,
+/// so per-tile work can use a direct Web-Mercator envelope filter.
+pub(crate) fn tile_pipeline_from_prepared_sql(
+    prepared_table: &str,
+    attrs_inner: &str,
+    attrs_outer: &str,
+) -> String {
+    format!(
+        r#"FROM generate_series($4::int, $5::int) AS xs(x)
+           CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
+           CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
+           CROSS JOIN LATERAL (
+              SELECT
+                 ST_AsMVTGeom(prep.gtile,
+                              ST_TileEnvelope($1, t.x, t.y),
+                              $3, $9, true) AS geom,
+                 prep.fid
+                 {attrs_outer}
+              FROM (
+                 SELECT
+                    CASE
+                       WHEN $11::float8 > 0
+                            AND prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
+                          THEN ST_SimplifyPreserveTopology(prep_src.geom_tile, $11::float8)
+                       ELSE prep_src.geom_tile
+                    END AS gtile,
+                    prep_src.geom_type,
+                    prep_src.fid
+                    {attrs_inner}
+                 FROM "{prepared_table}" prep_src
+                 WHERE prep_src.geom_tile && ST_TileEnvelope(
+                    $1, t.x, t.y, margin => ($9::float8 / $3::float8)
+                 )
+              ) prep
+              WHERE
+                 ($12::float8 <= 0
+                  OR prep.geom_type NOT IN ('POLYGON','MULTIPOLYGON')
+                  OR ST_Area(prep.gtile) >= $12::float8)
+                 AND ($13::float8 <= 0
+                      OR prep.geom_type NOT IN ('LINESTRING','MULTILINESTRING')
+                      OR ST_Length(prep.gtile) >= $13::float8)
+                 AND ($14::float8 >= 1.0
+                      OR prep.geom_type NOT IN ('POINT','MULTIPOINT')
+                      OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
+                         / 1000000.0 < $14::float8)
+           ) features
+           WHERE features.geom IS NOT NULL"#
+    )
+}
+
+pub(crate) fn point_feature_major_pipeline_sql(
+    prepared_table: &str,
+    attrs_inner: &str,
+    attrs_outer: &str,
+    attrs_mvt: &str,
+) -> String {
+    format!(
+        r#"WITH raw AS (
+             SELECT
+                floor((ST_X(prep_src.geom_tile) + 20037508.342789244)
+                      / (40075016.685578488 / power(2.0, $1::float8)))::int AS x,
+                floor((20037508.342789244 - ST_Y(prep_src.geom_tile))
+                      / (40075016.685578488 / power(2.0, $1::float8)))::int AS y,
+                prep_src.geom_tile,
+                prep_src.fid
+                {attrs_inner}
+             FROM "{prepared_table}" prep_src
+             WHERE prep_src.geom_type = 'POINT'
+               AND ($14::float8 >= 1.0
+                    OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
+                       / 1000000.0 < $14::float8)
+           ),
+           features AS (
+             SELECT
+                raw.x,
+                raw.y,
+                ST_AsMVTGeom(raw.geom_tile,
+                             ST_TileEnvelope($1, raw.x, raw.y),
+                             $3, $9, true) AS geom,
+                raw.fid
+                {attrs_outer}
+             FROM raw
+             WHERE raw.x BETWEEN $4::int AND $5::int
+               AND raw.y BETWEEN $6::int AND $7::int
+               AND raw.x >= 0
+               AND raw.y >= 0
+               AND raw.x < power(2.0, $1::float8)::int
+               AND raw.y < power(2.0, $1::float8)::int
+           ),
+           grouped AS (
+             SELECT f.x AS x, f.y AS y,
+                    count(*) AS feature_count,
+                    ST_AsMVT(mvt_features.*, $2, $3, 'geom', 'fid') AS mvt
+             FROM features f
+             CROSS JOIN LATERAL (
+                SELECT f.geom, f.fid
+                {attrs_mvt}
+             ) mvt_features
+             WHERE f.geom IS NOT NULL
+             GROUP BY f.x, f.y
+           )"#
+    )
+}
+
 pub(crate) fn build_zoom_level(
     src: PyramidSource,
     storage_table: &str,
@@ -457,8 +682,13 @@ pub(crate) fn build_zoom_level(
 
     let (attrs_inner, attrs_outer) = attribute_projections(cfg);
 
-    let pipeline =
-        tile_pipeline_from_sql(src.source_table, src.geom_column, src.fid_column, &attrs_inner, &attrs_outer);
+    let pipeline = tile_pipeline_from_sql(
+        src.source_table,
+        src.geom_column,
+        src.fid_column,
+        &attrs_inner,
+        &attrs_outer,
+    );
     let split_size = cfg.split_size;
     // Aggregate each tile's MVT exactly once. The previous form computed
     // ST_AsMVT in both the SELECT and the HAVING, so the (expensive) tile
@@ -495,6 +725,111 @@ pub(crate) fn build_zoom_level(
             simplify_tol_m.into(),
             min_area_m2.into(),
             min_len_m.into(),
+            drop_threshold.into(),
+        ],
+    )?;
+    let inserted_after = inserted_count(storage_table, z)?;
+    Ok(inserted_after - inserted_before)
+}
+
+fn build_zoom_level_prepared(
+    src: PyramidSource,
+    storage_table: &str,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+    prepared: &crate::prepared::PreparedBuildSource,
+) -> Result<i64, spi::Error> {
+    let cfg = src.cfg;
+    let z = rect.z;
+    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
+    let simplify_tol_m = knobs.simplify_tol_m;
+    let min_area_m2 = knobs.min_area_m2;
+    let min_len_m = knobs.min_len_m;
+    let drop_threshold = knobs.drop_threshold;
+    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "prep");
+
+    let pipeline = tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer);
+    let split_size = cfg.split_size;
+    let sql = format!(
+        r#"WITH grouped AS (
+             SELECT t.x AS x, t.y AS y,
+                    count(*) AS feature_count,
+                    ST_AsMVT(features.*, $2, $3, 'geom', 'fid') AS mvt
+             {pipeline}
+             GROUP BY t.x, t.y
+           )
+           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
+           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
+           FROM grouped
+           WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
+    );
+
+    let inserted_before = inserted_count(storage_table, z)?;
+    Spi::run_with_args(
+        &sql,
+        &[
+            (z as i32).into(),
+            src.name.into(),
+            (cfg.tile_size as i32).into(),
+            (xmin_t as i32).into(),
+            (xmax_t as i32).into(),
+            (ymin_t as i32).into(),
+            (ymax_t as i32).into(),
+            cfg.tile_srs.into(),
+            (cfg.tile_extend as i32).into(),
+            cfg.source_srs.into(),
+            simplify_tol_m.into(),
+            min_area_m2.into(),
+            min_len_m.into(),
+            drop_threshold.into(),
+        ],
+    )?;
+    let inserted_after = inserted_count(storage_table, z)?;
+    Ok(inserted_after - inserted_before)
+}
+
+fn build_zoom_level_prepared_points_feature_major(
+    src: PyramidSource,
+    storage_table: &str,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+    prepared: &crate::prepared::PreparedBuildSource,
+) -> Result<i64, spi::Error> {
+    let cfg = src.cfg;
+    let z = rect.z;
+    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
+    let drop_threshold = knobs.drop_threshold;
+    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "raw");
+    let (_, attrs_mvt) = attribute_projections_for(cfg, "prep_src", "f");
+    let pipeline =
+        point_feature_major_pipeline_sql(&prepared.table, &attrs_inner, &attrs_outer, &attrs_mvt);
+    let split_size = cfg.split_size;
+    let sql = format!(
+        r#"{pipeline}
+           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
+           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
+           FROM grouped
+           WHERE feature_count >= {split_size}
+             AND mvt IS NOT NULL"#
+    );
+
+    let inserted_before = inserted_count(storage_table, z)?;
+    Spi::run_with_args(
+        &sql,
+        &[
+            (z as i32).into(),
+            src.name.into(),
+            (cfg.tile_size as i32).into(),
+            (xmin_t as i32).into(),
+            (xmax_t as i32).into(),
+            (ymin_t as i32).into(),
+            (ymax_t as i32).into(),
+            cfg.tile_srs.into(),
+            (cfg.tile_extend as i32).into(),
+            cfg.source_srs.into(),
+            knobs.simplify_tol_m.into(),
+            knobs.min_area_m2.into(),
+            knobs.min_len_m.into(),
             drop_threshold.into(),
         ],
     )?;
@@ -549,5 +884,112 @@ mod tests {
             after_one,
             knobs.simplify_tol_m
         );
+    }
+
+    #[test]
+    fn prepared_pipeline_reads_preprojected_geometry() {
+        let sql = tile_pipeline_from_prepared_sql(
+            "_gp_prep_42",
+            r#", prep_src."kind" AS "kind""#,
+            r#", prep."kind""#,
+        );
+
+        assert!(sql.contains(r#"FROM "_gp_prep_42" prep_src"#));
+        assert!(sql.contains("prep_src.geom_tile && ST_TileEnvelope"));
+        assert!(sql.contains("ST_SimplifyPreserveTopology(prep_src.geom_tile"));
+        assert!(!sql.contains("ST_Transform"));
+    }
+
+    #[test]
+    fn attribute_projections_can_target_aliases() {
+        let cfg = PyramidConfig {
+            attributes: vec!["kind".into()],
+            ..Default::default()
+        };
+
+        let (inner, outer) = attribute_projections_for(&cfg, "prep_src", "prep");
+
+        assert_eq!(inner, r#", prep_src."kind" AS "kind""#);
+        assert_eq!(outer, r#", prep."kind""#);
+    }
+
+    #[test]
+    fn prepared_build_enabled_only_for_single_backend() {
+        let off = PyramidConfig::default();
+        assert!(!uses_prepared_build(&off));
+
+        let single = PyramidConfig {
+            prepared_build: true,
+            parallel: 1,
+            ..Default::default()
+        };
+        assert!(uses_prepared_build(&single));
+
+        let parallel = PyramidConfig {
+            prepared_build: true,
+            parallel: 2,
+            ..Default::default()
+        };
+        assert!(!uses_prepared_build(&parallel));
+    }
+
+    #[test]
+    fn feature_major_points_requires_prepared_single_backend_web_mercator() {
+        let enabled = PyramidConfig {
+            prepared_build: true,
+            feature_major_points: true,
+            parallel: 1,
+            tile_srs: 3857,
+            ..Default::default()
+        };
+        assert!(config_allows_feature_major_points(&enabled));
+
+        let without_prepared = PyramidConfig {
+            prepared_build: false,
+            ..enabled.clone()
+        };
+        assert!(!config_allows_feature_major_points(&without_prepared));
+
+        let parallel = PyramidConfig {
+            parallel: 2,
+            ..enabled.clone()
+        };
+        assert!(!config_allows_feature_major_points(&parallel));
+
+        let non_web_mercator = PyramidConfig {
+            tile_srs: 4326,
+            ..enabled
+        };
+        assert!(!config_allows_feature_major_points(&non_web_mercator));
+    }
+
+    #[test]
+    fn feature_major_requires_sufficient_max_zoom() {
+        let min = crate::config::DEFAULT_FEATURE_MAJOR_MIN_ZOOM;
+
+        // Shallow pyramids regress under feature-major; gate them out.
+        let shallow = PyramidConfig { max_zoom: min - 1, ..Default::default() };
+        assert!(!feature_major_zoom_sufficient(&shallow));
+
+        let at_threshold = PyramidConfig { max_zoom: min, ..Default::default() };
+        assert!(feature_major_zoom_sufficient(&at_threshold));
+
+        // Default pyramids are deep (maxZoom 18), so feature-major stays enabled.
+        assert!(feature_major_zoom_sufficient(&PyramidConfig::default()));
+
+        // The knob can force feature-major on for shallow pyramids (e.g. tests).
+        let forced = PyramidConfig { max_zoom: 2, feature_major_min_zoom: 0, ..Default::default() };
+        assert!(feature_major_zoom_sufficient(&forced));
+    }
+
+    #[test]
+    fn point_feature_major_pipeline_does_not_enumerate_bbox_tiles() {
+        let sql = point_feature_major_pipeline_sql("_gp_prep_test", "", "", "");
+        assert!(
+            !sql.contains("generate_series"),
+            "point feature-major path must not enumerate bbox tile cells"
+        );
+        assert!(sql.contains("ST_X(prep_src.geom_tile)"));
+        assert!(sql.contains("GROUP BY f.x, f.y"));
     }
 }
