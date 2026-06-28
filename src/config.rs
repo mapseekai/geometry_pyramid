@@ -8,6 +8,10 @@ pub const DEFAULT_TILE_EXTEND: u32 = 8;
 pub const DEFAULT_MIN_ZOOM: u8 = 0;
 pub const DEFAULT_MAX_ZOOM: u8 = 18;
 pub const DEFAULT_PARALLEL: u32 = 1;
+/// Upper bound on the auto-resolved worker count (`parallel = 0`). Keeps a very
+/// large host from spawning an absurd number of per-zoom spec files; the build
+/// degrades gracefully below this anyway (unspawnable slots run inline).
+pub const PARALLEL_AUTO_CAP: u32 = 32;
 pub const DEFAULT_PREPARED_BUILD: bool = false;
 pub const DEFAULT_FEATURE_MAJOR_POINTS: bool = false;
 /// Minimum `maxZoom` at which `featureMajorPoints` engages (see the field doc).
@@ -90,7 +94,12 @@ pub struct PyramidConfig {
     #[serde(default = "default_max_zoom", rename = "maxZoom")]
     pub max_zoom: u8,
 
-    /// Number of parallel workers used to build the pyramid.
+    /// Number of parallel worker slots (coordinator + background workers) used to
+    /// build the pyramid. `0` means **auto** — the host's available parallelism,
+    /// capped at [`PARALLEL_AUTO_CAP`] (matching Ganos, where `0` = maximum
+    /// allowed). `1` (the default) builds serially. Resolve via
+    /// [`PyramidConfig::effective_parallel`]; over-requesting is safe (slots that
+    /// can't spawn a worker run inline on the coordinator).
     #[serde(default = "default_parallel")]
     pub parallel: u32,
 
@@ -318,6 +327,28 @@ impl PyramidConfig {
         }
         Ok(())
     }
+
+    /// Effective worker-slot count (coordinator + workers) for the build.
+    ///
+    /// `parallel = 0` resolves to the host's available parallelism, capped at
+    /// [`PARALLEL_AUTO_CAP`] (Ganos's `0` = maximum-allowed semantics). Any
+    /// explicit value is returned verbatim. The result is always `>= 1`, so the
+    /// build's `effective_parallel() - 1` worker count never underflows.
+    pub fn effective_parallel(&self) -> u32 {
+        match self.parallel {
+            0 => auto_parallelism(),
+            n => n,
+        }
+    }
+}
+
+/// Available parallelism for `parallel = 0` (auto), clamped to
+/// `[1, PARALLEL_AUTO_CAP]`. Falls back to 1 when the platform can't report it.
+fn auto_parallelism() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .clamp(1, PARALLEL_AUTO_CAP)
 }
 
 fn default_source_srs() -> i32 {
@@ -391,6 +422,24 @@ mod tests {
     #[test]
     fn validate_accepts_defaults() {
         assert!(PyramidConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn effective_parallel_resolves_auto_and_honours_explicit() {
+        // Default (1) and any explicit value pass through verbatim.
+        assert_eq!(PyramidConfig::parse("").unwrap().effective_parallel(), 1);
+        assert_eq!(
+            PyramidConfig::parse(r#"{"parallel":4}"#)
+                .unwrap()
+                .effective_parallel(),
+            4
+        );
+        // 0 = auto: resolves to a real worker count in [1, PARALLEL_AUTO_CAP],
+        // never 0 (so `effective_parallel() - 1` can't underflow).
+        let auto = PyramidConfig::parse(r#"{"parallel":0}"#)
+            .unwrap()
+            .effective_parallel();
+        assert!((1..=PARALLEL_AUTO_CAP).contains(&auto));
     }
 
     #[test]

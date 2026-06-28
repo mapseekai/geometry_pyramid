@@ -1089,6 +1089,73 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('nullp')").unwrap();
     }
 
+    /// `parallel:0` (auto) must trigger the worker-parallel path — not silently
+    /// fall back to serial — and stay byte-identical. `effective_parallel()`
+    /// resolves 0 to the host core count; on a ≥2-core box this farms workers
+    /// (world-corner outliers widen the bbox so deep zooms exceed
+    /// PARALLEL_MIN_CELLS), and the auto-resolved worker count must produce the
+    /// same tiles as serial. (On a 1-core box auto resolves to 1 and the check
+    /// holds trivially.)
+    #[pg_test]
+    fn parallel_auto_matches_serial() {
+        use crate::worker::exec_sql_autonomous;
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_auto; \
+             CREATE TABLE _gp_auto (gid serial PRIMARY KEY, geom geometry(Geometry,4326)); \
+             INSERT INTO _gp_auto (geom) \
+                 SELECT ST_SetSRID(ST_MakePoint(110.0 + i*0.7, 35.0 + i*0.4), 4326) \
+                 FROM generate_series(1, 14) AS i; \
+             INSERT INTO _gp_auto (geom) \
+                 SELECT ST_SetSRID(ST_MakeEnvelope( \
+                     109.0 + i*0.8, 34.0 + i*0.5, 109.0 + i*0.8 + 1.7, 34.0 + i*0.5 + 1.1, 4326), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_auto (geom) VALUES \
+                 (ST_SetSRID(ST_MakePoint(-170,-75),4326)), \
+                 (ST_SetSRID(ST_MakePoint(170,78),4326))",
+        )
+        .unwrap();
+
+        let ser = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_auto','geom','gid', \
+             '{\"name\":\"a0_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ser, Some(true));
+
+        // parallel:0 => auto (host cores), worker-visible committed prepared table.
+        let auto = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_auto','geom','gid', \
+             '{\"name\":\"a0_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":0,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(auto, Some(true));
+
+        let ser_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_a0_ser")
+            .unwrap()
+            .unwrap();
+        assert!(ser_tiles > 0, "serial build produced no tiles");
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_a0_ser a \
+             FULL JOIN _gp_tiles_a0_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "parallel:0 (auto) tiles must match serial in coverage and encoded size"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('a0_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('a0_par')").unwrap();
+    }
+
     /// Incremental update must touch only the dirty tiles, no-op on an empty
     /// match, and reject a broken where_clause without damaging the pyramid.
     #[pg_test]
@@ -1589,6 +1656,13 @@ pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
 
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec![]
+        // The parallel-build tests each spawn background workers (build strips +
+        // the autonomous-commit worker), and libtest runs tests concurrently
+        // against one shared cluster. The PG default `max_worker_processes = 8`
+        // is exhausted when several parallel tests overlap — especially
+        // `parallel:0` (auto), which resolves to the host core count. Raise the
+        // ceiling well above peak concurrent demand so spawns don't fail (the
+        // autonomous-commit path has no inline fallback and would panic).
+        vec!["max_worker_processes = 64", "max_parallel_workers = 16"]
     }
 }

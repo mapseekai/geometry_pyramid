@@ -59,7 +59,7 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn std::error::Error + Send
         &[src.name.into()],
     )?;
 
-    let workers = src.cfg.parallel.max(1) - 1;
+    let workers = src.cfg.effective_parallel() - 1;
     if workers > 0 && src.cfg.tile_size_budget_bytes > 0 {
         // The budget retry loop wipes a zoom and rebuilds it within the
         // coordinator's uncommitted transaction. Under parallel>1 the workers
@@ -103,7 +103,7 @@ fn build_into(
         return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
-    let parallel = src.cfg.parallel.max(1) > 1;
+    let parallel = src.cfg.effective_parallel() > 1;
     let mut prepared = if uses_prepared_build(src.cfg) {
         let options = if config_allows_feature_major_points(src.cfg) {
             crate::prepared::PreparedBuildOptions::without_geom_tile_index()
@@ -187,7 +187,7 @@ fn uses_prepared_build(cfg: &PyramidConfig) -> bool {
 /// (when enabled) feature-driven path, both of which are strip-bounded.
 fn config_allows_feature_major_points(cfg: &PyramidConfig) -> bool {
     cfg.prepared_build
-        && cfg.parallel.max(1) == 1
+        && cfg.effective_parallel() == 1
         && cfg.feature_major_points
         && cfg.tile_srs == 3857
 }
@@ -212,15 +212,15 @@ fn should_use_feature_major_points(
             notice!(
                 "geometry_pyramid: featureMajorPoints=true requires tileSRS=3857; using prepared tile-major path"
             );
-        } else if src.cfg.feature_major_points && src.cfg.parallel.max(1) > 1 {
+        } else if src.cfg.feature_major_points && src.cfg.effective_parallel() > 1 {
             // Explain the silent demotion: feature-major points is single-backend
             // (see `config_allows_feature_major_points`), so under parallel>1 the
             // build runs the worker-parallel prepared tile-major / feature-driven
             // path instead. Without this the user gets no signal their knob was
-            // dropped.
+            // dropped. Print the resolved count so `parallel:0` (auto) reads true.
             notice!(
                 "geometry_pyramid: featureMajorPoints=true is single-backend; under parallel={} using the worker-parallel prepared tile-major path instead",
-                src.cfg.parallel
+                src.cfg.effective_parallel()
             );
         }
         return Ok(false);
@@ -590,7 +590,7 @@ fn run_zoom_strips(
     feature_major_points: bool,
     feature_driven: bool,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    let workers = src.cfg.parallel.max(1) - 1;
+    let workers = src.cfg.effective_parallel() - 1;
     if workers == 0 || rect.cell_count() <= PARALLEL_MIN_CELLS {
         build_zoom_level_dispatch(
             src,
