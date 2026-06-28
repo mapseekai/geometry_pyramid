@@ -20,8 +20,11 @@ pub(crate) enum WorkerMode {
     /// Execute one SQL script in an autonomous (separately committed)
     /// transaction. Used to create the shadow table for parallel builds.
     ExecSql { sql: String },
-    /// Build tile strips into `storage_table` using the shared
-    /// build_zoom_level pipeline, one transaction per strip.
+    /// Build tile strips into `storage_table`, one transaction per strip.
+    /// When `prepared_table` is set the worker drives the fast prepared
+    /// pipeline (prepared tile-major, or feature-driven when `feature_driven`)
+    /// against the committed, worker-visible prepared table; otherwise it runs
+    /// the baseline tile-major path straight off the source.
     BuildStrips {
         pyramid_name: String,
         storage_table: String,
@@ -31,6 +34,10 @@ pub(crate) enum WorkerMode {
         config: PyramidConfig,
         knobs: KnobValues,
         strips: Vec<TileRect>,
+        /// Committed prepared table the workers read (None = baseline path).
+        prepared_table: Option<String>,
+        /// Drive the feature-driven enumeration pipeline for these strips.
+        feature_driven: bool,
     },
 }
 
@@ -118,17 +125,28 @@ mod tests {
                     xmax: 1,
                     ymax: 7,
                 }],
+                prepared_table: Some("_gp_prep_p".into()),
+                feature_driven: true,
             },
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: WorkerSpec = serde_json::from_str(&json).unwrap();
-        let WorkerMode::BuildStrips { strips, knobs, .. } = back.mode else {
+        let WorkerMode::BuildStrips {
+            strips,
+            knobs,
+            prepared_table,
+            feature_driven,
+            ..
+        } = back.mode
+        else {
             panic!("wrong mode");
         };
         assert_eq!(back.db_oid, 16384);
         assert_eq!(strips.len(), 1);
         assert_eq!(strips[0].z, 3);
         assert!((knobs.drop_threshold - 0.4).abs() < 1e-9);
+        assert_eq!(prepared_table.as_deref(), Some("_gp_prep_p"));
+        assert!(feature_driven);
     }
 
     #[test]
@@ -210,6 +228,8 @@ fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + 
             config,
             knobs,
             strips,
+            prepared_table,
+            feature_driven,
         } => {
             let k = crate::build::ZoomKnobs::from_values(*knobs);
             let src = crate::source::PyramidSource {
@@ -219,9 +239,23 @@ fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + 
                 fid_column,
                 cfg: config,
             };
+            // The committed prepared table already carries its GiST index
+            // (workers never run the index-free feature-major-points path —
+            // that stays parallel=1), so report the index as present.
+            let prepared = prepared_table
+                .as_ref()
+                .map(|t| crate::prepared::PreparedBuildSource::new(t.clone(), true));
             for rect in strips {
                 let result: Result<i64, pgrx::spi::Error> = BackgroundWorker::transaction(|| {
-                    crate::build::build_zoom_level(src, storage_table, rect, &k)
+                    crate::build::build_zoom_level_dispatch(
+                        src,
+                        storage_table,
+                        rect,
+                        &k,
+                        prepared.as_ref(),
+                        false, // feature_major_points: never farmed to workers
+                        *feature_driven,
+                    )
                 });
                 result?;
             }
@@ -247,9 +281,11 @@ pub(crate) fn spawn(
 }
 
 /// Run an SQL script in an autonomous transaction via a one-shot worker,
-/// waiting for completion. Used for committed shadow-table DDL.
-pub(crate) fn exec_sql_autonomous(
+/// waiting up to `timeout_ms` (0 = unbounded) for completion. Used for
+/// committed shadow-table DDL and the committed prepared-table transform.
+pub(crate) fn exec_sql_autonomous_timeout(
     sql: &str,
+    timeout_ms: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, next_spec_idx());
     let spec = WorkerSpec {
@@ -260,9 +296,16 @@ pub(crate) fn exec_sql_autonomous(
     };
     let path = write_spec(&filename, &spec)?;
     let _handle = spawn(&filename)?;
-    let result = wait_for(std::slice::from_ref(&path), 60_000);
+    let result = wait_for(std::slice::from_ref(&path), timeout_ms);
     cleanup_spec(&path);
     result
+}
+
+/// Run committed DDL with the default 60s budget (fast schema-only work).
+pub(crate) fn exec_sql_autonomous(
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    exec_sql_autonomous_timeout(sql, 60_000)
 }
 
 /// Poll status files until every spec is done, any errors out, or the

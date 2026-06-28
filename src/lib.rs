@@ -663,6 +663,201 @@ mod tests {
         // so the table never accumulates stale data across test invocations.
     }
 
+    /// PR4: the parallel feature-driven fast path must produce the identical
+    /// tile set to a serial feature-driven build.
+    ///
+    /// This is the integration backstop for the whole PR4 slice: it exercises
+    /// (a) the committed, worker-visible prepared table, (b) workers running the
+    /// feature-driven pipeline on their x-strips, and (c) strip-coordinate
+    /// ownership being tile-exact — an overlap would trip the `(z,x,y)` PRIMARY
+    /// KEY at INSERT and a gap would surface as a NULL on one side of the FULL
+    /// JOIN. The source is committed via an autonomous worker so the BuildStrips
+    /// workers see it under MVCC (same harness constraint as
+    /// `parallel_build_matches_serial`).
+    #[pg_test]
+    fn parallel_feature_driven_matches_serial() {
+        use crate::worker::exec_sql_autonomous;
+
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        // A sparse mixed cluster (points + lines + polygons) plus two
+        // world-corner outliers that inflate the bbox so R(z) >> rows and
+        // feature-driven actually engages at the higher zooms — committed so
+        // workers can see it.
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_pfd; \
+             CREATE TABLE _gp_pfd (gid serial PRIMARY KEY, kind text, rank int, \
+                 geom geometry(Geometry, 4326)); \
+             INSERT INTO _gp_pfd (kind, rank, geom) \
+                 SELECT 'point', i, ST_SetSRID(ST_MakePoint(110.0 + i*0.7, 35.0 + i*0.4), 4326) \
+                 FROM generate_series(1, 12) AS i; \
+             INSERT INTO _gp_pfd (kind, rank, geom) \
+                 SELECT 'line', 100+i, ST_SetSRID(ST_MakeLine( \
+                     ST_MakePoint(108.0 + i*0.9, 36.0 + i*0.6), \
+                     ST_MakePoint(108.0 + i*0.9 + 2.0, 36.0 + i*0.6 + 1.5)), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_pfd (kind, rank, geom) \
+                 SELECT 'polygon', 200+i, ST_SetSRID(ST_MakeEnvelope( \
+                     109.0 + i*0.8, 34.0 + i*0.5, 109.0 + i*0.8 + 1.7, 34.0 + i*0.5 + 1.1, 4326), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_pfd (kind, rank, geom) VALUES \
+                 ('outlier', 9001, ST_SetSRID(ST_MakePoint(-170, -75), 4326)), \
+                 ('outlier', 9002, ST_SetSRID(ST_MakePoint(170, 78), 4326))",
+        )
+        .unwrap();
+
+        // Serial feature-driven (parallel defaults to 1 — in-transaction path).
+        let ser_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_pfd','geom','gid', \
+             '{\"name\":\"pfd_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ser_ok, Some(true));
+
+        // Parallel feature-driven: parallel=2 (one worker per zoom), committed
+        // worker-visible prepared table, generous timeout.
+        let par_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_pfd','geom','gid', \
+             '{\"name\":\"pfd_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":2,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(par_ok, Some(true));
+
+        // Guard against a vacuously-passing comparison (both empty).
+        let ser_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_pfd_ser")
+            .unwrap()
+            .unwrap();
+        assert!(
+            ser_tiles > 0,
+            "serial feature-driven build produced no tiles"
+        );
+
+        // FULL JOIN on (z,x,y): a coverage gap leaves a NULL octet_length on one
+        // side; a size difference (extra/missing/different feature) is unequal.
+        // Either way mismatches>0. Compared by encoded SIZE, not raw bytes, since
+        // parallel workers scan narrower x-strips and may encode a tile's features
+        // in a different order (size is invariant under that reordering).
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_pfd_ser a \
+             FULL JOIN _gp_tiles_pfd_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "parallel feature-driven tiles must match serial in coverage and per-tile encoded size"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('pfd_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('pfd_par')").unwrap();
+        // _gp_pfd was committed by exec_sql_autonomous; like _gp_par in
+        // parallel_build_matches_serial it is left for the next run's
+        // "DROP TABLE IF EXISTS" to reclaim (the test database is torn down
+        // after the run anyway).
+    }
+
+    /// PR4: the parallel *prepared tile-major* fast path must produce the
+    /// identical tile set to a serial prepared tile-major build.
+    ///
+    /// This covers the path that `parallel_feature_driven_matches_serial` does
+    /// NOT: `preparedBuild=true, parallel>1, featureDrivenEnum=false`. That combo
+    /// became reachable in PR4 (the committed prepared table is now worker-visible
+    /// for the plain prepared path too, not only feature-driven), so it needs its
+    /// own equivalence backstop. It exercises (a) the committed prepared table read
+    /// by workers, (b) `build_zoom_level_prepared` running on Morton blocks (the
+    /// dispatch's prepared-tile-major arm, distinct from the feature-driven arm),
+    /// and (c) Morton-block ownership being tile-exact — overlap trips the
+    /// `(z,x,y)` PRIMARY KEY, a gap surfaces as a NULL on one side of the FULL JOIN.
+    #[pg_test]
+    fn parallel_prepared_tile_major_matches_serial() {
+        use crate::worker::exec_sql_autonomous;
+
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        // Same sparse mixed cluster + world-corner outliers as the feature-driven
+        // test: the outliers inflate the bbox so the deep-zoom lattice exceeds
+        // PARALLEL_MIN_CELLS and workers actually farm (rather than running inline).
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_ptm; \
+             CREATE TABLE _gp_ptm (gid serial PRIMARY KEY, kind text, rank int, \
+                 geom geometry(Geometry, 4326)); \
+             INSERT INTO _gp_ptm (kind, rank, geom) \
+                 SELECT 'point', i, ST_SetSRID(ST_MakePoint(110.0 + i*0.7, 35.0 + i*0.4), 4326) \
+                 FROM generate_series(1, 12) AS i; \
+             INSERT INTO _gp_ptm (kind, rank, geom) \
+                 SELECT 'line', 100+i, ST_SetSRID(ST_MakeLine( \
+                     ST_MakePoint(108.0 + i*0.9, 36.0 + i*0.6), \
+                     ST_MakePoint(108.0 + i*0.9 + 2.0, 36.0 + i*0.6 + 1.5)), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_ptm (kind, rank, geom) \
+                 SELECT 'polygon', 200+i, ST_SetSRID(ST_MakeEnvelope( \
+                     109.0 + i*0.8, 34.0 + i*0.5, 109.0 + i*0.8 + 1.7, 34.0 + i*0.5 + 1.1, 4326), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_ptm (kind, rank, geom) VALUES \
+                 ('outlier', 9001, ST_SetSRID(ST_MakePoint(-170, -75), 4326)), \
+                 ('outlier', 9002, ST_SetSRID(ST_MakePoint(170, 78), 4326))",
+        )
+        .unwrap();
+
+        // Serial prepared tile-major (parallel defaults to 1). No featureDrivenEnum.
+        let ser_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_ptm','geom','gid', \
+             '{\"name\":\"ptm_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"preparedBuild\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ser_ok, Some(true));
+
+        // Parallel prepared tile-major: parallel=2, committed worker-visible
+        // prepared table, Morton-block partition, generous timeout.
+        let par_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_ptm','geom','gid', \
+             '{\"name\":\"ptm_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"preparedBuild\":true, \
+                \"parallel\":2,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(par_ok, Some(true));
+
+        // Guard against a vacuously-passing comparison (both empty).
+        let ser_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_ptm_ser")
+            .unwrap()
+            .unwrap();
+        assert!(
+            ser_tiles > 0,
+            "serial prepared tile-major build produced no tiles"
+        );
+
+        // FULL JOIN on (z,x,y): coverage gap ⇒ NULL on one side; size difference
+        // ⇒ unequal. Compared by encoded SIZE (order-invariant) since each Morton
+        // block scans a different sub-extent and may encode a tile's features in a
+        // different order.
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_ptm_ser a \
+             FULL JOIN _gp_tiles_ptm_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "parallel prepared tile-major tiles must match serial in coverage and per-tile encoded size"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('ptm_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('ptm_par')").unwrap();
+        // _gp_ptm was committed by exec_sql_autonomous; left for the next run's
+        // "DROP TABLE IF EXISTS" to reclaim (test database torn down after run).
+    }
+
     /// Incremental update must touch only the dirty tiles, no-op on an empty
     /// match, and reject a broken where_clause without damaging the pyramid.
     #[pg_test]

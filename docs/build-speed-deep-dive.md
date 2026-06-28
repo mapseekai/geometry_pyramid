@@ -154,6 +154,78 @@ Equivalence is covered by a `pg_test` at the default (nonzero) `tileExtend`, wit
 mixed geometry types, `simplifyPixels>0` and attributes, asserting an identical
 tile set and encoded size against the tile-major path across the crossover.
 
+## Parallel builds run the fast path on Morton blocks
+
+`parallel>1` farms each zoom to background workers. Originally workers ran the
+**baseline** tile-major path (re-transforming the source per strip per zoom),
+because the prepared table was a session-local `TEMP` table invisible to other
+backends. The parallel build now materializes the prepared table **committed**
+(via an autonomous worker, deterministic per-pyramid name, self-healing
+`DROP IF EXISTS` like the shadow table), so workers run the same prepared /
+feature-driven fast path the coordinator would.
+
+**Partition.** The fast path partitions each zoom rect into **Morton (Z-order)
+blocks** — a 2-D grid (≈4 blocks per worker) ordered by the Morton code of the
+block's grid position — assigned to workers **interleaved** (block *i* → worker
+*i* mod *W*). Blocks are a disjoint partition that exactly covers the rect, so
+every `(z,x,y)` is owned by exactly one worker (no overlap → no PK collision, no
+gap → no missing tile). Interleaving matters: a contiguous Morton run covering a
+dense region is split across workers rather than dumped on one. The pure-baseline
+parallel path keeps its proven x-strips (it re-scans source per tile, so 2-D
+blocking buys it little).
+
+**The read-filter is load-bearing.** The Morton bounds clamp the candidate-tile
+*explode*, not the *scan*: without a filter the `prepped` CTE reads **every**
+feature in every worker (`W×` the scan), so the clip splits `W` ways but the scan
+doesn't — near-zero speedup. Each worker therefore prefilters with
+`geom_tile && <block envelope>` (the block's tile span in metres, padded by the
+margin + 2 tiles — a provable superset of the explode, so it can't drop a tile),
+turning the per-worker scan into a GiST index-scan of its block. `EXPLAIN ANALYZE`
+confirms: an empty block reads 0 rows via the index instead of seq-scanning all.
+
+**Measured** (200k points over a country bbox, `parallel=4` = coordinator + 3
+workers, 8-core Apple aarch64, `featureDrivenEnum`, release build, one warm
+session):
+
+| dataset shape | serial | parallel=4 | speedup |
+|---------------|--------|-----------|---------|
+| distributed, `maxZoom=13` | 6.59 s | **3.95 s** | **1.67×** |
+| distributed, `maxZoom=16` | 9.56 s | **5.18 s** | **1.85×** |
+| concentrated core + far outliers, `maxZoom=13` | 7.35 s | 6.27 s | 1.17× |
+
+All builds are **byte-identical** to serial (FULL JOIN on `(z,x,y)` by encoded
+size, 0 mismatches at every depth). Per-zoom the expensive deep levels (z6–z15)
+hit **2.1–4.3×** with 4 workers — the parallelism is efficient *where it engages*.
+
+But the **overall** speedup is capped well below linear (~1.7–1.85×) and climbs
+only *slowly* with depth — it is **not** near-linear. The per-zoom curve shows
+why, and it is honest to state it plainly:
+
+- **A fixed serial floor dominates.** The shallow zooms z0–z5 run inline on the
+  coordinator (each rect is below `PARALLEL_MIN_CELLS=64`, so farming them costs
+  more than it saves — measured 0.78–0.95×, i.e. *slower* in parallel). Together
+  with the one-shot transform/index prefix (the committed prepared table is built
+  single-threaded before any worker starts), that floor is a constant ~1.4 s that
+  does not parallelize. Going `maxZoom` 13→16 only shifts the ratio 1.67→1.85×
+  because the deep parallel levels grow while the floor stays fixed (Amdahl). To
+  push past ~1.85× you must attack the floor itself — parallelize the transform
+  prefix, or cut the ~230 ms/zoom fixed cost of the shallow inline levels — which
+  is separate work from this partition scheme.
+- **A concentrated core can't be tile-partitioned.** When a dense cluster fits in
+  one Morton block (sparse data over a huge bbox), one worker carries it — no
+  uniform grid resolution can split it without exploding the block count over the
+  wide bbox. True balance there needs **work-aware** partitioning (quadtree on
+  occupied tiles, or per-block feature counts) — a follow-up. Tile-exact ownership
+  forbids partitioning by feature (two workers could emit the same tile → PK
+  collision), so the partition must stay tile-based.
+
+> **Caveat that bit once.** The committed prepared table must be dropped in the
+> *coordinator's* transaction, not via an autonomous worker: the coordinator holds
+> `ACCESS SHARE` on it for the whole build, so an autonomous `DROP`'s
+> `ACCESS EXCLUSIVE` deadlocks against it — and because the coordinator waits on a
+> status *file*, not a lock, Postgres can't detect it; it silently burned the full
+> worker timeout (~60 s) every parallel build until fixed.
+
 ## The single-pass MVT refactor was a no-op
 
 Commit `4cc10ff` ("single-pass MVT aggregation") moved `ST_AsMVT` out of a

@@ -103,19 +103,22 @@ fn build_into(
         return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
     };
 
+    let parallel = src.cfg.parallel.max(1) > 1;
     let mut prepared = if uses_prepared_build(src.cfg) {
         let options = if config_allows_feature_major_points(src.cfg) {
             crate::prepared::PreparedBuildOptions::without_geom_tile_index()
         } else {
             crate::prepared::PreparedBuildOptions::with_geom_tile_index()
         };
-        Some(crate::prepared::prepare_source_for_build(src, options)?)
+        Some(if parallel {
+            // Committed + worker-visible. The transform/index runs once here as
+            // a serial prefix (it borrows the build's own timeout), then every
+            // worker reads the result instead of re-transforming the source.
+            crate::prepared::prepare_source_committed(src, options, src.cfg.build_timeout_ms)?
+        } else {
+            crate::prepared::prepare_source_for_build(src, options)?
+        })
     } else {
-        if src.cfg.prepared_build {
-            notice!(
-                "geometry_pyramid: preparedBuild=true is ignored when parallel > 1; using existing parallel build path"
-            );
-        }
         None
     };
     let feature_major_points = if let Some(prepared) = prepared.as_mut() {
@@ -154,15 +157,39 @@ fn build_into(
         crate::stats::upsert_zoom_stats(src.name, &result)?;
         total += result.tiles;
     }
+
+    // The committed prepared table outlives the coordinator transaction, so it
+    // must be dropped explicitly once all zooms are built (the temp variant is
+    // reclaimed at commit). Dropped in the coordinator transaction — see
+    // [`crate::prepared::drop_prepared_committed`] for why it must not be
+    // autonomous.
+    if parallel {
+        if let Some(p) = prepared.as_ref() {
+            crate::prepared::drop_prepared_committed(&p.table)?;
+        }
+    }
     Ok(total)
 }
 
+/// Whether to materialize a prepared (pre-transformed) source table. Now
+/// parallel-agnostic: under `parallel>1` the table is committed and
+/// worker-visible (see [`crate::prepared::prepare_source_committed`]) so the
+/// workers can run the fast prepared/feature-driven path on their strips
+/// instead of re-transforming the source per strip per zoom (the baseline).
 fn uses_prepared_build(cfg: &PyramidConfig) -> bool {
-    cfg.prepared_build && cfg.parallel.max(1) == 1
+    cfg.prepared_build
 }
 
+/// Feature-major *points* stays single-backend: its pipeline bins every point
+/// arithmetically with no GiST prefilter, so a worker handed one x-strip would
+/// still scan and bin the whole point set — `W` workers ⇒ `W×` the work, a net
+/// loss. Under `parallel>1` a point source falls to the prepared tile-major or
+/// (when enabled) feature-driven path, both of which are strip-bounded.
 fn config_allows_feature_major_points(cfg: &PyramidConfig) -> bool {
-    uses_prepared_build(cfg) && cfg.feature_major_points && cfg.tile_srs == 3857
+    cfg.prepared_build
+        && cfg.parallel.max(1) == 1
+        && cfg.feature_major_points
+        && cfg.tile_srs == 3857
 }
 
 /// `featureMajorPoints` only pays off when the pyramid is deep enough that the
@@ -184,6 +211,16 @@ fn should_use_feature_major_points(
         if src.cfg.feature_major_points && src.cfg.tile_srs != 3857 {
             notice!(
                 "geometry_pyramid: featureMajorPoints=true requires tileSRS=3857; using prepared tile-major path"
+            );
+        } else if src.cfg.feature_major_points && src.cfg.parallel.max(1) > 1 {
+            // Explain the silent demotion: feature-major points is single-backend
+            // (see `config_allows_feature_major_points`), so under parallel>1 the
+            // build runs the worker-parallel prepared tile-major / feature-driven
+            // path instead. Without this the user gets no signal their knob was
+            // dropped.
+            notice!(
+                "geometry_pyramid: featureMajorPoints=true is single-backend; under parallel={} using the worker-parallel prepared tile-major path instead",
+                src.cfg.parallel
             );
         }
         return Ok(false);
@@ -355,29 +392,15 @@ fn build_zoom_level_with_budget(
         // visible to subsequent worker txns only after coordinator commit). For
         // the default tile_size_budget_bytes=0 there are no retries, so this is
         // a non-issue in the common path.
-        if let Some(prepared) = prepared {
-            if feature_major_points {
-                build_zoom_level_prepared_points_feature_major(
-                    src,
-                    storage_table,
-                    rect,
-                    &knobs,
-                    prepared,
-                )?;
-            } else if feature_driven {
-                build_zoom_level_prepared_feature_driven(
-                    src,
-                    storage_table,
-                    rect,
-                    &knobs,
-                    prepared,
-                )?;
-            } else {
-                build_zoom_level_prepared(src, storage_table, rect, &knobs, prepared)?;
-            }
-        } else {
-            run_zoom_strips(src, storage_table, rect, &knobs)?;
-        }
+        run_zoom_strips(
+            src,
+            storage_table,
+            rect,
+            &knobs,
+            prepared,
+            feature_major_points,
+            feature_driven,
+        )?;
 
         let (tiles, total_bytes, max_tile_bytes) = zoom_stats(storage_table, z)?;
         notice!(
@@ -504,32 +527,106 @@ fn source_bbox(
     Ok(bbox_from_query(&inner, &[tile_srs.into()])?.map(|a| (a[0], a[1], a[2], a[3])))
 }
 
-/// Execute one zoom round, splitting the rectangle into x-strips and farming
-/// them to background workers when cfg.parallel > 1. Slot 0 always runs inline
-/// in the coordinator; a failed spawn degrades that slot to inline execution.
-/// Returns the total tile count for the zoom (recounted from the table so it
-/// includes rows committed by workers).
+/// Run the chosen build path (baseline, prepared tile-major, feature-major
+/// points, or feature-driven) for one tile rect. The single dispatch point
+/// shared by the coordinator's inline path and the background workers, so a
+/// worker strip is built byte-for-byte the way the coordinator would build it.
+pub(crate) fn build_zoom_level_dispatch(
+    src: PyramidSource,
+    storage_table: &str,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+    prepared: Option<&crate::prepared::PreparedBuildSource>,
+    feature_major_points: bool,
+    feature_driven: bool,
+) -> Result<i64, spi::Error> {
+    match prepared {
+        Some(prepared) if feature_major_points => build_zoom_level_prepared_points_feature_major(
+            src,
+            storage_table,
+            rect,
+            knobs,
+            prepared,
+        ),
+        Some(prepared) if feature_driven => {
+            build_zoom_level_prepared_feature_driven(src, storage_table, rect, knobs, prepared)
+        }
+        Some(prepared) => build_zoom_level_prepared(src, storage_table, rect, knobs, prepared),
+        None => build_zoom_level(src, storage_table, rect, knobs),
+    }
+}
+
+/// Below this many tile cells a zoom is too cheap to be worth worker spawn +
+/// IPC; the coordinator builds it inline. Morton gridding targets the expensive
+/// high-zoom levels where `R(z)` is large (the same regime feature-driven
+/// engages), so the cheap shallow levels fall through to the coordinator.
+const PARALLEL_MIN_CELLS: i64 = 64;
+
+/// Divisions per axis for the Morton block grid: ~4 blocks per worker slot so
+/// the interleaved block→worker assignment has enough granularity to balance a
+/// clustered extent. `grid²` blocks total.
+fn morton_grid(slots: usize) -> u32 {
+    let target = (4 * slots) as f64;
+    target.sqrt().ceil() as u32
+}
+
+/// Execute one zoom round, partitioning the rectangle into Morton (Z-order)
+/// blocks and farming them to background workers when cfg.parallel > 1. Slot 0
+/// always runs inline in the coordinator; a failed spawn degrades that slot to
+/// inline execution. Each block is built via [`build_zoom_level_dispatch`], so
+/// workers run the same fast prepared/feature-driven path the coordinator would
+/// — clamped to their block's tile coordinates, which makes every (z,x,y) owned
+/// by exactly one block (no overlap, no gap). Blocks are assigned to workers
+/// **interleaved** in Morton order (block i → slot i mod slots) so a contiguous
+/// dense core spreads across workers rather than landing on one. Returns the
+/// total tile count for the zoom (recounted from the table so it includes rows
+/// committed by workers).
 fn run_zoom_strips(
     src: PyramidSource,
     storage_table: &str,
     rect: &TileRect,
     knobs: &ZoomKnobs,
+    prepared: Option<&crate::prepared::PreparedBuildSource>,
+    feature_major_points: bool,
+    feature_driven: bool,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let workers = src.cfg.parallel.max(1) - 1;
-    if workers == 0 {
-        build_zoom_level(src, storage_table, rect, knobs)?;
+    if workers == 0 || rect.cell_count() <= PARALLEL_MIN_CELLS {
+        build_zoom_level_dispatch(
+            src,
+            storage_table,
+            rect,
+            knobs,
+            prepared,
+            feature_major_points,
+            feature_driven,
+        )?;
         return Ok(inserted_count(storage_table, rect.z)?);
     }
 
-    let strips = rect.split_x(4 * (workers + 1));
-    let slots = (workers as usize + 1).min(strips.len());
+    let slots = workers as usize + 1;
+    // Baseline tile-major keeps its proven x-strip partition (it re-scans the
+    // source per tile via LATERAL, so 2-D blocking buys it little). The prepared
+    // and feature-driven fast paths scan the prepared table, so they use Morton
+    // blocks: a cluster confined to a sub-region then balances across workers.
+    let blocks = if prepared.is_some() {
+        rect.split_morton(morton_grid(slots))
+    } else {
+        rect.split_x(4 * slots as u32)
+    };
+    let slots = slots.min(blocks.len());
+    // Workers read the committed prepared table by name; the index-free
+    // feature-major-points path never reaches here (it stays parallel=1).
+    let prepared_table = prepared.map(|p| p.table.clone());
 
     let mut spec_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut handles: Vec<pgrx::bgworkers::DynamicBackgroundWorker> = Vec::new();
     let mut inline_strips: Vec<TileRect> = Vec::new();
 
     for slot in 0..slots {
-        let chunk: Vec<TileRect> = strips.iter().copied().skip(slot).step_by(slots).collect();
+        // Interleave in Morton order: slot s takes blocks s, s+slots, … so the
+        // contiguous Morton run covering a dense core is split across slots.
+        let chunk: Vec<TileRect> = blocks.iter().copied().skip(slot).step_by(slots).collect();
         if slot == 0 {
             inline_strips = chunk;
             continue;
@@ -552,6 +649,8 @@ fn run_zoom_strips(
                 config: src.cfg.clone(),
                 knobs: knobs.to_values(),
                 strips: chunk.clone(),
+                prepared_table: prepared_table.clone(),
+                feature_driven,
             },
         };
         let path = crate::worker::write_spec(&filename, &spec)?;
@@ -574,7 +673,15 @@ fn run_zoom_strips(
 
     // Coordinator builds its own share while workers run.
     for strip in &inline_strips {
-        build_zoom_level(src, storage_table, strip, knobs)?;
+        build_zoom_level_dispatch(
+            src,
+            storage_table,
+            strip,
+            knobs,
+            prepared,
+            feature_major_points,
+            feature_driven,
+        )?;
     }
 
     let wait_result = crate::worker::wait_for(&spec_paths, src.cfg.build_timeout_ms);
@@ -827,6 +934,21 @@ pub(crate) fn feature_driven_pipeline_sql(
                        * (40075016.685578488 / power(2.0, $1::float8)) AS mm
              ) k
              WHERE prep_src.geom_tile IS NOT NULL
+               -- Strip read-filter: skip features whose envelope cannot reach
+               -- any tile in the build rect [$4..$5]x[$6..$7], so a parallel
+               -- worker GiST-scans only its block instead of every feature. The
+               -- envelope is the rect's tile span in metres, padded by the
+               -- margin mm plus 2 tiles -- strictly wider than the explode's
+               -- mm +/- 1 tile, so it is a provable superset of what the
+               -- explode+clamp keeps (cannot drop a tile; the exact membership
+               -- test still runs below). On the serial full-rect build it spans
+               -- the whole bbox and excludes nothing.
+               AND prep_src.geom_tile && ST_MakeEnvelope(
+                     $4::float8 * k.tw - 20037508.342789244 - k.mm - 2 * k.tw,
+                     20037508.342789244 - ($7::float8 + 1) * k.tw - k.mm - 2 * k.tw,
+                     ($5::float8 + 1) * k.tw - 20037508.342789244 + k.mm + 2 * k.tw,
+                     20037508.342789244 - $6::float8 * k.tw + k.mm + 2 * k.tw,
+                     $8)
                AND ($14::float8 >= 1.0
                     OR prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
                     OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
@@ -1183,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_build_enabled_only_for_single_backend() {
+    fn prepared_build_enabled_whenever_requested() {
         let off = PyramidConfig::default();
         assert!(!uses_prepared_build(&off));
 
@@ -1194,12 +1316,51 @@ mod tests {
         };
         assert!(uses_prepared_build(&single));
 
+        // PR4: prepared build is now parallel-agnostic — under parallel>1 the
+        // table is committed and worker-visible so workers run the fast path.
         let parallel = PyramidConfig {
             prepared_build: true,
             parallel: 2,
             ..Default::default()
         };
-        assert!(!uses_prepared_build(&parallel));
+        assert!(uses_prepared_build(&parallel));
+    }
+
+    #[test]
+    fn feature_major_points_stays_single_backend() {
+        // Feature-major points must NOT engage under parallel>1 (each worker
+        // would re-scan the whole point set). It falls back to the strip-bounded
+        // prepared/feature-driven path instead.
+        let single = PyramidConfig {
+            prepared_build: true,
+            feature_major_points: true,
+            parallel: 1,
+            tile_srs: 3857,
+            ..Default::default()
+        };
+        assert!(config_allows_feature_major_points(&single));
+
+        let parallel = PyramidConfig {
+            parallel: 2,
+            ..single.clone()
+        };
+        assert!(!config_allows_feature_major_points(&parallel));
+        // ...but prepared build itself stays on under parallel.
+        assert!(uses_prepared_build(&parallel));
+    }
+
+    #[test]
+    fn feature_driven_allowed_under_parallel() {
+        // Feature-driven IS strip-bounded (its candidate-tile explode clamps to
+        // the build rect), so it's allowed to run in parallel workers.
+        let parallel = PyramidConfig {
+            prepared_build: true,
+            feature_driven_enum: true,
+            parallel: 2,
+            tile_srs: 3857,
+            ..Default::default()
+        };
+        assert!(config_allows_feature_driven(&parallel));
     }
 
     #[test]
@@ -1314,6 +1475,9 @@ mod tests {
         // Derives a candidate tile range per feature from its envelope...
         assert!(sql.contains("ST_XMin(prep_src.geom_tile)"));
         assert!(sql.contains("ST_YMax(prep_src.geom_tile)"));
+        // ...prefilters the scan to the build rect via a GiST && so a parallel
+        // worker reads only its block (a provable superset of the explode)...
+        assert!(sql.contains("prep_src.geom_tile && ST_MakeEnvelope("));
         // ...then explodes + clamps to the build rect ($4..$7), never the full
         // unconditional lattice the tile-major path enumerates.
         assert!(sql.contains("generate_series(GREATEST(kept.tx0, $4::int)"));
