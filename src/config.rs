@@ -63,6 +63,18 @@ pub struct CatalogRow {
     pub storage_exists: bool,
 }
 
+/// One level-of-detail rule: within `[minZoom, maxZoom]`, only src features
+/// satisfying `filter` (a raw SQL boolean expr over src columns)
+/// participate in tiles. See docs/superpowers/specs/2026-06-29-build-rules-design.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRule {
+    #[serde(rename = "minZoom")]
+    pub min_zoom: u8,
+    #[serde(rename = "maxZoom")]
+    pub max_zoom: u8,
+    pub filter: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     /// Optional pyramid name. Defaults to the source table name.
@@ -211,6 +223,10 @@ pub struct PyramidConfig {
         rename = "dynamicBeyondMaxZoom"
     )]
     pub dynamic_beyond_max_zoom: bool,
+
+    /// Per-level feature filters (level-of-detail). Empty = no filtering (default).
+    #[serde(default, rename = "buildRules")]
+    pub build_rules: Vec<BuildRule>,
 }
 
 impl PyramidConfig {
@@ -275,6 +291,7 @@ impl Default for PyramidConfig {
             split_size: 0,
             build_timeout_ms: 0,
             dynamic_beyond_max_zoom: true,
+            build_rules: Vec::new(),
         }
     }
 }
@@ -325,6 +342,23 @@ impl PyramidConfig {
                 "tileExtend ({}) must be < tileSize ({})",
                 self.tile_extend, self.tile_size
             ));
+        }
+        for (k, rule) in self.build_rules.iter().enumerate() {
+            if rule.min_zoom > rule.max_zoom {
+                return Err(format!(
+                    "buildRules[{k}]: minZoom ({}) must be <= maxZoom ({})",
+                    rule.min_zoom, rule.max_zoom
+                ));
+            }
+            let filter = rule.filter.trim();
+            if filter.is_empty() {
+                return Err(format!("buildRules[{k}]: filter must not be empty"));
+            }
+            if filter.contains(';') {
+                return Err(format!(
+                    "buildRules[{k}]: filter must be a single expr (no ';')"
+                ));
+            }
         }
         Ok(())
     }
@@ -545,5 +579,46 @@ mod tests {
         assert!(!PyramidConfig::default().prepared_build);
         let cfg = PyramidConfig::parse(r#"{"preparedBuild":true}"#).unwrap();
         assert!(cfg.prepared_build);
+    }
+
+    #[test]
+    fn build_rules_default_empty_and_parses() {
+        assert!(PyramidConfig::default().build_rules.is_empty());
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.build_rules.len(), 1);
+        assert_eq!(c.build_rules[0].min_zoom, 0);
+        assert_eq!(c.build_rules[0].max_zoom, 4);
+        assert_eq!(c.build_rules[0].filter, "scalerank < 5");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn build_rules_reject_inverted_zoom() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":5,"maxZoom":2,"filter":"true"}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn build_rules_reject_empty_filter() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"   "}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn build_rules_reject_semicolon() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"true; DROP TABLE x"}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
     }
 }
