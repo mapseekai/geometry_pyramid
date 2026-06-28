@@ -664,9 +664,9 @@ Add to the `tests` module in `src/lib.rs`:
         // Every materialized tile must be byte-identical between the two.
         let mismatches = Spi::get_one::<i64>(
             "SELECT count(*)::bigint FROM \
-               (SELECT z,x,y,mvt FROM geometry_pyramid_bre_none) a \
+               (SELECT z,x,y,mvt FROM _gp_tiles_bre_none) a \
              FULL JOIN \
-               (SELECT z,x,y,mvt FROM geometry_pyramid_bre_true) b \
+               (SELECT z,x,y,mvt FROM _gp_tiles_bre_true) b \
              USING (z,x,y) \
              WHERE a.mvt IS DISTINCT FROM b.mvt",
         )
@@ -700,8 +700,8 @@ Add to the `tests` module in `src/lib.rs`:
                 .unwrap();
         }
         let mismatches = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM geometry_pyramid_brp_ser a \
-             FULL JOIN geometry_pyramid_brp_par b USING (z,x,y) \
+            "SELECT count(*)::bigint FROM _gp_tiles_brp_ser a \
+             FULL JOIN _gp_tiles_brp_par b USING (z,x,y) \
              WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
         )
         .unwrap()
@@ -773,7 +773,7 @@ Add to the `tests` module in `src/lib.rs`:
         )
         .unwrap();
         let exists = Spi::get_one::<bool>(
-            "SELECT to_regclass('geometry_pyramid_bri') IS NOT NULL",
+            "SELECT to_regclass('_gp_tiles_bri') IS NOT NULL",
         )
         .unwrap()
         .unwrap();
@@ -788,12 +788,9 @@ Add to the `tests` module in `src/lib.rs`:
 Run: `cargo pgrx test pg17 2>&1 | grep -E "build_rules_(filter|true|parallel|multiple|invalid)|test result"`
 Expected: all five PASS (Tasks 1–5 implement the behavior). If `build_rules_filter_covered_zoom_only` fails on a tile coordinate, re-derive the (z,x,y) for the test longitudes with `SELECT ST_TileEnvelope(...)` and adjust — the assertion logic (covered filtered, uncovered present) stays the same.
 
-- [ ] **Step 3: Confirm the storage table name**
+- [ ] **Step 3: (verified) storage table name is `_gp_tiles_<name>`**
 
-The equivalence/parallel tests query `geometry_pyramid_<name>`. If the suite errors with `relation "geometry_pyramid_bre_none" does not exist`, find the real prefix:
-
-Run: `grep -n "fn tile_table_name" src/storage.rs`
-Then read that function and adjust the table names in the two FULL JOIN queries accordingly.
+The equivalence/parallel tests query the tile-storage tables `_gp_tiles_bre_none`, `_gp_tiles_bre_true`, `_gp_tiles_brp_ser`, `_gp_tiles_brp_par`, and `to_regclass('_gp_tiles_bri')` — already correct in the test code above (`storage::tile_table_name` = `format!("_gp_tiles_{name}")`, `src/storage.rs:8-12`). Note `geometry_pyramid_stats` (used by other tests) is a separate stats relation, not tile storage. No change needed; proceed.
 
 - [ ] **Step 4: Run the full suite**
 
