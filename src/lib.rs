@@ -858,6 +858,237 @@ mod tests {
         // "DROP TABLE IF EXISTS" to reclaim (test database torn down after run).
     }
 
+    /// PR4 robustness: a parallel build must (a) **self-heal** over a leftover
+    /// committed prepared table from a crashed prior run — the per-pyramid name is
+    /// deterministic and recreated via `DROP IF EXISTS` — and (b) **drop** that
+    /// prepared table when it finishes. (b) is the contract whose violation (an
+    /// autonomous `DROP` instead of an in-coordinator-transaction one) caused the
+    /// undetectable ACCESS SHARE vs ACCESS EXCLUSIVE deadlock that burned the full
+    /// worker timeout on every parallel build.
+    #[pg_test]
+    fn parallel_build_self_heals_and_drops_prepared_table() {
+        use crate::worker::exec_sql_autonomous;
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        // Committed source the workers can see; world-corner outliers widen the
+        // bbox so deep zooms farm rather than run inline.
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_heal; \
+             CREATE TABLE _gp_heal (gid serial PRIMARY KEY, geom geometry(Point,4326)); \
+             INSERT INTO _gp_heal (geom) \
+                 SELECT ST_SetSRID(ST_MakePoint(110.0 + i*0.5, 35.0 + i*0.3), 4326) \
+                 FROM generate_series(1, 16) AS i; \
+             INSERT INTO _gp_heal (geom) VALUES \
+                 (ST_SetSRID(ST_MakePoint(-170,-75),4326)), \
+                 (ST_SetSRID(ST_MakePoint(170,78),4326))",
+        )
+        .unwrap();
+
+        // Simulate a leaked prepared table from a crashed run: deterministic name
+        // `_gp_prep_heal` with a deliberately WRONG schema, so a stale read (rather
+        // than a clean recreate) would fail loudly. The build must DROP+recreate it.
+        exec_sql_autonomous(
+            r#"DROP TABLE IF EXISTS "_gp_prep_heal"; CREATE TABLE "_gp_prep_heal" (bogus int)"#,
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_heal','geom','gid', \
+             '{\"name\":\"heal\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":2,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            Some(true),
+            "parallel build must self-heal over a leftover prepared table, not error on it"
+        );
+
+        let tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_heal")
+            .unwrap()
+            .unwrap();
+        assert!(tiles > 0, "self-healed build must still produce tiles");
+
+        // The committed prepared table must be gone once the build finishes —
+        // dropped in the coordinator transaction, visible as gone within it.
+        let dropped = Spi::get_one::<bool>("SELECT to_regclass('_gp_prep_heal') IS NULL").unwrap();
+        assert_eq!(
+            dropped,
+            Some(true),
+            "parallel build must drop its committed prepared table on success"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('heal')").unwrap();
+    }
+
+    /// PR4 robustness: a high parallelism degree (more workers than Morton blocks
+    /// fit on this small extent) must not corrupt or drop tiles — tile coverage
+    /// and encoded sizes match serial. Exercises `split_morton`'s degrade path (grid
+    /// exceeds extent) end to end; the surplus workers simply build empty blocks.
+    #[pg_test]
+    fn parallel_eight_matches_serial() {
+        use crate::worker::exec_sql_autonomous;
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_p8; \
+             CREATE TABLE _gp_p8 (gid serial PRIMARY KEY, kind text, geom geometry(Geometry,4326)); \
+             INSERT INTO _gp_p8 (kind, geom) \
+                 SELECT 'point', ST_SetSRID(ST_MakePoint(110.0 + i*0.7, 35.0 + i*0.4), 4326) \
+                 FROM generate_series(1, 14) AS i; \
+             INSERT INTO _gp_p8 (kind, geom) \
+                 SELECT 'poly', ST_SetSRID(ST_MakeEnvelope( \
+                     109.0 + i*0.8, 34.0 + i*0.5, 109.0 + i*0.8 + 1.7, 34.0 + i*0.5 + 1.1, 4326), 4326) \
+                 FROM generate_series(1, 8) AS i; \
+             INSERT INTO _gp_p8 (kind, geom) VALUES \
+                 ('outlier', ST_SetSRID(ST_MakePoint(-170,-75),4326)), \
+                 ('outlier', ST_SetSRID(ST_MakePoint(170,78),4326))",
+        )
+        .unwrap();
+
+        let ser = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_p8','geom','gid', \
+             '{\"name\":\"p8_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ser, Some(true));
+
+        let par = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_p8','geom','gid', \
+             '{\"name\":\"p8_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":8,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(par, Some(true));
+
+        let ser_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_p8_ser")
+            .unwrap()
+            .unwrap();
+        assert!(ser_tiles > 0, "serial build produced no tiles");
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_p8_ser a \
+             FULL JOIN _gp_tiles_p8_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "parallel=8 must match serial in coverage and per-tile encoded size"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('p8_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('p8_par')").unwrap();
+    }
+
+    /// PR4 robustness: `splitSize` (defer sub-threshold tiles) composes with
+    /// parallel. The deferral is a `feature_count >= splitSize` filter applied per
+    /// tile; tile-exact Morton ownership means each tile's `feature_count` is the
+    /// same whether tallied in a worker or the coordinator, so a parallel splitSize
+    /// build must match a serial one exactly — *including which tiles are deferred*.
+    /// A block boundary that mis-attributed a feature would shift a count across the
+    /// threshold and materialize/defer a tile on only one side.
+    #[pg_test]
+    fn parallel_with_split_size_matches_serial() {
+        use crate::worker::exec_sql_autonomous;
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+
+        // A tight cluster (multi-feature tiles survive splitSize) plus isolated
+        // points and outliers (single-feature tiles get deferred).
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_spl; \
+             CREATE TABLE _gp_spl (gid serial PRIMARY KEY, geom geometry(Point,4326)); \
+             INSERT INTO _gp_spl (geom) \
+                 SELECT ST_SetSRID(ST_MakePoint(110.0 + (i%4)*0.01, 35.0 + (i/4)*0.01), 4326) \
+                 FROM generate_series(1, 24) AS i; \
+             INSERT INTO _gp_spl (geom) \
+                 SELECT ST_SetSRID(ST_MakePoint(120.0 + i*2.0, 40.0 + i*1.5), 4326) \
+                 FROM generate_series(1, 6) AS i; \
+             INSERT INTO _gp_spl (geom) VALUES \
+                 (ST_SetSRID(ST_MakePoint(-170,-75),4326)), \
+                 (ST_SetSRID(ST_MakePoint(170,78),4326))",
+        )
+        .unwrap();
+
+        let ser = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_spl','geom','gid', \
+             '{\"name\":\"spl_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":2, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true}')",
+        )
+        .unwrap();
+        assert_eq!(ser, Some(true));
+
+        let par = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_spl','geom','gid', \
+             '{\"name\":\"spl_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":2, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":2,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(par, Some(true));
+
+        let ser_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_spl_ser")
+            .unwrap()
+            .unwrap();
+        assert!(
+            ser_tiles > 0,
+            "splitSize=2 must still materialize the multi-feature cluster tiles"
+        );
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM _gp_tiles_spl_ser a \
+             FULL JOIN _gp_tiles_spl_par b USING (z, x, y) \
+             WHERE octet_length(a.mvt) IS DISTINCT FROM octet_length(b.mvt)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "parallel splitSize build must defer/materialize exactly the same tiles as serial"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('spl_ser')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('spl_par')").unwrap();
+    }
+
+    /// PR4 robustness: a parallel build over a source whose geometries are all NULL
+    /// has no extent (`source_bbox` → None), so it must take the early empty-pyramid
+    /// path and finish cleanly with zero tiles — not panic, hang, or spin up workers
+    /// against an empty prepared table.
+    #[pg_test]
+    fn parallel_build_handles_all_null_geometry() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_null (gid serial PRIMARY KEY, geom geometry(Point,4326)); \
+             INSERT INTO _gp_null (geom) SELECT NULL FROM generate_series(1, 8)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_null','geom','gid', \
+             '{\"name\":\"nullp\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"parallel\":2,\"buildTimeoutMs\":60000}')",
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            Some(true),
+            "all-NULL source must build a (empty) pyramid cleanly"
+        );
+
+        let tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_nullp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tiles, 0, "all-NULL source must yield an empty pyramid");
+
+        Spi::run("SELECT ST_DropPyramid('nullp')").unwrap();
+    }
+
     /// Incremental update must touch only the dirty tiles, no-op on an empty
     /// match, and reject a broken where_clause without damaging the pyramid.
     #[pg_test]
