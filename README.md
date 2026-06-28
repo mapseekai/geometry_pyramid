@@ -21,10 +21,10 @@ rebuilt; omitting the clause triggers a full rebuild. `ST_Tile` is now
 requests beyond `maxZoom` are sliced on-demand from the source table (when
 `dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
 semantics; unknown pyramids return NULL (so do `ST_Pyramid` / `ST_UpdatePyramid`
-on an unknown name — cleanly, never an error). Sparse tiles (feature count <
-`splitSize`, default 10000) are likewise not materialized at build time and are
-sliced on-demand by `ST_Tile`; combined with the `maxZoom` level boundary,
-materialization covers only the dense low/mid-zoom tiles. PNG rendering,
+on an unknown name — cleanly, never an error). By default (`splitSize` 0) every
+non-empty tile within `maxZoom` is materialized; raising `splitSize` defers
+sparse tiles (feature count below it) to on-demand slicing by `ST_Tile` instead
+of materializing them. PNG rendering,
 coalesce-densest, and Ganos `buildRules` (per-level rules) remain on the roadmap.
 
 ## SQL surface
@@ -66,7 +66,7 @@ keys mirror Ganos:
 | `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 | `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
-| `splitSize` | `10000` | Tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source. 0 materializes every non-empty tile. |
+| `splitSize` | `0` | `0` (default) materializes every non-empty tile. A value > 0 is a density boundary: tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source on every request. |
 
 ## Creating a pyramid
 
@@ -169,7 +169,7 @@ mvt bytea` and `PRIMARY KEY (z, x, y)`. `format` is currently always `'pbf'`;
 `srid` is the tile coordinate system (`tileSRS`). Consumers may read this table
 directly; `ST_Tile` returns only the `mvt` column.
 
-> **Note on `splitSize`:** with `splitSize` > 0 (the default is 10000), any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on every request. For a busy tile server over a large source, set `splitSize` to 0 (materialize everything) or tune it to your density so the live-scan fallback stays bounded.
+> **Note on `splitSize`:** the default `0` materializes every non-empty tile within `maxZoom`, so reads are pure storage lookups. If you set `splitSize` > 0, any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on *every* request. That trades a faster, smaller build for slower repeated reads, so size it to your density and read load (and keep a spatial index on the source) before raising it above 0.
 
 ## Project layout
 

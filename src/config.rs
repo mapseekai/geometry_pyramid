@@ -192,9 +192,10 @@ pub struct PyramidConfig {
     )]
     pub max_tile_size_attempts: u32,
 
-    /// Tiles whose feature count is below splitSize are NOT materialized at
-    /// build time; ST_Tile slices them on-demand from the source (density
-    /// boundary, mirrors Ganos). 0 disables (materialize every non-empty tile).
+    /// Density boundary. The default 0 materializes every non-empty tile.
+    /// With splitSize > 0, tiles whose feature count is below it are NOT
+    /// materialized at build time; ST_Tile slices them on-demand from the
+    /// source on every request (mirrors Ganos's density-based dynamic build).
     #[serde(default = "default_split_size", rename = "splitSize")]
     pub split_size: u32,
 
@@ -271,7 +272,7 @@ impl Default for PyramidConfig {
             drop_rate: DEFAULT_DROP_RATE,
             tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
             max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
-            split_size: 10000,
+            split_size: 0,
             build_timeout_ms: 0,
             dynamic_beyond_max_zoom: true,
         }
@@ -403,7 +404,7 @@ fn default_dynamic_beyond_max_zoom() -> bool {
     true
 }
 fn default_split_size() -> u32 {
-    10000
+    0
 }
 
 #[cfg(test)]
@@ -531,10 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn split_size_defaults_10000_and_parses() {
-        assert_eq!(PyramidConfig::default().split_size, 10000);
-        let c = PyramidConfig::parse(r#"{"splitSize":0}"#).unwrap();
-        assert_eq!(c.split_size, 0);
+    fn split_size_defaults_zero_and_parses() {
+        assert_eq!(PyramidConfig::default().split_size, 0);
+        let c = PyramidConfig::parse(r#"{"splitSize":10000}"#).unwrap();
+        assert_eq!(c.split_size, 10000);
         let c2 = PyramidConfig::parse(r#"{"splitSize":250}"#).unwrap();
         assert_eq!(c2.split_size, 250);
     }
