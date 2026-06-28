@@ -183,34 +183,45 @@ margin + 2 tiles — a provable superset of the explode, so it can't drop a tile
 turning the per-worker scan into a GiST index-scan of its block. `EXPLAIN ANALYZE`
 confirms: an empty block reads 0 rows via the index instead of seq-scanning all.
 
-**Measured** (200k points over a country bbox, `parallel=4` = coordinator + 3
-workers, 8-core Apple aarch64, `featureDrivenEnum`, release build, one warm
-session):
+**Measured on real data** — Natural Earth 10m, loaded via `ogr2ogr` (GDAL 3.12),
+8-core Apple aarch64, release build, `featureDrivenEnum`, byte-identical to serial
+(FULL JOIN on `(z,x,y)` by encoded size, 0 mismatches):
 
-| dataset shape | serial | parallel=4 | speedup |
-|---------------|--------|-----------|---------|
-| distributed, `maxZoom=13` | 6.59 s | **3.95 s** | **1.67×** |
-| distributed, `maxZoom=16` | 9.56 s | **5.18 s** | **1.85×** |
-| concentrated core + far outliers, `maxZoom=13` | 7.35 s | 6.27 s | 1.17× |
+| dataset | serial | parallel=4 | parallel=8 |
+|---------|--------|-----------|-----------|
+| roads — 56.6k lines, `maxZoom=10` | 28.8 s | **13.3 s (2.17×)** | **10.5 s (2.73×)** |
+| urban areas — 11.9k polygons, `maxZoom=11` | 96.8 s | **41.5 s (2.33×)** | — |
 
-All builds are **byte-identical** to serial (FULL JOIN on `(z,x,y)` by encoded
-size, 0 mismatches at every depth). Per-zoom the expensive deep levels (z6–z15)
-hit **2.1–4.3×** with 4 workers — the parallelism is efficient *where it engages*.
+Per-zoom the deep levels dominate real builds and parallelize well: at
+`parallel=8`, roads z9 hits **4.5×** and z10 **4.6×**. The speedup **rises** with
+both depth (deeper pyramids put proportionally more work in the parallel deep
+levels) and worker count. The shallow inline floor (z0–z3) is only ~14% of a real
+line build / ~7% of a polygon build — it grows to ~40% at `parallel=8` and becomes
+the ceiling there, but on real geometry it is far smaller than synthetic point
+data suggests. **Recommendation: set `parallel` ≈ core count for deep builds** —
+it is the highest-ROI lever and needs no code.
 
-But the **overall** speedup is capped well below linear (~1.7–1.85×) and climbs
-only *slowly* with depth — it is **not** near-linear. The per-zoom curve shows
-why, and it is honest to state it plainly:
+Two levers that *looked* promising were **killed by real-data profiling**, and
+the reasoning is worth recording so they are not re-attempted:
 
-- **A fixed serial floor dominates.** The shallow zooms z0–z5 run inline on the
-  coordinator (each rect is below `PARALLEL_MIN_CELLS=64`, so farming them costs
-  more than it saves — measured 0.78–0.95×, i.e. *slower* in parallel). Together
-  with the one-shot transform/index prefix (the committed prepared table is built
-  single-threaded before any worker starts), that floor is a constant ~1.4 s that
-  does not parallelize. Going `maxZoom` 13→16 only shifts the ratio 1.67→1.85×
-  because the deep parallel levels grow while the floor stays fixed (Amdahl). To
-  push past ~1.85× you must attack the floor itself — parallelize the transform
-  prefix, or cut the ~230 ms/zoom fixed cost of the shallow inline levels — which
-  is separate work from this partition scheme.
+- **Sub-pixel culling is dead.** `ST_AsMVT` charges per row, so dropping
+  features that render to less than a pixel at low zoom seems like a free win. On
+  real clustered urban polygons **52.6%** are sub-pixel at z0 — but only **0.3%**
+  by z2 and **0%** by z4, and z0–z1 are <2% of total build time. There is nothing
+  meaningful to cull. (An earlier synthetic point benchmark with 200× exact
+  duplicates per location made this lever *look* large; that was an artifact —
+  `ST_AsMVT` encoding 200 coincident copies, not real cullable volume.)
+- **The "serial floor" is small on real data.** The one-shot transform/index
+  prefix decomposes (200k rows) into CTAS `ST_Transform` 293 ms + GiST build
+  168 ms (PostgreSQL has no parallel GiST build) + ANALYZE 41 ms. Parallelizing
+  only the CTAS is a ~3–4% win — not worth the complexity given the floor is
+  ~7–14% of a real build.
+
+The remaining genuine lever beyond worker-scaling is parallelizing feature
+aggregation *within* a shallow tile (partition features → partial encode → merge
+MVT), which is complex with diminishing returns. **Net: this partition scheme
+already captures most of the available parallelism on real data.**
+
 - **A concentrated core can't be tile-partitioned.** When a dense cluster fits in
   one Morton block (sparse data over a huge bbox), one worker carries it — no
   uniform grid resolution can split it without exploding the block count over the
