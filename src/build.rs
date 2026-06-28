@@ -725,6 +725,43 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
     attribute_projections_for(cfg, "src", "prep")
 }
 
+/// LOD rule predicate columns for the prepared-table CTAS: one boolean column
+/// `_gp_rule_k` per rule, evaluated once from the src row. Empty when there
+/// are no rules. Mirrors the inner fragment shape of `attribute_projections_for`.
+pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
+    let mut s = String::new();
+    for (k, rule) in cfg.build_rules.iter().enumerate() {
+        s.push_str(&format!(r#", ({}) AS _gp_rule_{k}"#, rule.filter));
+    }
+    s
+}
+
+/// Which side a per-zoom rule clause targets: the prepared table (precomputed
+/// `_gp_rule_k` booleans) or the raw src table (the inline filter expr).
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub(crate) enum RuleTarget {
+    Prepared,
+    src,
+}
+
+/// The ` AND …` clause restricting zoom `z` to features passing every rule whose
+/// band covers `z`. Empty when no rule covers `z`. `Prepared` references the
+/// precomputed `prep_src._gp_rule_k`; `src` inlines the raw filter (unqualified
+/// columns resolve against the single src table in scope).
+pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarget) -> String {
+    let mut s = String::new();
+    for (k, rule) in cfg.build_rules.iter().enumerate() {
+        if z >= rule.min_zoom && z <= rule.max_zoom {
+            match target {
+                RuleTarget::Prepared => s.push_str(&format!(" AND prep_src._gp_rule_{k}")),
+                RuleTarget::src => s.push_str(&format!(" AND ({})", rule.filter)),
+            }
+        }
+    }
+    s
+}
+
 /// The shared `FROM … features` block of the MVT pipeline: a 2-D tile grid
 /// (`generate_series`, params $4..$7) joined to the per-tile feature pipeline
 /// (projection, per-zoom simplification, min-size + point-drop filters,
@@ -1486,5 +1523,52 @@ mod tests {
         assert!(sql.contains("ST_AsMVTGeom(kept.gtile, ST_TileEnvelope($1, gx, gy)"));
         assert!(sql.contains("WHERE f.geom IS NOT NULL"));
         assert!(sql.contains("GROUP BY f.x, f.y"));
+    }
+
+    #[test]
+    fn rule_projections_number_by_index() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"},
+                              {"minZoom":5,"maxZoom":8,"filter":"b > 1"}]}"#,
+        )
+        .unwrap();
+        let p = rule_projections_for(&cfg);
+        assert!(p.contains("(a < 5) AS _gp_rule_0"), "got: {p}");
+        assert!(p.contains("(b > 1) AS _gp_rule_1"), "got: {p}");
+    }
+
+    #[test]
+    fn rule_projections_empty_when_no_rules() {
+        assert_eq!(rule_projections_for(&PyramidConfig::default()), "");
+    }
+
+    #[test]
+    fn rules_clause_prepared_ands_covering_booleans() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"},
+                              {"minZoom":3,"maxZoom":8,"filter":"b > 1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rules_clause_for_zoom(&cfg, 3, RuleTarget::Prepared),
+            " AND prep_src._gp_rule_0 AND prep_src._gp_rule_1"
+        );
+        assert_eq!(
+            rules_clause_for_zoom(&cfg, 6, RuleTarget::Prepared),
+            " AND prep_src._gp_rule_1"
+        );
+        assert_eq!(rules_clause_for_zoom(&cfg, 10, RuleTarget::Prepared), "");
+    }
+
+    #[test]
+    fn rules_clause_source_inlines_filter() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rules_clause_for_zoom(&cfg, 2, RuleTarget::src),
+            " AND (a < 5)"
+        );
     }
 }
