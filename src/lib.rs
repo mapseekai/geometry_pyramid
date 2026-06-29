@@ -1701,7 +1701,7 @@ mod tests {
              FROM generate_series(1, 300)",
         )
         .unwrap();
-        for (name, cfg) in [
+        for (_name, cfg) in [
             ("bre_none", r#"{"name":"bre_none","minZoom":0,"maxZoom":4,"splitSize":0}"#),
             (
                 "bre_true",
@@ -1710,8 +1710,14 @@ mod tests {
         ] {
             let sql = format!("SELECT ST_BuildPyramid('_gp_bre','geom','gid','{cfg}')");
             Spi::get_one::<bool>(&sql).unwrap();
-            let _ = name;
         }
+        // Non-vacuous guard: both sides empty would make the FULL JOIN below pass
+        // with 0 mismatches. Require the no-rules build to have produced tiles, so
+        // the `true`-filter side is actually compared against real coverage.
+        let none_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_bre_none")
+            .unwrap()
+            .unwrap();
+        assert!(none_tiles > 0, "no-rules build produced no tiles to compare");
         // A no-op `true` filter must leave the feature set identical, so every
         // materialized tile matches in coverage and encoded size. Compare by
         // `octet_length` (the codebase's cross-build convention): an MVT feature
@@ -1882,12 +1888,20 @@ mod tests {
              EXCEPTION WHEN others THEN NULL; END $$",
         )
         .unwrap();
-        let exists = Spi::get_one::<bool>(
-            "SELECT to_regclass('_gp_tiles_bri') IS NOT NULL",
+        // Atomicity: ST_BuildPyramid inserts a catalog row *before* the build runs
+        // its filter probe, so that row is the one thing actually written before the
+        // failure. The caught exception must roll it back together with the
+        // (never-created) tile table — neither may survive.
+        let leftover = Spi::get_one::<bool>(
+            "SELECT to_regclass('_gp_tiles_bri') IS NOT NULL \
+                 OR EXISTS (SELECT 1 FROM geometry_pyramid_catalog WHERE pyramid_name = 'bri')",
         )
         .unwrap()
         .unwrap();
-        assert!(!exists, "invalid buildRules filter must leave no pyramid");
+        assert!(
+            !leftover,
+            "invalid buildRules filter must leave no pyramid (no tile table, no catalog row)"
+        );
         Spi::run("DROP TABLE _gp_bri").unwrap();
     }
 }
