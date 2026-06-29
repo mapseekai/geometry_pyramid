@@ -24,8 +24,9 @@ semantics; unknown pyramids return NULL (so do `ST_Pyramid` / `ST_UpdatePyramid`
 on an unknown name — cleanly, never an error). By default (`splitSize` 0) every
 non-empty tile within `maxZoom` is materialized; raising `splitSize` defers
 sparse tiles (feature count below it) to on-demand slicing by `ST_Tile` instead
-of materializing them. PNG rendering,
-coalesce-densest, and Ganos `buildRules` (per-level rules) remain on the roadmap.
+of materializing them. **Per-level feature filtering** (`buildRules`,
+level-of-detail) restricts coarse zooms to features matching a SQL predicate.
+PNG rendering and coalesce-densest remain on the roadmap.
 
 ## SQL surface
 
@@ -67,6 +68,7 @@ keys mirror Ganos:
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 | `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
 | `splitSize` | `0` | `0` (default) materializes every non-empty tile. A value > 0 is a density boundary: tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source on every request. |
+| `buildRules` | `[]` | Per-level feature filters (LOD). Each rule `{minZoom, maxZoom, filter}` restricts that zoom band to source features satisfying `filter` (a raw SQL boolean expression over source columns). Zooms not covered by any rule include all features; multiple rules covering a zoom are ANDed. Empty (default) = no filtering. |
 
 ## Creating a pyramid
 
@@ -170,6 +172,8 @@ mvt bytea` and `PRIMARY KEY (z, x, y)`. `format` is currently always `'pbf'`;
 directly; `ST_Tile` returns only the `mvt` column.
 
 > **Note on `splitSize`:** the default `0` materializes every non-empty tile within `maxZoom`, so reads are pure storage lookups. If you set `splitSize` > 0, any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on *every* request. That trades a faster, smaller build for slower repeated reads, so size it to your density and read load (and keep a spatial index on the source) before raising it above 0.
+
+> **Note on `buildRules`:** rules implement level-of-detail — e.g. `[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5"}]` keeps only major features at coarse zooms. `filter` is a raw SQL boolean expression evaluated with the privileges of the `ST_BuildPyramid` caller (trusted-admin input, like a view definition); it is checked against the source before any build work and must be a single expression (no `;`). This is a deliberate, documented exception to parameterized-query guidance — an arbitrary predicate cannot be parameterized.
 
 ## Project layout
 
@@ -291,8 +295,9 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
     server-side raster output, matching Ganos.
 11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
-12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics. Ganos `splitSize` density-based dynamic build and `buildRules` remain future work.~~ ✅
-13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅ (`buildRules` per-level rules remain future work).
+12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics.~~ ✅
+13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅
+14. ~~**buildRules** — per-level feature filtering (LOD): each `{minZoom, maxZoom, filter}` restricts a zoom band to source features matching a raw SQL predicate; zooms covered by no rule keep all features, and multiple rules covering a zoom are ANDed.~~ ✅
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 
