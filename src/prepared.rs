@@ -58,6 +58,7 @@ pub(crate) fn prepare_source_for_build(
         crate::worker::next_spec_idx(),
     );
     let (attrs_inner, _) = crate::build::attribute_projections_for(src.cfg, "src", "prep");
+    let rules_inner = crate::build::rule_projections_for(src.cfg);
 
     Spi::run_with_args(
         &create_table_sql(
@@ -66,6 +67,7 @@ pub(crate) fn prepare_source_for_build(
             src.geom_column,
             src.fid_column,
             &attrs_inner,
+            &rules_inner,
         ),
         &[src.cfg.tile_srs.into()],
     )?;
@@ -99,6 +101,7 @@ pub(crate) fn prepare_source_committed(
 ) -> Result<PreparedBuildSource, Box<dyn std::error::Error + Send + Sync>> {
     let table = prepared_table_name_for(src.name);
     let (attrs_inner, _) = crate::build::attribute_projections_for(src.cfg, "src", "prep");
+    let rules_inner = crate::build::rule_projections_for(src.cfg);
 
     // One autonomous script: tile_srs is inlined (a validated i32, injection-safe)
     // because the autonomous executor runs raw SQL without bind parameters.
@@ -110,6 +113,7 @@ pub(crate) fn prepare_source_committed(
             src.geom_column,
             src.fid_column,
             &attrs_inner,
+            &rules_inner,
             src.cfg.tile_srs,
         )
     );
@@ -174,6 +178,7 @@ fn create_table_committed_sql(
     geom_column: &str,
     fid_column: &str,
     attrs_inner: &str,
+    rules_inner: &str,
     tile_srs: i32,
 ) -> String {
     format!(
@@ -182,7 +187,7 @@ fn create_table_committed_sql(
               src."{fid_column}"::bigint AS fid,
               ST_Transform(src."{geom_column}", {tile_srs}) AS geom_tile,
               GeometryType(src."{geom_column}") AS geom_type
-              {attrs_inner}
+              {attrs_inner}{rules_inner}
            FROM "{source_table}" src
            WHERE src."{geom_column}" IS NOT NULL"#
     )
@@ -194,6 +199,7 @@ fn create_table_sql(
     geom_column: &str,
     fid_column: &str,
     attrs_inner: &str,
+    rules_inner: &str,
 ) -> String {
     format!(
         r#"CREATE TEMP TABLE "{prepared_table}" ON COMMIT DROP AS
@@ -201,7 +207,7 @@ fn create_table_sql(
               src."{fid_column}"::bigint AS fid,
               ST_Transform(src."{geom_column}", $1) AS geom_tile,
               GeometryType(src."{geom_column}") AS geom_type
-              {attrs_inner}
+              {attrs_inner}{rules_inner}
            FROM "{source_table}" src
            WHERE src."{geom_column}" IS NOT NULL"#
     )
@@ -229,6 +235,7 @@ mod tests {
             "geom",
             "gid",
             r#", src."kind" AS "kind""#,
+            "",
         );
 
         assert!(sql.contains(r#"CREATE TEMP TABLE "_gp_prep_7" ON COMMIT DROP AS"#));
@@ -256,6 +263,7 @@ mod tests {
             "geom",
             "gid",
             r#", src."kind" AS "kind""#,
+            "",
             3857,
         );
         // Persistent: no TEMP / ON COMMIT DROP so workers can see it.
@@ -265,6 +273,19 @@ mod tests {
         // tile_srs inlined (autonomous executor takes no bind params).
         assert!(sql.contains(r#"ST_Transform(src."geom", 3857) AS geom_tile"#));
         assert!(sql.contains(r#", src."kind" AS "kind""#));
+    }
+
+    #[test]
+    fn create_table_sql_projects_rule_columns() {
+        let sql = create_table_sql(
+            "_gp_prep_7",
+            "roads",
+            "geom",
+            "gid",
+            "",
+            r#", (scalerank < 5) _gp_rule_0"#,
+        );
+        assert!(sql.contains(r#"(scalerank < 5) _gp_rule_0"#));
     }
 
     #[test]
