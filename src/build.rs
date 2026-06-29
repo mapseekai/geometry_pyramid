@@ -739,10 +739,9 @@ pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
 /// Which side a per-zoom rule clause targets: the prepared table (precomputed
 /// `_gp_rule_k` booleans) or the raw src table (the inline filter expr).
 #[derive(Clone, Copy)]
-#[allow(non_camel_case_types)]
 pub(crate) enum RuleTarget {
     Prepared,
-    src,
+    Source,
 }
 
 /// The ` AND …` clause restricting zoom `z` to features passing every rule whose
@@ -755,7 +754,7 @@ pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarg
         if z >= rule.min_zoom && z <= rule.max_zoom {
             match target {
                 RuleTarget::Prepared => s.push_str(&format!(" AND prep_src._gp_rule_{k}")),
-                RuleTarget::src => s.push_str(&format!(" AND ({})", rule.filter)),
+                RuleTarget::Source => s.push_str(&format!(" AND ({})", rule.filter)),
             }
         }
     }
@@ -1567,7 +1566,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            rules_clause_for_zoom(&cfg, 2, RuleTarget::src),
+            rules_clause_for_zoom(&cfg, 2, RuleTarget::Source),
             " AND (a < 5)"
         );
     }
