@@ -37,12 +37,14 @@ pub(crate) fn generate_tile(
 
     let knobs = crate::build::ZoomKnobs::from_config(cfg, z).to_values();
     let (attrs_inner, attrs_outer) = crate::build::attribute_projections(cfg);
+    let rule_where = crate::build::rules_clause_for_zoom(cfg, z, crate::build::RuleTarget::Source);
     let pipeline = crate::build::tile_pipeline_from_sql(
         src.source_table,
         src.geom_column,
         src.fid_column,
         &attrs_inner,
         &attrs_outer,
+        &rule_where,
     );
 
     // Single tile = degenerate 1x1 range: xmin=xmax=x ($4,$5), ymin=ymax=y

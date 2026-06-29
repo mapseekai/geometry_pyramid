@@ -775,6 +775,7 @@ pub(crate) fn tile_pipeline_from_sql(
     fid_column: &str,
     attrs_inner: &str,
     attrs_outer: &str,
+    rule_where: &str,
 ) -> String {
     format!(
         r#"FROM generate_series($4::int, $5::int) AS xs(x)
@@ -804,7 +805,7 @@ pub(crate) fn tile_pipeline_from_sql(
                    AND src."{geom_column}" && ST_Transform(
                           ST_TileEnvelope($1, t.x, t.y, margin => ($9::float8 / $3::float8)),
                           $10
-                       )
+                       ){rule_where}
               ) prep
               WHERE
                  ($12::float8 <= 0
@@ -829,6 +830,7 @@ pub(crate) fn tile_pipeline_from_prepared_sql(
     prepared_table: &str,
     attrs_inner: &str,
     attrs_outer: &str,
+    rule_where: &str,
 ) -> String {
     format!(
         r#"FROM generate_series($4::int, $5::int) AS xs(x)
@@ -855,7 +857,7 @@ pub(crate) fn tile_pipeline_from_prepared_sql(
                  FROM "{prepared_table}" prep_src
                  WHERE prep_src.geom_tile && ST_TileEnvelope(
                     $1, t.x, t.y, margin => ($9::float8 / $3::float8)
-                 )
+                 ){rule_where}
               ) prep
               WHERE
                  ($12::float8 <= 0
@@ -878,6 +880,7 @@ pub(crate) fn point_feature_major_pipeline_sql(
     attrs_inner: &str,
     attrs_outer: &str,
     attrs_mvt: &str,
+    rule_where: &str,
 ) -> String {
     format!(
         r#"WITH raw AS (
@@ -893,7 +896,7 @@ pub(crate) fn point_feature_major_pipeline_sql(
              WHERE prep_src.geom_type = 'POINT'
                AND ($14::float8 >= 1.0
                     OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
-                       / 1000000.0 < $14::float8)
+                       / 1000000.0 < $14::float8){rule_where}
            ),
            features AS (
              SELECT
@@ -946,6 +949,7 @@ pub(crate) fn feature_driven_pipeline_sql(
     attrs_from_prepped: &str, // , prepped."col"
     attrs_from_kept: &str,    // , kept."col"
     attrs_mvt: &str,          // , f."col"
+    rule_where: &str,
 ) -> String {
     format!(
         r#"WITH prepped AS (
@@ -988,7 +992,7 @@ pub(crate) fn feature_driven_pipeline_sql(
                AND ($14::float8 >= 1.0
                     OR prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
                     OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
-                       / 1000000.0 < $14::float8)
+                       / 1000000.0 < $14::float8){rule_where}
            ),
            kept AS (
              SELECT
@@ -1055,12 +1059,14 @@ pub(crate) fn build_zoom_level(
 
     let (attrs_inner, attrs_outer) = attribute_projections(cfg);
 
+    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Source);
     let pipeline = tile_pipeline_from_sql(
         src.source_table,
         src.geom_column,
         src.fid_column,
         &attrs_inner,
         &attrs_outer,
+        &rule_where,
     );
     let split_size = cfg.split_size;
     // Aggregate each tile's MVT exactly once. The previous form computed
@@ -1121,7 +1127,8 @@ fn build_zoom_level_prepared(
     let drop_threshold = knobs.drop_threshold;
     let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "prep");
 
-    let pipeline = tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer);
+    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
+    let pipeline = tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer, &rule_where);
     let split_size = cfg.split_size;
     let sql = format!(
         r#"WITH grouped AS (
@@ -1174,8 +1181,9 @@ fn build_zoom_level_prepared_points_feature_major(
     let drop_threshold = knobs.drop_threshold;
     let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "raw");
     let (_, attrs_mvt) = attribute_projections_for(cfg, "prep_src", "f");
+    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline =
-        point_feature_major_pipeline_sql(&prepared.table, &attrs_inner, &attrs_outer, &attrs_mvt);
+        point_feature_major_pipeline_sql(&prepared.table, &attrs_inner, &attrs_outer, &attrs_mvt, &rule_where);
     let split_size = cfg.split_size;
     let sql = format!(
         r#"{pipeline}
@@ -1223,12 +1231,14 @@ fn build_zoom_level_prepared_feature_driven(
     let (attrs_inner, attrs_from_prepped) = attribute_projections_for(cfg, "prep_src", "prepped");
     let (_, attrs_from_kept) = attribute_projections_for(cfg, "x", "kept");
     let (_, attrs_mvt) = attribute_projections_for(cfg, "x", "f");
+    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline = feature_driven_pipeline_sql(
         &prepared.table,
         &attrs_inner,
         &attrs_from_prepped,
         &attrs_from_kept,
         &attrs_mvt,
+        &rule_where,
     );
     let split_size = cfg.split_size;
     let sql = format!(
@@ -1319,6 +1329,7 @@ mod tests {
             "_gp_prep_42",
             r#", prep_src."kind" AS "kind""#,
             r#", prep."kind""#,
+            "",
         );
 
         assert!(sql.contains(r#"FROM "_gp_prep_42" prep_src"#));
@@ -1460,7 +1471,7 @@ mod tests {
 
     #[test]
     fn point_feature_major_pipeline_does_not_enumerate_bbox_tiles() {
-        let sql = point_feature_major_pipeline_sql("_gp_prep_test", "", "", "");
+        let sql = point_feature_major_pipeline_sql("_gp_prep_test", "", "", "", "");
         assert!(
             !sql.contains("generate_series"),
             "point feature-major path must not enumerate bbox tile cells"
@@ -1507,7 +1518,7 @@ mod tests {
 
     #[test]
     fn feature_driven_pipeline_derives_tiles_from_envelopes() {
-        let sql = feature_driven_pipeline_sql("_gp_prep_test", "", "", "", "");
+        let sql = feature_driven_pipeline_sql("_gp_prep_test", "", "", "", "", "");
         // Derives a candidate tile range per feature from its envelope...
         assert!(sql.contains("ST_XMin(prep_src.geom_tile)"));
         assert!(sql.contains("ST_YMax(prep_src.geom_tile)"));
