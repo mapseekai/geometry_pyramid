@@ -1144,7 +1144,8 @@ fn build_zoom_level_prepared(
     let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "prep");
 
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
-    let pipeline = tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer, &rule_where);
+    let pipeline =
+        tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer, &rule_where);
     let split_size = cfg.split_size;
     let sql = format!(
         r#"WITH grouped AS (
@@ -1198,8 +1199,13 @@ fn build_zoom_level_prepared_points_feature_major(
     let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "raw");
     let (_, attrs_mvt) = attribute_projections_for(cfg, "prep_src", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
-    let pipeline =
-        point_feature_major_pipeline_sql(&prepared.table, &attrs_inner, &attrs_outer, &attrs_mvt, &rule_where);
+    let pipeline = point_feature_major_pipeline_sql(
+        &prepared.table,
+        &attrs_inner,
+        &attrs_outer,
+        &attrs_mvt,
+        &rule_where,
+    );
     let split_size = cfg.split_size;
     let sql = format!(
         r#"{pipeline}
@@ -1588,10 +1594,9 @@ mod tests {
 
     #[test]
     fn rules_clause_source_inlines_filter() {
-        let cfg = PyramidConfig::parse(
-            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"}]}"#,
-        )
-        .unwrap();
+        let cfg =
+            PyramidConfig::parse(r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"}]}"#)
+                .unwrap();
         assert_eq!(
             rules_clause_for_zoom(&cfg, 2, RuleTarget::Source),
             " AND (a < 5)"

@@ -1672,16 +1672,22 @@ mod tests {
         .unwrap();
         // z2 is covered by the rule: A's tile survives, B's tile is filtered out.
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 2, 0, 2)").unwrap().is_some(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 2, 0, 2)")
+                .unwrap()
+                .is_some(),
             "z2 tile over A (rank 1) must survive rank<5"
         );
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 2, 3, 2)").unwrap().is_none(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 2, 3, 2)")
+                .unwrap()
+                .is_none(),
             "z2 tile over B (rank 9) must be filtered out"
         );
         // z3 is NOT covered: B reappears.
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 3, 6, 4)").unwrap().is_some(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('br', 3, 6, 4)")
+                .unwrap()
+                .is_some(),
             "z3 (uncovered) tile over B must be present"
         );
         Spi::run("SELECT ST_DropPyramid('br')").unwrap();
@@ -1691,10 +1697,8 @@ mod tests {
     #[pg_test]
     fn build_rules_true_filter_matches_no_rules() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_bre (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
+        Spi::run("CREATE TABLE _gp_bre (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
+            .unwrap();
         Spi::run(
             "INSERT INTO _gp_bre (geom) SELECT ST_SetSRID(ST_MakePoint(\
                 random()*340 - 170, random()*140 - 70), 4326) \
@@ -1702,7 +1706,10 @@ mod tests {
         )
         .unwrap();
         for (_name, cfg) in [
-            ("bre_none", r#"{"name":"bre_none","minZoom":0,"maxZoom":4,"splitSize":0}"#),
+            (
+                "bre_none",
+                r#"{"name":"bre_none","minZoom":0,"maxZoom":4,"splitSize":0}"#,
+            ),
             (
                 "bre_true",
                 r#"{"name":"bre_true","minZoom":0,"maxZoom":4,"splitSize":0,"buildRules":[{"minZoom":0,"maxZoom":22,"filter":"true"}]}"#,
@@ -1717,7 +1724,10 @@ mod tests {
         let none_tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_bre_none")
             .unwrap()
             .unwrap();
-        assert!(none_tiles > 0, "no-rules build produced no tiles to compare");
+        assert!(
+            none_tiles > 0,
+            "no-rules build produced no tiles to compare"
+        );
         // A no-op `true` filter must leave the feature set identical, so every
         // materialized tile matches in coverage and encoded size. Compare by
         // `octet_length` (the codebase's cross-build convention): an MVT feature
@@ -1735,7 +1745,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(mismatches, 0, "true-filter pyramid must equal the no-rules pyramid");
+        assert_eq!(
+            mismatches, 0,
+            "true-filter pyramid must equal the no-rules pyramid"
+        );
         Spi::run("SELECT ST_DropPyramid('bre_none')").unwrap();
         Spi::run("SELECT ST_DropPyramid('bre_true')").unwrap();
         Spi::run("DROP TABLE _gp_bre").unwrap();
@@ -1854,15 +1867,21 @@ mod tests {
         )
         .unwrap();
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 0, 2)").unwrap().is_some(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 0, 2)")
+                .unwrap()
+                .is_some(),
             "A (rank 5) passes both rules"
         );
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 3, 2)").unwrap().is_none(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 3, 2)")
+                .unwrap()
+                .is_none(),
             "B (rank 9) fails rank<=5"
         );
         assert!(
-            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 2, 2)").unwrap().is_none(),
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brm', 2, 2, 2)")
+                .unwrap()
+                .is_none(),
             "C (rank 1) fails rank>=5"
         );
         Spi::run("SELECT ST_DropPyramid('brm')").unwrap();
@@ -1872,12 +1891,9 @@ mod tests {
     #[pg_test]
     fn build_rules_invalid_filter_errors_cleanly() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
-        Spi::run(
-            "CREATE TABLE _gp_bri (gid serial PRIMARY KEY, geom geometry(Point, 4326))",
-        )
-        .unwrap();
-        Spi::run("INSERT INTO _gp_bri (geom) VALUES (ST_SetSRID(ST_MakePoint(1,1),4326))")
+        Spi::run("CREATE TABLE _gp_bri (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
             .unwrap();
+        Spi::run("INSERT INTO _gp_bri (geom) VALUES (ST_SetSRID(ST_MakePoint(1,1),4326))").unwrap();
         // Filter references a non-existent column: build must err in a
         // subtransaction, leaving NO pyramid behind.
         Spi::run(

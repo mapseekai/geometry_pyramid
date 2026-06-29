@@ -602,19 +602,17 @@ mod tests {
 
     #[test]
     fn build_rules_reject_inverted_zoom() {
-        let c = PyramidConfig::parse(
-            r#"{"buildRules":[{"minZoom":5,"maxZoom":2,"filter":"true"}]}"#,
-        )
-        .unwrap();
+        let c =
+            PyramidConfig::parse(r#"{"buildRules":[{"minZoom":5,"maxZoom":2,"filter":"true"}]}"#)
+                .unwrap();
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn build_rules_reject_empty_filter() {
-        let c = PyramidConfig::parse(
-            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"   "}]}"#,
-        )
-        .unwrap();
+        let c =
+            PyramidConfig::parse(r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"   "}]}"#)
+                .unwrap();
         assert!(c.validate().is_err());
     }
 
