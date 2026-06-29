@@ -93,6 +93,22 @@ fn build_into(
     src: PyramidSource,
     storage_table: &str,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    // Validate each LOD rule's filter against the src up front, so a bad
+    // expr fails cleanly (naming the rule) before any prep/shadow work and
+    // never leaves a partial pyramid. `AND false` makes it a pure parse/column
+    // check that scans nothing.
+    for (k, rule) in src.cfg.build_rules.iter().enumerate() {
+        let probe = format!(
+            r#"SELECT 1 FROM "{}" WHERE ({}) AND false LIMIT 1"#,
+            src.source_table, rule.filter
+        );
+        Spi::run(&probe).map_err(|e| {
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "buildRules[{k}] filter is invalid: {e}"
+            ))
+        })?;
+    }
+
     let bbox = source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?;
     let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
         notice!(
