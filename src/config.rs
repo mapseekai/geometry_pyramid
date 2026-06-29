@@ -63,9 +63,12 @@ pub struct CatalogRow {
     pub storage_exists: bool,
 }
 
-/// One level-of-detail rule: within `[minZoom, maxZoom]`, only src features
-/// satisfying `filter` (a raw SQL boolean expr over src columns)
-/// participate in tiles. See docs/superpowers/specs/2026-06-29-build-rules-design.md.
+/// One level-of-detail rule: within `[minZoom, maxZoom]`, only source features
+/// satisfying `filter` participate in tiles. `filter` is a raw SQL boolean
+/// expression over source columns, evaluated with the **caller's own privileges**
+/// (trusted-admin input, like a view definition) and validated against the source
+/// before any build work; it must not contain a statement separator (`;`). See
+/// docs/superpowers/specs/2026-06-29-build-rules-design.md and the README note.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildRule {
     #[serde(rename = "minZoom")]
@@ -225,6 +228,9 @@ pub struct PyramidConfig {
     pub dynamic_beyond_max_zoom: bool,
 
     /// Per-level feature filters (level-of-detail). Empty = no filtering (default).
+    /// Each rule's `filter` is raw SQL run with the **caller's own privileges**
+    /// (trusted-admin input, like a view definition) — see [`BuildRule`] and the
+    /// README security note.
     #[serde(default, rename = "buildRules")]
     pub build_rules: Vec<BuildRule>,
 }
@@ -361,7 +367,7 @@ impl PyramidConfig {
             // expression is caught later by the build-time validation probe.
             if filter.contains(';') {
                 return Err(format!(
-                    "buildRules[{k}]: filter must be a single expression (no ';')"
+                    "buildRules[{k}]: filter must not contain a statement separator (';')"
                 ));
             }
         }

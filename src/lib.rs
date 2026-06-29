@@ -1774,7 +1774,10 @@ mod tests {
         // z4-6 (uncovered) carry every feature. The rule must apply identically
         // whether its per-zoom predicate is evaluated serially or read from the
         // `_gp_rule_0` column that flows through the committed prepared table to the
-        // background workers.
+        // background workers. `rank` is deliberately NOT in `attributes`, so this
+        // also proves the spec's headline invariant: a filter over a *non-attribute*
+        // source column works because the boolean is precomputed at CTAS time — the
+        // prepared table never carries the raw column.
         exec_sql_autonomous(
             "DROP TABLE IF EXISTS _gp_brp; \
              CREATE TABLE _gp_brp (gid serial PRIMARY KEY, kind text, rank int, \
@@ -1801,7 +1804,7 @@ mod tests {
         let ser_ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_brp','geom','gid', \
              '{\"name\":\"brp_ser\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
-                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\"], \
                 \"preparedBuild\":true, \
                 \"buildRules\":[{\"minZoom\":0,\"maxZoom\":3,\"filter\":\"rank < 100\"}]}')",
         )
@@ -1811,7 +1814,7 @@ mod tests {
         let par_ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_brp','geom','gid', \
              '{\"name\":\"brp_par\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
-                \"simplifyPixels\":1.0,\"attributes\":[\"kind\",\"rank\"], \
+                \"simplifyPixels\":1.0,\"attributes\":[\"kind\"], \
                 \"preparedBuild\":true, \
                 \"parallel\":2,\"buildTimeoutMs\":60000, \
                 \"buildRules\":[{\"minZoom\":0,\"maxZoom\":3,\"filter\":\"rank < 100\"}]}')",
