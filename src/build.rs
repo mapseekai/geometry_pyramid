@@ -754,7 +754,7 @@ pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
 
 /// Which side a per-zoom rule clause targets: the prepared table (precomputed
 /// `_gp_rule_k` booleans) or the raw src table (the inline filter expr).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RuleTarget {
     Prepared,
     Source,

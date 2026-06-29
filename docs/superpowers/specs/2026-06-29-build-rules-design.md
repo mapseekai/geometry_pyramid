@@ -123,4 +123,9 @@ worker 改读源表。均否决。预计算布尔列把注入面也收敛到一�
 
 - `build_rules` 默认空 = 现状。所有现有路径在空规则下生成的 SQL 与 clause 为 `""`,
   零行为变化(由测试 2 的字节一致保证)。
-- 不改 `ST_Tile` 读路径、不改 worker 协议、不改存储 schema。
+- 不改 worker 协议、不改存储 schema。
+- **`ST_Tile` 读路径(实现期修订):** 原计划"不改读路径",但 `dynamic::generate_tile`
+  与构建基线共用 `tile_pipeline_from_sql`,该参数是编译期强制的;传 `""` 会让按需切片
+  (splitSize 延迟或超出 maxZoom)的瓦片与物化瓦片**不一致**。因此按需读路径同样应用
+  `RuleTarget::Source`(原始 src 谓词),使按需瓦片与物化瓦片在同一 zoom 上一致;未被任何
+  规则覆盖的 zoom 子句为空,读路径行为不变。

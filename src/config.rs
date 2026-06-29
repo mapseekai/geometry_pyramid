@@ -354,9 +354,14 @@ impl PyramidConfig {
             if filter.is_empty() {
                 return Err(format!("buildRules[{k}]: filter must not be empty"));
             }
+            // Single-statement guard, not a sanitizer: the filter is evaluated
+            // with the caller's own privileges (trusted-admin posture, like a
+            // view definition — see the README note), so this only forbids
+            // chaining a second statement. A malformed or unknown-column
+            // expression is caught later by the build-time validation probe.
             if filter.contains(';') {
                 return Err(format!(
-                    "buildRules[{k}]: filter must be a single expr (no ';')"
+                    "buildRules[{k}]: filter must be a single expression (no ';')"
                 ));
             }
         }

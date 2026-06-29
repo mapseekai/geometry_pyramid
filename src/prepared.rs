@@ -283,9 +283,9 @@ mod tests {
             "geom",
             "gid",
             "",
-            r#", (scalerank < 5) _gp_rule_0"#,
+            r#", (scalerank < 5) AS _gp_rule_0"#,
         );
-        assert!(sql.contains(r#"(scalerank < 5) _gp_rule_0"#));
+        assert!(sql.contains(r#"(scalerank < 5) AS _gp_rule_0"#));
     }
 
     #[test]
