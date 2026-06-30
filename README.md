@@ -175,6 +175,23 @@ directly; `ST_Tile` returns only the `mvt` column.
 
 > **Note on `buildRules`:** rules implement level-of-detail — e.g. `[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5"}]` keeps only major features at coarse zooms. `filter` is a raw SQL boolean expression evaluated with the privileges of the `ST_BuildPyramid` caller (trusted-admin input, like a view definition); it is checked against the source before any build work and must not contain a statement separator (`;`). The `;` rule is a defense-in-depth check, not single-expression enforcement — under this posture an arbitrary predicate is already as privileged as a view definition. This is a deliberate, documented exception to parameterized-query guidance — an arbitrary predicate cannot be parameterized.
 
+> A graduated `buildRules` is also the lever for **coarse-zoom build speed**: when
+> low zooms would otherwise pack every feature into a handful of tiles, keep only
+> the major features there. For example, by feature length:
+>
+> ```jsonc
+> "buildRules": [
+>   { "minZoom": 0, "maxZoom": 4, "filter": "shape_len > 10000" },
+>   { "minZoom": 5, "maxZoom": 6, "filter": "shape_len > 2000"  },
+>   { "minZoom": 7, "maxZoom": 8, "filter": "shape_len > 500"   }
+> ]
+> ```
+>
+> On a 483k-feature hydrography layer (EPSG:6663) this cut a z0–12 build from
+> **4m33s to 1m55s (2.4×)** and storage from **83 MB to 60 MB**, with z0–4 per-zoom
+> time dropping 24–82× (those tiles hold 77 rivers instead of 483k). Zooms covered
+> by no rule (z9–12 here) keep every feature, so deep-zoom detail is unchanged.
+
 ## Project layout
 
 ```
