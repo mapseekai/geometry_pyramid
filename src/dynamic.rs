@@ -37,12 +37,18 @@ pub(crate) fn generate_tile(
 
     let knobs = crate::build::ZoomKnobs::from_config(cfg, z).to_values();
     let (attrs_inner, attrs_outer) = crate::build::attribute_projections(cfg);
+    // buildRules applies on the on-demand read path too (RuleTarget::Source, the
+    // raw src filter), so a tile served live — splitSize-deferred, or beyond
+    // maxZoom — carries the same LOD filtering as its materialized peers. A zoom no
+    // rule covers yields an empty clause, leaving unfiltered tiles unchanged.
+    let rule_where = crate::build::rules_clause_for_zoom(cfg, z, crate::build::RuleTarget::Source);
     let pipeline = crate::build::tile_pipeline_from_sql(
         src.source_table,
         src.geom_column,
         src.fid_column,
         &attrs_inner,
         &attrs_outer,
+        &rule_where,
     );
 
     // Single tile = degenerate 1x1 range: xmin=xmax=x ($4,$5), ymin=ymax=y

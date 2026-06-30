@@ -8,6 +8,15 @@ pub const DEFAULT_TILE_EXTEND: u32 = 8;
 pub const DEFAULT_MIN_ZOOM: u8 = 0;
 pub const DEFAULT_MAX_ZOOM: u8 = 18;
 pub const DEFAULT_PARALLEL: u32 = 1;
+/// Upper bound on the auto-resolved worker count (`parallel = 0`). Keeps a very
+/// large host from spawning an absurd number of per-zoom spec files; the build
+/// degrades gracefully below this anyway (unspawnable slots run inline).
+pub const PARALLEL_AUTO_CAP: u32 = 32;
+pub const DEFAULT_PREPARED_BUILD: bool = false;
+pub const DEFAULT_FEATURE_MAJOR_POINTS: bool = false;
+/// Minimum `maxZoom` at which `featureMajorPoints` engages (see the field doc).
+pub const DEFAULT_FEATURE_MAJOR_MIN_ZOOM: u8 = 13;
+pub const DEFAULT_FEATURE_DRIVEN_ENUM: bool = false;
 pub const DEFAULT_SOURCE_SRS: i32 = 4326;
 pub const DEFAULT_TILE_SRS: i32 = 3857;
 
@@ -54,6 +63,21 @@ pub struct CatalogRow {
     pub storage_exists: bool,
 }
 
+/// One level-of-detail rule: within `[minZoom, maxZoom]`, only source features
+/// satisfying `filter` participate in tiles. `filter` is a raw SQL boolean
+/// expression over source columns, evaluated with the **caller's own privileges**
+/// (trusted-admin input, like a view definition) and validated against the source
+/// before any build work; it must not contain a statement separator (`;`). See
+/// docs/superpowers/specs/2026-06-29-build-rules-design.md and the README note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRule {
+    #[serde(rename = "minZoom")]
+    pub min_zoom: u8,
+    #[serde(rename = "maxZoom")]
+    pub max_zoom: u8,
+    pub filter: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     /// Optional pyramid name. Defaults to the source table name.
@@ -85,9 +109,59 @@ pub struct PyramidConfig {
     #[serde(default = "default_max_zoom", rename = "maxZoom")]
     pub max_zoom: u8,
 
-    /// Number of parallel workers used to build the pyramid.
+    /// Number of parallel worker slots (coordinator + background workers) used to
+    /// build the pyramid. `0` means **auto** — the host's available parallelism,
+    /// capped at [`PARALLEL_AUTO_CAP`] (matching Ganos, where `0` = maximum
+    /// allowed). `1` (the default) builds serially. Resolve via
+    /// [`PyramidConfig::effective_parallel`]; over-requesting is safe (slots that
+    /// can't spawn a worker run inline on the coordinator).
     #[serde(default = "default_parallel")]
     pub parallel: u32,
+
+    /// Opt-in first-full-build speed path. When true and parallel=1, the build
+    /// pre-projects source geometries into a temporary indexed table before
+    /// slicing tiles. With parallel>1 the first implementation falls back to
+    /// the existing worker path.
+    #[serde(default = "default_prepared_build", rename = "preparedBuild")]
+    pub prepared_build: bool,
+
+    /// Experimental Ganos-like sparse path for pure POINT sources. When enabled
+    /// together with preparedBuild and parallel=1, the builder groups points by
+    /// their computed tile id instead of probing every tile in the source bbox.
+    #[serde(
+        default = "default_feature_major_points",
+        rename = "featureMajorPoints"
+    )]
+    pub feature_major_points: bool,
+
+    /// Minimum `maxZoom` at which `featureMajorPoints` actually engages.
+    /// Feature-major cost is ~flat per zoom (O(features)) while tile-major cost
+    /// grows ~4x per zoom (O(R(z)) bbox-cell enumerate + probe), so feature-major
+    /// only wins for deep pyramids — benchmarks (PG17/PostGIS3.6) put the total
+    /// break-even between z12 and z13 even on an FM-favorable wide-bbox dataset,
+    /// so the default (13) errs toward enabling. Below this, eligible point builds
+    /// fall back to prepared tile-major so shallow pyramids don't regress. Set 0
+    /// to always use feature-major when otherwise eligible. NOTE: the true driver
+    /// is bbox-spread vs feature-count; this maxZoom proxy is a coarse, cheap
+    /// heuristic — tight-bbox sources may want it higher.
+    #[serde(
+        default = "default_feature_major_min_zoom",
+        rename = "featureMajorMinZoom"
+    )]
+    pub feature_major_min_zoom: u8,
+
+    /// Generalizes the `featureMajorPoints` idea to **all** geometry types: per
+    /// zoom, candidate tiles are derived from each feature's envelope tile-range
+    /// (arithmetic) instead of enumerating + GiST-probing every cell in the source
+    /// bbox. Requires preparedBuild, parallel=1 and tileSRS=3857. Output is
+    /// identical to the tile-major path (same `ST_AsMVTGeom` clip). It only
+    /// engages where it pays off — a one-time prep check disables it when the
+    /// per-feature explode would enumerate more than the full lattice (dense
+    /// extents, or a few bbox-spanning features), and per zoom it is used only
+    /// when R(z) exceeds a small multiple of the row count (sparse / high zoom).
+    /// Below that crossover the dense tile-major path runs instead.
+    #[serde(default = "default_feature_driven_enum", rename = "featureDrivenEnum")]
+    pub feature_driven_enum: bool,
 
     /// Optional list of attribute columns to include in MVT features.
     #[serde(default)]
@@ -103,7 +177,10 @@ pub struct PyramidConfig {
     /// Minimum visual feature size in tile pixels. At each zoom, polygons
     /// whose area `< (size_px)²` and lines whose length `< size_px` are
     /// filtered out before MVT encoding. 0 disables.
-    #[serde(default = "default_min_feature_pixels", rename = "minFeatureSizePixels")]
+    #[serde(
+        default = "default_min_feature_pixels",
+        rename = "minFeatureSizePixels"
+    )]
     pub min_feature_size_px: f64,
 
     /// Tippecanoe-style point drop rate: at zoom z, retain
@@ -116,17 +193,24 @@ pub struct PyramidConfig {
     /// any tile at a zoom exceeds this size after the initial INSERT, the
     /// zoom is wiped and rebuilt with tighter simplify / min-size / drop
     /// knobs. 0 disables the retry loop.
-    #[serde(default = "default_tile_size_budget_bytes", rename = "tileSizeBudgetBytes")]
+    #[serde(
+        default = "default_tile_size_budget_bytes",
+        rename = "tileSizeBudgetBytes"
+    )]
     pub tile_size_budget_bytes: i64,
 
     /// Cap on retry rounds per zoom when chasing the byte budget. The build
     /// gives up and emits whatever it has after this many attempts.
-    #[serde(default = "default_max_tile_size_attempts", rename = "maxTileSizeAttempts")]
+    #[serde(
+        default = "default_max_tile_size_attempts",
+        rename = "maxTileSizeAttempts"
+    )]
     pub max_tile_size_attempts: u32,
 
-    /// Tiles whose feature count is below splitSize are NOT materialized at
-    /// build time; ST_Tile slices them on-demand from the source (density
-    /// boundary, mirrors Ganos). 0 disables (materialize every non-empty tile).
+    /// Density boundary. The default 0 materializes every non-empty tile.
+    /// With splitSize > 0, tiles whose feature count is below it are NOT
+    /// materialized at build time; ST_Tile slices them on-demand from the
+    /// source on every request (mirrors Ganos's density-based dynamic build).
     #[serde(default = "default_split_size", rename = "splitSize")]
     pub split_size: u32,
 
@@ -137,8 +221,18 @@ pub struct PyramidConfig {
 
     /// When a requested tile has z > maxZoom, slice it live from the source
     /// table instead of returning NULL. Default true (mirrors Ganos maxLevel).
-    #[serde(default = "default_dynamic_beyond_max_zoom", rename = "dynamicBeyondMaxZoom")]
+    #[serde(
+        default = "default_dynamic_beyond_max_zoom",
+        rename = "dynamicBeyondMaxZoom"
+    )]
     pub dynamic_beyond_max_zoom: bool,
+
+    /// Per-level feature filters (level-of-detail). Empty = no filtering (default).
+    /// Each rule's `filter` is raw SQL run with the **caller's own privileges**
+    /// (trusted-admin input, like a view definition) — see [`BuildRule`] and the
+    /// README security note.
+    #[serde(default, rename = "buildRules")]
+    pub build_rules: Vec<BuildRule>,
 }
 
 impl PyramidConfig {
@@ -190,15 +284,20 @@ impl Default for PyramidConfig {
             min_zoom: DEFAULT_MIN_ZOOM,
             max_zoom: DEFAULT_MAX_ZOOM,
             parallel: DEFAULT_PARALLEL,
+            prepared_build: DEFAULT_PREPARED_BUILD,
+            feature_major_points: DEFAULT_FEATURE_MAJOR_POINTS,
+            feature_major_min_zoom: DEFAULT_FEATURE_MAJOR_MIN_ZOOM,
+            feature_driven_enum: DEFAULT_FEATURE_DRIVEN_ENUM,
             attributes: Vec::new(),
             simplify_pixels: DEFAULT_SIMPLIFY_PIXELS,
             min_feature_size_px: DEFAULT_MIN_FEATURE_PIXELS,
             drop_rate: DEFAULT_DROP_RATE,
             tile_size_budget_bytes: DEFAULT_TILE_SIZE_BUDGET_BYTES,
             max_tile_size_attempts: DEFAULT_MAX_TILE_SIZE_ATTEMPTS,
-            split_size: 10000,
+            split_size: 0,
             build_timeout_ms: 0,
             dynamic_beyond_max_zoom: true,
+            build_rules: Vec::new(),
         }
     }
 }
@@ -250,8 +349,52 @@ impl PyramidConfig {
                 self.tile_extend, self.tile_size
             ));
         }
+        for (k, rule) in self.build_rules.iter().enumerate() {
+            if rule.min_zoom > rule.max_zoom {
+                return Err(format!(
+                    "buildRules[{k}]: minZoom ({}) must be <= maxZoom ({})",
+                    rule.min_zoom, rule.max_zoom
+                ));
+            }
+            let filter = rule.filter.trim();
+            if filter.is_empty() {
+                return Err(format!("buildRules[{k}]: filter must not be empty"));
+            }
+            // Single-statement guard, not a sanitizer: the filter is evaluated
+            // with the caller's own privileges (trusted-admin posture, like a
+            // view definition — see the README note), so this only forbids
+            // chaining a second statement. A malformed or unknown-column
+            // expression is caught later by the build-time validation probe.
+            if filter.contains(';') {
+                return Err(format!(
+                    "buildRules[{k}]: filter must not contain a statement separator (';')"
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// Effective worker-slot count (coordinator + workers) for the build.
+    ///
+    /// `parallel = 0` resolves to the host's available parallelism, capped at
+    /// [`PARALLEL_AUTO_CAP`] (Ganos's `0` = maximum-allowed semantics). Any
+    /// explicit value is returned verbatim. The result is always `>= 1`, so the
+    /// build's `effective_parallel() - 1` worker count never underflows.
+    pub fn effective_parallel(&self) -> u32 {
+        match self.parallel {
+            0 => auto_parallelism(),
+            n => n,
+        }
+    }
+}
+
+/// Available parallelism for `parallel = 0` (auto), clamped to
+/// `[1, PARALLEL_AUTO_CAP]`. Falls back to 1 when the platform can't report it.
+fn auto_parallelism() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .clamp(1, PARALLEL_AUTO_CAP)
 }
 
 fn default_source_srs() -> i32 {
@@ -275,6 +418,18 @@ fn default_max_zoom() -> u8 {
 fn default_parallel() -> u32 {
     DEFAULT_PARALLEL
 }
+fn default_prepared_build() -> bool {
+    DEFAULT_PREPARED_BUILD
+}
+fn default_feature_major_points() -> bool {
+    DEFAULT_FEATURE_MAJOR_POINTS
+}
+fn default_feature_major_min_zoom() -> u8 {
+    DEFAULT_FEATURE_MAJOR_MIN_ZOOM
+}
+fn default_feature_driven_enum() -> bool {
+    DEFAULT_FEATURE_DRIVEN_ENUM
+}
 fn default_simplify_pixels() -> f64 {
     DEFAULT_SIMPLIFY_PIXELS
 }
@@ -294,7 +449,7 @@ fn default_dynamic_beyond_max_zoom() -> bool {
     true
 }
 fn default_split_size() -> u32 {
-    10000
+    0
 }
 
 #[cfg(test)]
@@ -307,6 +462,7 @@ mod tests {
         assert_eq!(cfg.tile_size, DEFAULT_TILE_SIZE);
         assert_eq!(cfg.source_srs, 4326);
         assert_eq!(cfg.tile_srs, 3857);
+        assert!(!cfg.feature_major_points);
     }
 
     #[test]
@@ -315,13 +471,48 @@ mod tests {
     }
 
     #[test]
+    fn effective_parallel_resolves_auto_and_honours_explicit() {
+        // Default (1) and any explicit value pass through verbatim.
+        assert_eq!(PyramidConfig::parse("").unwrap().effective_parallel(), 1);
+        assert_eq!(
+            PyramidConfig::parse(r#"{"parallel":4}"#)
+                .unwrap()
+                .effective_parallel(),
+            4
+        );
+        // 0 = auto: resolves to a real worker count in [1, PARALLEL_AUTO_CAP],
+        // never 0 (so `effective_parallel() - 1` can't underflow).
+        let auto = PyramidConfig::parse(r#"{"parallel":0}"#)
+            .unwrap()
+            .effective_parallel();
+        assert!((1..=PARALLEL_AUTO_CAP).contains(&auto));
+    }
+
+    #[test]
     fn validate_rejects_broken_invariants() {
         let cases = [
-            PyramidConfig { min_zoom: 5, max_zoom: 3, ..Default::default() },
-            PyramidConfig { max_zoom: 30, ..Default::default() },
-            PyramidConfig { tile_size: 0, ..Default::default() },
-            PyramidConfig { tile_size: 40000, ..Default::default() },
-            PyramidConfig { tile_size: 256, tile_extend: 256, ..Default::default() },
+            PyramidConfig {
+                min_zoom: 5,
+                max_zoom: 3,
+                ..Default::default()
+            },
+            PyramidConfig {
+                max_zoom: 30,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 0,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 40000,
+                ..Default::default()
+            },
+            PyramidConfig {
+                tile_size: 256,
+                tile_extend: 256,
+                ..Default::default()
+            },
         ];
         for cfg in cases {
             assert!(cfg.validate().is_err(), "expected rejection for {cfg:?}");
@@ -331,13 +522,14 @@ mod tests {
     #[test]
     fn parses_known_keys() {
         let cfg = PyramidConfig::parse(
-            r#"{"sourceSRS":4490,"tileSize":512,"maxZoom":14,"parallel":4}"#,
+            r#"{"sourceSRS":4490,"tileSize":512,"maxZoom":14,"parallel":4,"featureMajorPoints":true}"#,
         )
         .unwrap();
         assert_eq!(cfg.source_srs, 4490);
         assert_eq!(cfg.tile_size, 512);
         assert_eq!(cfg.max_zoom, 14);
         assert_eq!(cfg.parallel, 4);
+        assert!(cfg.feature_major_points);
     }
 
     #[test]
@@ -385,11 +577,57 @@ mod tests {
     }
 
     #[test]
-    fn split_size_defaults_10000_and_parses() {
-        assert_eq!(PyramidConfig::default().split_size, 10000);
-        let c = PyramidConfig::parse(r#"{"splitSize":0}"#).unwrap();
-        assert_eq!(c.split_size, 0);
+    fn split_size_defaults_zero_and_parses() {
+        assert_eq!(PyramidConfig::default().split_size, 0);
+        let c = PyramidConfig::parse(r#"{"splitSize":10000}"#).unwrap();
+        assert_eq!(c.split_size, 10000);
         let c2 = PyramidConfig::parse(r#"{"splitSize":250}"#).unwrap();
         assert_eq!(c2.split_size, 250);
+    }
+
+    #[test]
+    fn prepared_build_defaults_false_and_parses() {
+        assert!(!PyramidConfig::default().prepared_build);
+        let cfg = PyramidConfig::parse(r#"{"preparedBuild":true}"#).unwrap();
+        assert!(cfg.prepared_build);
+    }
+
+    #[test]
+    fn build_rules_default_empty_and_parses() {
+        assert!(PyramidConfig::default().build_rules.is_empty());
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.build_rules.len(), 1);
+        assert_eq!(c.build_rules[0].min_zoom, 0);
+        assert_eq!(c.build_rules[0].max_zoom, 4);
+        assert_eq!(c.build_rules[0].filter, "scalerank < 5");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn build_rules_reject_inverted_zoom() {
+        let c =
+            PyramidConfig::parse(r#"{"buildRules":[{"minZoom":5,"maxZoom":2,"filter":"true"}]}"#)
+                .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn build_rules_reject_empty_filter() {
+        let c =
+            PyramidConfig::parse(r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"   "}]}"#)
+                .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn build_rules_reject_semicolon() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"true; DROP TABLE x"}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
     }
 }

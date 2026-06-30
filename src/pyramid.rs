@@ -68,9 +68,7 @@ fn st_build_pyramid(
 
 /// `ST_DropPyramid(name) -> bool`
 #[pg_extern(name = "st_droppyramid")]
-fn st_drop_pyramid(
-    name: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+fn st_drop_pyramid(name: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     validate_identifier(name)?;
     let removed = Spi::get_one_with_args::<i64>(
         "WITH d AS (DELETE FROM geometry_pyramid_catalog WHERE pyramid_name = $1 RETURNING 1) \
@@ -267,7 +265,10 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
         &[format!("\"{storage_table}\"").into()],
     )?;
     let tile_count: i64 = if reg.is_some() {
-        Spi::get_one(&format!(r#"SELECT count(*)::bigint FROM "{storage_table}""#))?.unwrap_or(0)
+        Spi::get_one(&format!(
+            r#"SELECT count(*)::bigint FROM "{storage_table}""#
+        ))?
+        .unwrap_or(0)
     } else {
         0
     };
@@ -318,10 +319,7 @@ pub(crate) fn validate_identifier(
     if ident.len() > 45 {
         return Err(format!("identifier too long: {ident}").into());
     }
-    if !ident
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!("invalid identifier: {ident}").into());
     }
     Ok(())

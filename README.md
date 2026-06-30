@@ -21,11 +21,12 @@ rebuilt; omitting the clause triggers a full rebuild. `ST_Tile` is now
 requests beyond `maxZoom` are sliced on-demand from the source table (when
 `dynamicBeyondMaxZoom` is enabled, the default), mirroring Ganos's `maxLevel`
 semantics; unknown pyramids return NULL (so do `ST_Pyramid` / `ST_UpdatePyramid`
-on an unknown name — cleanly, never an error). Sparse tiles (feature count <
-`splitSize`, default 10000) are likewise not materialized at build time and are
-sliced on-demand by `ST_Tile`; combined with the `maxZoom` level boundary,
-materialization covers only the dense low/mid-zoom tiles. PNG rendering,
-coalesce-densest, and Ganos `buildRules` (per-level rules) remain on the roadmap.
+on an unknown name — cleanly, never an error). By default (`splitSize` 0) every
+non-empty tile within `maxZoom` is materialized; raising `splitSize` defers
+sparse tiles (feature count below it) to on-demand slicing by `ST_Tile` instead
+of materializing them. **Per-level feature filtering** (`buildRules`,
+level-of-detail) restricts coarse zooms to features matching a SQL predicate.
+PNG rendering and coalesce-densest remain on the roadmap.
 
 ## SQL surface
 
@@ -55,6 +56,10 @@ keys mirror Ganos:
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
 | `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
+| `preparedBuild` | `false` | Opt-in first full-build speed path for `parallel=1`: pre-project source geometries into a session-local indexed temp table before slicing. With `parallel>1`, it falls back to the existing worker path. |
+| `featureMajorPoints` | `false` | Experimental sparse path for pure `POINT` sources. Requires `preparedBuild=true`, `parallel=1`, and `tileSRS=3857`; the builder computes tile ids per point instead of probing every bbox tile. Mixed, line, polygon, or non-Web-Mercator builds fall back to prepared tile-major. |
+| `featureMajorMinZoom` | `13` | Minimum `maxZoom` at which `featureMajorPoints` engages — it only wins once the high zoom levels (where tile-major's empty-cell probing explodes) dominate the build, and slightly regresses shallow pyramids. Below this, eligible point builds fall back to prepared tile-major (with a `NOTICE`). Set `0` to always use feature-major when eligible. |
+| `featureDrivenEnum` | `false` | All-geometry generalization of `featureMajorPoints`: derive candidate tiles from each feature's envelope instead of enumerating + GiST-probing every bbox cell. Requires `preparedBuild=true`, `parallel=1`, `tileSRS=3857`; output is identical to the tile-major path. Self-gating — a one-time prep check disables it for dense extents or a few bbox-spanning features, and per zoom it engages only above the `R(z) > 2·rows` crossover (sparse / high zoom), so turning it on is always safe. Measured ~65× at z14 on a sparse mixed dataset. |
 | `attributes` | `[]` | Columns to include in MVT features. |
 | `simplifyPixels` | `1.0` | DP tolerance in tile pixels (≈1 px ≈ tippecanoe default). 0 disables. |
 | `minFeatureSizePixels` | `0.0` | Drop polygons whose area `<` and lines `<` this many tile pixels. 0 disables. |
@@ -62,7 +67,8 @@ keys mirror Ganos:
 | `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 | `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
-| `splitSize` | `10000` | Tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source. 0 materializes every non-empty tile. |
+| `splitSize` | `0` | `0` (default) materializes every non-empty tile. A value > 0 is a density boundary: tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source on every request. |
+| `buildRules` | `[]` | Per-level feature filters (LOD). Each rule `{minZoom, maxZoom, filter}` restricts that zoom band to source features satisfying `filter` (a raw SQL boolean expression over source columns). Zooms not covered by any rule include all features; multiple rules covering a zoom are ANDed. Empty (default) = no filtering. |
 
 ## Creating a pyramid
 
@@ -165,7 +171,26 @@ mvt bytea` and `PRIMARY KEY (z, x, y)`. `format` is currently always `'pbf'`;
 `srid` is the tile coordinate system (`tileSRS`). Consumers may read this table
 directly; `ST_Tile` returns only the `mvt` column.
 
-> **Note on `splitSize`:** with `splitSize` > 0 (the default is 10000), any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on every request. For a busy tile server over a large source, set `splitSize` to 0 (materialize everything) or tune it to your density so the live-scan fallback stays bounded.
+> **Note on `splitSize`:** the default `0` materializes every non-empty tile within `maxZoom`, so reads are pure storage lookups. If you set `splitSize` > 0, any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on *every* request. That trades a faster, smaller build for slower repeated reads, so size it to your density and read load (and keep a spatial index on the source) before raising it above 0.
+
+> **Note on `buildRules`:** rules implement level-of-detail — e.g. `[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5"}]` keeps only major features at coarse zooms. `filter` is a raw SQL boolean expression evaluated with the privileges of the `ST_BuildPyramid` caller (trusted-admin input, like a view definition); it is checked against the source before any build work and must not contain a statement separator (`;`). The `;` rule is a defense-in-depth check, not single-expression enforcement — under this posture an arbitrary predicate is already as privileged as a view definition. This is a deliberate, documented exception to parameterized-query guidance — an arbitrary predicate cannot be parameterized.
+
+> A graduated `buildRules` is also the lever for **coarse-zoom build speed**: when
+> low zooms would otherwise pack every feature into a handful of tiles, keep only
+> the major features there. For example, by feature length:
+>
+> ```jsonc
+> "buildRules": [
+>   { "minZoom": 0, "maxZoom": 4, "filter": "shape_len > 10000" },
+>   { "minZoom": 5, "maxZoom": 6, "filter": "shape_len > 2000"  },
+>   { "minZoom": 7, "maxZoom": 8, "filter": "shape_len > 500"   }
+> ]
+> ```
+>
+> On a 483k-feature hydrography layer (EPSG:6663) this cut a z0–12 build from
+> **4m33s to 1m55s (2.4×)** and storage from **83 MB to 60 MB**, with z0–4 per-zoom
+> time dropping 24–82× (those tiles hold 77 rivers instead of 483k). Zooms covered
+> by no rule (z9–12 here) keep every feature, so deep-zoom detail is unchanged.
 
 ## Project layout
 
@@ -231,16 +256,33 @@ baseline the build-speed work compares against.
 
 ```bash
 psql "$DATABASE_URL" \
-  -v pyramid_name=gp_bench \
+  -v pyramid_name=gp_bench_baseline \
   -v max_zoom=8 \
   -v scale=1000000 \
+  -v prepared_build=false \
+  -f bench/build_speed.sql
+
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_prepared \
+  -v max_zoom=8 \
+  -v scale=1000000 \
+  -v prepared_build=true \
+  -f bench/build_speed.sql
+
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_points_fm \
+  -v max_zoom=8 \
+  -v scale=1000000 \
+  -v point_only=true \
+  -v prepared_build=true \
+  -v feature_major_points=true \
   -f bench/build_speed.sql
 ```
 
 `scale` is the dense-point count (lines ≈ `scale/3`, polygons ≈ `scale/4`); raise
-it to `1e7`/`1e8` on target hardware. See `docs/build-speed-deep-dive.md` for the
-analysis and `docs/superpowers/plans/2026-06-26-build-speed-feature-major.md` for
-the staged plan.
+it to `1e7`/`1e8` on target hardware. `featureMajorPoints` is useful only with
+`point_only=true` or another pure `POINT` source; mixed data deliberately falls
+back to the prepared tile-major path.
 
 ## Generation rules
 
@@ -270,8 +312,9 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
     server-side raster output, matching Ganos.
 11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
-12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics. Ganos `splitSize` density-based dynamic build and `buildRules` remain future work.~~ ✅
-13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅ (`buildRules` per-level rules remain future work).
+12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics.~~ ✅
+13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅
+14. ~~**buildRules** — per-level feature filtering (LOD): each `{minZoom, maxZoom, filter}` restricts a zoom band to source features matching a raw SQL predicate; zooms covered by no rule keep all features, and multiple rules covering a zoom are ANDed.~~ ✅
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 
