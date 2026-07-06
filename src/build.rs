@@ -98,9 +98,12 @@ fn build_into(
     // never leaves a partial pyramid. `AND false` makes it a pure parse/column
     // check that scans nothing.
     for (k, rule) in src.cfg.build_rules.iter().enumerate() {
+        let Some(filter) = &rule.filter else {
+            continue;
+        };
         let probe = format!(
             r#"SELECT 1 FROM "{}" WHERE ({}) AND false LIMIT 1"#,
-            src.source_table, rule.filter
+            src.source_table, filter
         );
         Spi::run(&probe).map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!(
@@ -747,7 +750,9 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
 pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
-        s.push_str(&format!(r#", ({}) AS _gp_rule_{k}"#, rule.filter));
+        if let Some(filter) = &rule.filter {
+            s.push_str(&format!(r#", ({filter}) AS _gp_rule_{k}"#));
+        }
     }
     s
 }
@@ -768,9 +773,12 @@ pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarg
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
         if z >= rule.min_zoom && z <= rule.max_zoom {
+            let Some(filter) = &rule.filter else {
+                continue;
+            };
             match target {
                 RuleTarget::Prepared => s.push_str(&format!(" AND prep_src._gp_rule_{k}")),
-                RuleTarget::Source => s.push_str(&format!(" AND ({})", rule.filter)),
+                RuleTarget::Source => s.push_str(&format!(" AND ({filter})")),
             }
         }
     }
