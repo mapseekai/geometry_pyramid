@@ -41,7 +41,14 @@ pub(crate) fn generate_tile(
     // raw src filter), so a tile served live — splitSize-deferred, or beyond
     // maxZoom — carries the same LOD filtering as its materialized peers. A zoom no
     // rule covers yields an empty clause, leaving unfiltered tiles unchanged.
-    let rule_where = crate::build::rules_clause_for_zoom(cfg, z, crate::build::RuleTarget::Source);
+    let rule_where = crate::build::rules_clause_for_zoom(
+        cfg,
+        z,
+        crate::build::RuleTarget::Source {
+            geom_column: src.geom_column,
+            fid_column: src.fid_column,
+        },
+    );
     let pipeline = crate::build::tile_pipeline_from_sql(
         src.source_table,
         src.geom_column,
