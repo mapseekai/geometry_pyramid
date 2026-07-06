@@ -253,6 +253,60 @@ mod tests {
     }
 
     #[pg_test]
+    fn build_rules_feature_driven_filters_output() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_brfd (gid serial PRIMARY KEY, kind text, rank int, \
+             geom geometry(Geometry, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_brfd (kind, rank, geom) VALUES \
+             ('keep_point', 1, ST_SetSRID(ST_MakePoint(-100, 0), 4326)), \
+             ('drop_point', 900, ST_SetSRID(ST_MakePoint(100, 0), 4326)), \
+             ('keep_line', 2, ST_SetSRID(ST_MakeLine(ST_MakePoint(-130, 20), ST_MakePoint(-120, 25)), 4326)), \
+             ('keep_poly', 3, ST_SetSRID(ST_MakeEnvelope(-140, 30, -135, 35, 4326), 4326)), \
+             ('outlier', 9001, ST_SetSRID(ST_MakePoint(-170, -75), 4326)), \
+             ('outlier', 9002, ST_SetSRID(ST_MakePoint(170, 78), 4326))",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brfd','geom','gid', \
+             '{\"name\":\"brfd\",\"minZoom\":0,\"maxZoom\":6,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureDrivenEnum\":true, \
+                \"buildRules\":[{\"minZoom\":6,\"maxZoom\":6,\"filter\":\"rank < 100\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z6_tiles =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_brfd WHERE z = 6")
+                .unwrap()
+                .unwrap();
+        assert!(
+            z6_tiles > 0,
+            "feature-driven buildRules test must produce non-empty z6 output"
+        );
+
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brfd', 6, 14, 32)")
+                .unwrap()
+                .is_some(),
+            "feature-driven covered zoom must keep the rank 1 point"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brfd', 6, 49, 32)")
+                .unwrap()
+                .is_none(),
+            "feature-driven covered zoom must filter the rank 900 point"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('brfd')").unwrap();
+        Spi::run("DROP TABLE _gp_brfd").unwrap();
+    }
+
+    #[pg_test]
     fn feature_driven_enum_matches_default_for_mixed_geometries() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run(
