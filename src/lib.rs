@@ -43,6 +43,17 @@ mod tests {
         assert_eq!(v, env!("CARGO_PKG_VERSION"));
     }
 
+    fn bytea_contains(bytes: &[u8], needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn tile_bytes(sql: &str) -> Vec<u8> {
+        Spi::get_one::<Vec<u8>>(sql)
+            .unwrap()
+            .expect("tile should exist")
+    }
+
     /// End-to-end smoke test: register a tiny table, build a pyramid over
     /// it, fetch a tile, then drop it. Requires PostGIS (declared in the
     /// .control file's `requires`).
@@ -2201,6 +2212,100 @@ mod tests {
 
         Spi::run("SELECT ST_DropPyramid('brprep')").unwrap();
         Spi::run("DROP TABLE _gp_brprep").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_source_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_src").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_src(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_src VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(30, -10), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_src','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":1,\"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":0,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z0 = tile_bytes("SELECT ST_Tile('_gp_lod_src', 0, 0, 0)");
+        assert!(bytea_contains(&z0, "kind"));
+        assert!(!bytea_contains(&z0, "detail"));
+
+        let z1 = tile_bytes("SELECT ST_Tile('_gp_lod_src', 1, 1, 1)");
+        assert!(bytea_contains(&z1, "kind"));
+        assert!(bytea_contains(&z1, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_src')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_src").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_dynamic_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_dyn").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_dyn(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_dyn VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(30, -10), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_dyn','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":0,\"splitSize\":9999,
+                \"dynamicBeyondMaxZoom\":true,
+                \"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":2,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z0 = tile_bytes("SELECT ST_Tile('_gp_lod_dyn', 0, 0, 0)");
+        assert!(bytea_contains(&z0, "kind"));
+        assert!(!bytea_contains(&z0, "detail"));
+
+        let z1 = tile_bytes("SELECT ST_Tile('_gp_lod_dyn', 1, 1, 1)");
+        assert!(bytea_contains(&z1, "kind"));
+        assert!(!bytea_contains(&z1, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_dyn')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_dyn").unwrap();
     }
 
     #[pg_test]

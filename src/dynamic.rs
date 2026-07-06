@@ -36,7 +36,8 @@ pub(crate) fn generate_tile(
     }
 
     let knobs = crate::build::ZoomKnobs::from_config(cfg, z).to_values();
-    let (attrs_inner, attrs_outer) = crate::build::attribute_projections(cfg);
+    let (attrs_inner, attrs_outer) =
+        crate::build::attribute_projections_for_zoom(cfg, z, "src", "prep");
     // buildRules applies on the on-demand read path too (RuleTarget::Source, the
     // raw src filter), so a tile served live — splitSize-deferred, or beyond
     // maxZoom — carries the same LOD filtering as its materialized peers. A zoom no

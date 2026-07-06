@@ -1236,7 +1236,7 @@ pub(crate) fn build_zoom_level(
     let min_len_m = knobs.min_len_m;
     let drop_threshold = knobs.drop_threshold;
 
-    let (attrs_inner, attrs_outer) = attribute_projections(cfg);
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "src", "prep");
 
     let rule_where = rules_clause_for_zoom(
         cfg,
