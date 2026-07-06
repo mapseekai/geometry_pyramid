@@ -200,6 +200,59 @@ mod tests {
     }
 
     #[pg_test]
+    fn build_rules_feature_major_points_filters_output() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_brfm (gid serial PRIMARY KEY, rank int, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_brfm (rank, geom) VALUES \
+             (1, ST_SetSRID(ST_MakePoint(-100, 0), 4326)), \
+             (9, ST_SetSRID(ST_MakePoint( 100, 0), 4326))",
+        )
+        .unwrap();
+
+        let before = prepared_geom_index_count();
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brfm','geom','gid', \
+             '{\"name\":\"brfm\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":0, \
+                \"preparedBuild\":true,\"featureMajorPoints\":true, \
+                \"featureMajorMinZoom\":0, \
+                \"buildRules\":[{\"minZoom\":5,\"maxZoom\":5,\"filter\":\"rank < 5\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+        let after = prepared_geom_index_count();
+        assert_eq!(
+            after, before,
+            "pure POINT feature-major path should not create the prepared geom_tile index"
+        );
+
+        let tiles = Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_brfm")
+            .unwrap()
+            .unwrap();
+        assert!(tiles > 0, "feature-major buildRules test produced no tiles");
+
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brfm', 5, 7, 16)")
+                .unwrap()
+                .is_some(),
+            "feature-major covered zoom must keep rank 1"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brfm', 5, 24, 16)")
+                .unwrap()
+                .is_none(),
+            "feature-major covered zoom must filter rank 9"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('brfm')").unwrap();
+        Spi::run("DROP TABLE _gp_brfm").unwrap();
+    }
+
+    #[pg_test]
     fn feature_driven_enum_matches_default_for_mixed_geometries() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run(
