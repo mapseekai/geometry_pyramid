@@ -144,9 +144,9 @@ The sampling predicate should be deterministic across:
 - beyond-maxZoom dynamic reads.
 
 The default key is the feature id because it is already required by the public
-API and used by existing `dropRate` hashing. A future implementation may allow
-source-column keys, but every key must be projected or otherwise available in
-prepared and optimized paths before sampling is applied.
+API and used by existing `dropRate` hashing. Explicit source-column keys are
+allowed when they pass identifier validation, and every key must be projected or
+otherwise available in prepared and optimized paths before sampling is applied.
 
 `dropRate` stays as a legacy point-retention knob. If `dropRate` and `sample`
 both cover the same point feature, both predicates apply. This is stricter but
