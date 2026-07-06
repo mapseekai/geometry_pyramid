@@ -720,6 +720,7 @@ fn run_zoom_strips(
 /// empty; they are spliced after a fixed column list. Column names are
 /// revalidated defensively because they ride into dynamic SQL — a name failing
 /// the validation is skipped with a notice rather than silently dropped.
+#[cfg(test)]
 pub(crate) fn attribute_projections_for(
     cfg: &PyramidConfig,
     inner_alias: &str,
@@ -731,10 +732,6 @@ pub(crate) fn attribute_projections_for(
         append_attribute_projection(&mut inner, &mut outer, inner_alias, outer_alias, col);
     }
     (inner, outer)
-}
-
-pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
-    attribute_projections_for(cfg, "src", "prep")
 }
 
 pub(crate) fn effective_attributes_for_zoom(cfg: &PyramidConfig, z: u8) -> &[String] {
@@ -1311,7 +1308,7 @@ fn build_zoom_level_prepared(
     let min_area_m2 = knobs.min_area_m2;
     let min_len_m = knobs.min_len_m;
     let drop_threshold = knobs.drop_threshold;
-    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "prep");
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "prep");
 
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline =
@@ -1366,8 +1363,8 @@ fn build_zoom_level_prepared_points_feature_major(
     let z = rect.z;
     let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
     let drop_threshold = knobs.drop_threshold;
-    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "raw");
-    let (_, attrs_mvt) = attribute_projections_for(cfg, "prep_src", "f");
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "raw");
+    let (_, attrs_mvt) = attribute_projections_for_zoom(cfg, z, "prep_src", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline = point_feature_major_pipeline_sql(
         &prepared.table,
@@ -1420,9 +1417,10 @@ fn build_zoom_level_prepared_feature_driven(
     let cfg = src.cfg;
     let z = rect.z;
     let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
-    let (attrs_inner, attrs_from_prepped) = attribute_projections_for(cfg, "prep_src", "prepped");
-    let (_, attrs_from_kept) = attribute_projections_for(cfg, "x", "kept");
-    let (_, attrs_mvt) = attribute_projections_for(cfg, "x", "f");
+    let (attrs_inner, attrs_from_prepped) =
+        attribute_projections_for_zoom(cfg, z, "prep_src", "prepped");
+    let (_, attrs_from_kept) = attribute_projections_for_zoom(cfg, z, "x", "kept");
+    let (_, attrs_mvt) = attribute_projections_for_zoom(cfg, z, "x", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline = feature_driven_pipeline_sql(
         &prepared.table,
