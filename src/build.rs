@@ -9,6 +9,7 @@ use crate::config::PyramidConfig;
 use crate::source::PyramidSource;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
+use std::fmt::Write as _;
 
 /// Per-zoom build outcome, consumed by the stats layer.
 #[derive(Clone, Copy, Debug)]
@@ -731,8 +732,8 @@ pub(crate) fn attribute_projections_for(
             );
             continue;
         }
-        inner.push_str(&format!(r#", {inner_alias}."{col}" AS "{col}""#));
-        outer.push_str(&format!(r#", {outer_alias}."{col}""#));
+        write!(inner, r#", {inner_alias}."{col}" AS "{col}""#).expect("write to String");
+        write!(outer, r#", {outer_alias}."{col}""#).expect("write to String");
     }
     (inner, outer)
 }
@@ -747,7 +748,7 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
 pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
-        s.push_str(&format!(r#", ({}) AS _gp_rule_{k}"#, rule.filter));
+        write!(s, r#", ({}) AS _gp_rule_{k}"#, rule.filter).expect("write to String");
     }
     s
 }
@@ -769,8 +770,12 @@ pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarg
     for (k, rule) in cfg.build_rules.iter().enumerate() {
         if z >= rule.min_zoom && z <= rule.max_zoom {
             match target {
-                RuleTarget::Prepared => s.push_str(&format!(" AND prep_src._gp_rule_{k}")),
-                RuleTarget::Source => s.push_str(&format!(" AND ({})", rule.filter)),
+                RuleTarget::Prepared => {
+                    write!(s, " AND prep_src._gp_rule_{k}").expect("write to String");
+                }
+                RuleTarget::Source => {
+                    write!(s, " AND ({})", rule.filter).expect("write to String");
+                }
             }
         }
     }
