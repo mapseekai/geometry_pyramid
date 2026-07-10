@@ -1892,6 +1892,99 @@ mod tests {
     }
 
     #[pg_test]
+    fn build_rules_prepared_multi_rule_and_by_zoom() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_brprep (gid serial PRIMARY KEY, rank int, kind text, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_brprep (rank, kind, geom) VALUES \
+             (5, 'keep', ST_SetSRID(ST_MakePoint(-150, 0), 4326)), \
+             (1, 'drop', ST_SetSRID(ST_MakePoint( -50, 0), 4326)), \
+             (9, 'keep', ST_SetSRID(ST_MakePoint(  50, 0), 4326)), \
+             (9, 'drop', ST_SetSRID(ST_MakePoint( 150, 0), 4326))",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brprep','geom','gid', \
+             '{\"name\":\"brprep\",\"minZoom\":0,\"maxZoom\":4,\"splitSize\":0, \
+                \"preparedBuild\":true, \
+                \"buildRules\":[{\"minZoom\":1,\"maxZoom\":2,\"filter\":\"rank <= 5\"}, \
+                                {\"minZoom\":2,\"maxZoom\":3,\"filter\":\"kind = ''keep''\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        // z1: only rank <= 5 applies. The eastern tile contains only rank 9 rows.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 1, 0, 1)")
+                .unwrap()
+                .is_some(),
+            "z1 must keep rows passing the rank rule"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 1, 1, 1)")
+                .unwrap()
+                .is_none(),
+            "z1 must filter rows failing the rank rule"
+        );
+
+        // z2: both rules overlap, so the result is rank <= 5 AND kind = 'keep'.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 2, 0, 2)")
+                .unwrap()
+                .is_some(),
+            "z2 must keep the feature satisfying both prepared rule columns"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 2, 1, 2)")
+                .unwrap()
+                .is_none(),
+            "z2 must filter rank-pass/kind-fail rows"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 2, 2, 2)")
+                .unwrap()
+                .is_none(),
+            "z2 must filter rank-fail/kind-pass rows"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 2, 3, 2)")
+                .unwrap()
+                .is_none(),
+            "z2 must filter rows failing both rules"
+        );
+
+        // z3: only kind = 'keep' applies; the high-rank keep row reappears.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 3, 5, 4)")
+                .unwrap()
+                .is_some(),
+            "z3 must keep high-rank rows when only the kind rule covers the zoom"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 3, 2, 4)")
+                .unwrap()
+                .is_none(),
+            "z3 must filter kind=drop rows"
+        );
+
+        // z4: no rules cover this zoom; the row failing both rules reappears.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brprep', 4, 14, 8)")
+                .unwrap()
+                .is_some(),
+            "uncovered z4 must not filter the rank 9/kind drop row"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('brprep')").unwrap();
+        Spi::run("DROP TABLE _gp_brprep").unwrap();
+    }
+
+    #[pg_test]
     fn build_rules_invalid_filter_errors_cleanly() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run("CREATE TABLE _gp_bri (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
