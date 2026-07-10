@@ -1695,6 +1695,118 @@ mod tests {
     }
 
     #[pg_test]
+    fn build_rules_dynamic_split_and_beyond_max_zoom() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_brdyn (gid serial PRIMARY KEY, rank int, \
+             geom geometry(Point, 4326))",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_brdyn (rank, geom) VALUES \
+             (1, ST_SetSRID(ST_MakePoint(-100, 0), 4326)), \
+             (9, ST_SetSRID(ST_MakePoint( 100, 0), 4326))",
+        )
+        .unwrap();
+
+        let mat_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brdyn','geom','gid', \
+             '{\"name\":\"brdyn_mat\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":0, \
+                \"buildRules\":[{\"minZoom\":2,\"maxZoom\":5,\"filter\":\"rank < 5\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(mat_ok, Some(true));
+
+        let split_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brdyn','geom','gid', \
+             '{\"name\":\"brdyn_split\",\"minZoom\":0,\"maxZoom\":5,\"splitSize\":100, \
+                \"buildRules\":[{\"minZoom\":2,\"maxZoom\":5,\"filter\":\"rank < 5\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(split_ok, Some(true));
+
+        let beyond_ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_brdyn','geom','gid', \
+             '{\"name\":\"brdyn_beyond\",\"minZoom\":0,\"maxZoom\":2,\"splitSize\":0, \
+                \"buildRules\":[{\"minZoom\":5,\"maxZoom\":5,\"filter\":\"rank < 5\"}]}')",
+        )
+        .unwrap();
+        assert_eq!(beyond_ok, Some(true));
+
+        let split_materialized =
+            Spi::get_one::<i64>("SELECT count(*)::bigint FROM _gp_tiles_brdyn_split")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            split_materialized, 0,
+            "splitSize=100 must force storage misses so ST_Tile uses dynamic slicing"
+        );
+
+        // z5 tile coords for (-100,0) and (100,0): x=7/y=16 and x=24/y=16.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_mat', 5, 7, 16)")
+                .unwrap()
+                .is_some(),
+            "materialized covered zoom must keep rank 1"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_mat', 5, 24, 16)")
+                .unwrap()
+                .is_none(),
+            "materialized covered zoom must filter rank 9"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_split', 5, 7, 16)")
+                .unwrap()
+                .is_some(),
+            "splitSize dynamic covered zoom must keep rank 1"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_split', 5, 24, 16)")
+                .unwrap()
+                .is_none(),
+            "splitSize dynamic covered zoom must filter rank 9"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_beyond', 5, 7, 16)")
+                .unwrap()
+                .is_some(),
+            "z>maxZoom dynamic covered zoom must keep rank 1"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_beyond', 5, 24, 16)")
+                .unwrap()
+                .is_none(),
+            "z>maxZoom dynamic covered zoom must filter rank 9"
+        );
+
+        // z1 is not covered by either rule set; the rank 9 feature reappears.
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_mat', 1, 1, 1)")
+                .unwrap()
+                .is_some(),
+            "uncovered materialized zoom must not filter rank 9"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_split', 1, 1, 1)")
+                .unwrap()
+                .is_some(),
+            "uncovered splitSize dynamic zoom must not filter rank 9"
+        );
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('brdyn_beyond', 1, 1, 1)")
+                .unwrap()
+                .is_some(),
+            "uncovered stored zoom in beyond-max pyramid must not filter rank 9"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('brdyn_mat')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('brdyn_split')").unwrap();
+        Spi::run("SELECT ST_DropPyramid('brdyn_beyond')").unwrap();
+        Spi::run("DROP TABLE _gp_brdyn").unwrap();
+    }
+
+    #[pg_test]
     fn build_rules_true_filter_matches_no_rules() {
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
         Spi::run("CREATE TABLE _gp_bre (gid serial PRIMARY KEY, geom geometry(Point, 4326))")
