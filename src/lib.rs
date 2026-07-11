@@ -43,6 +43,17 @@ mod tests {
         assert_eq!(v, env!("CARGO_PKG_VERSION"));
     }
 
+    fn bytea_contains(bytes: &[u8], needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn tile_bytes(sql: &str) -> Vec<u8> {
+        Spi::get_one::<Vec<u8>>(sql)
+            .unwrap()
+            .expect("tile should exist")
+    }
+
     /// End-to-end smoke test: register a tiny table, build a pyramid over
     /// it, fetch a tile, then drop it. Requires PostGIS (declared in the
     /// .control file's `requires`).
@@ -599,12 +610,12 @@ mod tests {
             .expect("previous tile must survive a failed rebuild");
         assert_eq!(before, after);
 
-        let shadows = Spi::get_one::<i64>(
-            "SELECT count(*)::bigint FROM pg_tables WHERE tablename LIKE '%\\_\\_shadow'",
+        let shadow_left = Spi::get_one::<bool>(
+            "SELECT to_regclass('\"_gp_tiles__gp_atomic__shadow\"') IS NOT NULL",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(shadows, 0);
+        assert!(!shadow_left);
 
         Spi::run("SELECT ST_DropPyramid('_gp_atomic')").unwrap();
         Spi::run("DROP TABLE _gp_atomic").unwrap();
@@ -2201,6 +2212,281 @@ mod tests {
 
         Spi::run("SELECT ST_DropPyramid('brprep')").unwrap();
         Spi::run("DROP TABLE _gp_brprep").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_source_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_src").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_src(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_src VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(30, -10), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_src','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":1,\"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":0,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z0 = tile_bytes("SELECT ST_Tile('_gp_lod_src', 0, 0, 0)");
+        assert!(bytea_contains(&z0, "kind"));
+        assert!(!bytea_contains(&z0, "detail"));
+
+        let z1 = tile_bytes("SELECT ST_Tile('_gp_lod_src', 1, 1, 1)");
+        assert!(bytea_contains(&z1, "kind"));
+        assert!(bytea_contains(&z1, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_src')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_src").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_dynamic_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_dyn").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_dyn(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_dyn VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(30, -10), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_dyn','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":0,\"splitSize\":9999,
+                \"dynamicBeyondMaxZoom\":true,
+                \"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":2,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z0 = tile_bytes("SELECT ST_Tile('_gp_lod_dyn', 0, 0, 0)");
+        assert!(bytea_contains(&z0, "kind"));
+        assert!(!bytea_contains(&z0, "detail"));
+
+        let z1 = tile_bytes("SELECT ST_Tile('_gp_lod_dyn', 1, 1, 1)");
+        assert!(bytea_contains(&z1, "kind"));
+        assert!(!bytea_contains(&z1, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_dyn')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_dyn").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_prepared_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_prep").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_prep(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_prep VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(30, -10), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_prep','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":1,\"preparedBuild\":true,
+                \"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":0,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\",\"kind\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z0 = tile_bytes("SELECT ST_Tile('_gp_lod_prep', 0, 0, 0)");
+        assert!(bytea_contains(&z0, "kind"));
+        assert!(!bytea_contains(&z0, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_prep')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_prep").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_sample_key_prepared_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_sample_prep").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_sample_prep(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_sample_prep VALUES
+             (1, ST_SetSRID(ST_Point(10, -10), 4326), 'keep')",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_sample_prep','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":0,\"preparedBuild\":true,
+                \"buildRules\":[
+                  {\"minZoom\":0,\"maxZoom\":0,
+                   \"sample\":{\"rate\":0,\"key\":[\"fid\",\"kind\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+        assert!(
+            Spi::get_one::<Vec<u8>>("SELECT ST_Tile('_gp_lod_sample_prep', 0, 0, 0)")
+                .unwrap()
+                .is_none(),
+            "sample rate 0 with a non-fid key should build and filter all rows"
+        );
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_sample_prep')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_sample_prep").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_feature_major_points() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_fm").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_fm(
+                gid bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_fm VALUES
+             (1, ST_SetSRID(ST_Point(-100, 0), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(100, 0), 4326), 'drop', 'large-detail', 9)",
+        )
+        .unwrap();
+
+        let before = prepared_geom_index_count();
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_fm','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":5,\"preparedBuild\":true,
+                \"featureMajorPoints\":true,\"featureMajorMinZoom\":0,
+                \"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":5,\"maxZoom\":5,
+                   \"filter\":\"rank < 5\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+        assert_eq!(
+            prepared_geom_index_count(),
+            before,
+            "feature-major point path should not create the prepared geom index"
+        );
+
+        let z5 = tile_bytes("SELECT ST_Tile('_gp_lod_fm', 5, 7, 16)");
+        assert!(bytea_contains(&z5, "kind"));
+        assert!(!bytea_contains(&z5, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_fm')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_fm").unwrap();
+    }
+
+    #[pg_test]
+    fn build_rules_attr_fields_and_sample_feature_driven() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("DROP TABLE IF EXISTS _gp_lod_fd").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_lod_fd(
+                gid bigint PRIMARY KEY,
+                geom geometry(Geometry, 4326),
+                kind text,
+                detail text,
+                rank int
+            )",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO _gp_lod_fd VALUES
+             (1, ST_SetSRID(ST_Point(-100, 0), 4326), 'keep', 'large-detail', 1),
+             (2, ST_SetSRID(ST_Point(100, 0), 4326), 'drop', 'large-detail', 900),
+             (3, ST_SetSRID(ST_MakeLine(ST_MakePoint(-130, 20), ST_MakePoint(-120, 25)), 4326), 'keep_line', 'large-detail', 2),
+             (4, ST_SetSRID(ST_MakeEnvelope(-140, 30, -135, 35, 4326), 4326), 'keep_poly', 'large-detail', 3),
+             (5, ST_SetSRID(ST_Point(-170, -75), 4326), 'outlier', 'large-detail', 9001),
+             (6, ST_SetSRID(ST_Point(170, 78), 4326), 'outlier', 'large-detail', 9002)",
+        )
+        .unwrap();
+
+        let ok = Spi::get_one::<bool>(
+            "SELECT ST_BuildPyramid('_gp_lod_fd','geom','gid',
+             '{\"minZoom\":0,\"maxZoom\":6,\"preparedBuild\":true,
+                \"featureDrivenEnum\":true,
+                \"attributes\":[\"kind\",\"detail\"],
+                \"buildRules\":[
+                  {\"minZoom\":6,\"maxZoom\":6,
+                   \"filter\":\"rank < 100\",
+                   \"attrFields\":[\"kind\"],
+                   \"sample\":{\"rate\":100,\"key\":[\"fid\"],
+                             \"geometryTypes\":[\"POINT\",\"LINESTRING\",\"POLYGON\"]}}
+                ]}')",
+        )
+        .unwrap();
+        assert_eq!(ok, Some(true));
+
+        let z6 = tile_bytes("SELECT ST_Tile('_gp_lod_fd', 6, 14, 32)");
+        assert!(bytea_contains(&z6, "kind"));
+        assert!(!bytea_contains(&z6, "detail"));
+
+        Spi::run("SELECT ST_DropPyramid('_gp_lod_fd')").unwrap();
+        Spi::run("DROP TABLE _gp_lod_fd").unwrap();
     }
 
     #[pg_test]

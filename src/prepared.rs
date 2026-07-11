@@ -57,7 +57,11 @@ pub(crate) fn prepare_source_for_build(
         unsafe { pg_sys::MyProcPid } as u32,
         crate::worker::next_spec_idx(),
     );
-    let (attrs_inner, _) = crate::build::attribute_projections_for(src.cfg, "src", "prep");
+    let attrs_inner = format!(
+        "{}{}",
+        crate::build::prepared_attribute_projections(src.cfg, "src"),
+        crate::build::sample_key_projections_for(src.cfg, "src")
+    );
     let rules_inner = crate::build::rule_projections_for(src.cfg);
 
     Spi::run_with_args(
@@ -100,7 +104,11 @@ pub(crate) fn prepare_source_committed(
     timeout_ms: i64,
 ) -> Result<PreparedBuildSource, Box<dyn std::error::Error + Send + Sync>> {
     let table = prepared_table_name_for(src.name);
-    let (attrs_inner, _) = crate::build::attribute_projections_for(src.cfg, "src", "prep");
+    let attrs_inner = format!(
+        "{}{}",
+        crate::build::prepared_attribute_projections(src.cfg, "src"),
+        crate::build::sample_key_projections_for(src.cfg, "src")
+    );
     let rules_inner = crate::build::rule_projections_for(src.cfg);
 
     // One autonomous script: tile_srs is inlined (a validated i32, injection-safe)
@@ -286,6 +294,19 @@ mod tests {
             r#", (scalerank < 5) AS _gp_rule_0"#,
         );
         assert!(sql.contains(r#"(scalerank < 5) AS _gp_rule_0"#));
+    }
+
+    #[test]
+    fn create_table_sql_projects_sample_key_columns() {
+        let sql = create_table_sql(
+            "_gp_prep_7",
+            "roads",
+            "geom",
+            "gid",
+            r#", src."kind"::text AS _gp_sample_0_1"#,
+            "",
+        );
+        assert!(sql.contains(r#"src."kind"::text AS _gp_sample_0_1"#));
     }
 
     #[test]

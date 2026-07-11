@@ -63,19 +63,34 @@ pub struct CatalogRow {
     pub storage_exists: bool,
 }
 
-/// One level-of-detail rule: within `[minZoom, maxZoom]`, only source features
-/// satisfying `filter` participate in tiles. `filter` is a raw SQL boolean
-/// expression over source columns, evaluated with the **caller's own privileges**
-/// (trusted-admin input, like a view definition) and validated against the source
-/// before any build work; it must not contain a statement separator (`;`). See
-/// docs/superpowers/specs/2026-06-29-build-rules-design.md and the README note.
+/// One level-of-detail rule. Within `[minZoom, maxZoom]`, a rule can filter
+/// source features, override output attributes, and/or apply deterministic
+/// sampling. `filter` is raw SQL over source columns, evaluated with the
+/// **caller's own privileges** (trusted-admin input, like a view definition) and
+/// validated against the source before any build work; it must not contain a
+/// statement separator (`;`). See docs/superpowers/specs/*buildrules* and the
+/// README note.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildRule {
     #[serde(rename = "minZoom")]
     pub min_zoom: u8,
     #[serde(rename = "maxZoom")]
     pub max_zoom: u8,
-    pub filter: String,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default, rename = "attrFields")]
+    pub attr_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub sample: Option<BuildRuleSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRuleSample {
+    pub rate: f64,
+    #[serde(default = "default_sample_key")]
+    pub key: Vec<String>,
+    #[serde(default, rename = "geometryTypes")]
+    pub geometry_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +317,23 @@ impl Default for PyramidConfig {
     }
 }
 
+fn default_sample_key() -> Vec<String> {
+    vec!["fid".to_string()]
+}
+
+fn valid_rule_identifier(ident: &str) -> bool {
+    !ident.is_empty()
+        && ident.len() <= 45
+        && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn valid_geometry_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "POINT" | "MULTIPOINT" | "LINESTRING" | "MULTILINESTRING" | "POLYGON" | "MULTIPOLYGON"
+    )
+}
+
 impl PyramidConfig {
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
         if json.trim().is_empty() {
@@ -356,19 +388,77 @@ impl PyramidConfig {
                     rule.min_zoom, rule.max_zoom
                 ));
             }
-            let filter = rule.filter.trim();
-            if filter.is_empty() {
-                return Err(format!("buildRules[{k}]: filter must not be empty"));
-            }
-            // Single-statement guard, not a sanitizer: the filter is evaluated
-            // with the caller's own privileges (trusted-admin posture, like a
-            // view definition — see the README note), so this only forbids
-            // chaining a second statement. A malformed or unknown-column
-            // expression is caught later by the build-time validation probe.
-            if filter.contains(';') {
+            if rule.filter.is_none() && rule.attr_fields.is_none() && rule.sample.is_none() {
                 return Err(format!(
-                    "buildRules[{k}]: filter must not contain a statement separator (';')"
+                    "buildRules[{k}]: must set at least one of filter, attrFields, or sample"
                 ));
+            }
+            if let Some(filter) = &rule.filter {
+                let filter = filter.trim();
+                if filter.is_empty() {
+                    return Err(format!("buildRules[{k}]: filter must not be empty"));
+                }
+                // Single-statement guard, not a sanitizer: the filter is evaluated
+                // with the caller's own privileges (trusted-admin posture, like a
+                // view definition — see the README note), so this only forbids
+                // chaining a second statement. A malformed or unknown-column
+                // expression is caught later by the build-time validation probe.
+                if filter.contains(';') {
+                    return Err(format!(
+                        "buildRules[{k}]: filter must not contain a statement separator (';')"
+                    ));
+                }
+            }
+            if let Some(attrs) = &rule.attr_fields {
+                for (i, attr) in attrs.iter().enumerate() {
+                    if !valid_rule_identifier(attr) {
+                        return Err(format!(
+                            "buildRules[{k}].attrFields[{i}]: invalid identifier"
+                        ));
+                    }
+                }
+            }
+            if let Some(sample) = &rule.sample {
+                if !(0.0..=100.0).contains(&sample.rate) {
+                    return Err(format!(
+                        "buildRules[{k}].sample.rate must be between 0 and 100"
+                    ));
+                }
+                if sample.key.is_empty() {
+                    return Err(format!("buildRules[{k}].sample.key must not be empty"));
+                }
+                for (i, key) in sample.key.iter().enumerate() {
+                    if key != "fid" && !valid_rule_identifier(key) {
+                        return Err(format!(
+                            "buildRules[{k}].sample.key[{i}]: invalid identifier"
+                        ));
+                    }
+                }
+                for (i, geom_type) in sample.geometry_types.iter().enumerate() {
+                    if !valid_geometry_type_name(geom_type) {
+                        return Err(format!(
+                            "buildRules[{k}].sample.geometryTypes[{i}]: unsupported geometry type"
+                        ));
+                    }
+                }
+            }
+        }
+        for z in 0..=MAX_ZOOM_LIMIT {
+            let mut seen: Option<&[String]> = None;
+            for rule in &self.build_rules {
+                if z >= rule.min_zoom && z <= rule.max_zoom {
+                    if let Some(attrs) = &rule.attr_fields {
+                        if let Some(prev) = seen {
+                            if prev != attrs.as_slice() {
+                                return Err(format!(
+                                    "buildRules: conflicting attrFields for zoom {z}"
+                                ));
+                            }
+                        } else {
+                            seen = Some(attrs.as_slice());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -602,8 +692,51 @@ mod tests {
         assert_eq!(c.build_rules.len(), 1);
         assert_eq!(c.build_rules[0].min_zoom, 0);
         assert_eq!(c.build_rules[0].max_zoom, 4);
-        assert_eq!(c.build_rules[0].filter, "scalerank < 5");
+        assert_eq!(c.build_rules[0].filter.as_deref(), Some("scalerank < 5"));
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn build_rules_accept_filter_only_legacy_shape() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"rank < 5"}]}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.build_rules[0].filter.as_deref(), Some("rank < 5"));
+    }
+
+    #[test]
+    fn build_rules_accept_attr_fields_and_sample() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,
+              "attrFields":["name","kind"],
+              "sample":{"rate":25,"key":["fid"],"geometryTypes":["POINT"]}}]}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        let rule = &c.build_rules[0];
+        assert_eq!(rule.attr_fields.as_deref().unwrap(), ["name", "kind"]);
+        let sample = rule.sample.as_ref().unwrap();
+        assert_eq!(sample.rate, 25.0);
+        assert_eq!(sample.key, ["fid"]);
+        assert_eq!(sample.geometry_types, ["POINT"]);
+    }
+
+    #[test]
+    fn build_rules_default_sample_key_is_fid() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"sample":{"rate":100}}]}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.build_rules[0].sample.as_ref().unwrap().key, ["fid"]);
+    }
+
+    #[test]
+    fn build_rules_reject_noop_rule() {
+        let c = PyramidConfig::parse(r#"{"buildRules":[{"minZoom":0,"maxZoom":4}]}"#).unwrap();
+        assert!(c.validate().unwrap_err().contains("must set at least one"));
     }
 
     #[test]
@@ -629,5 +762,65 @@ mod tests {
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn build_rules_reject_invalid_attr_field() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"attrFields":["bad-name"]}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().unwrap_err().contains("attrFields[0]"));
+    }
+
+    #[test]
+    fn build_rules_reject_sample_rate_out_of_range() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"sample":{"rate":101}}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().unwrap_err().contains("sample.rate"));
+    }
+
+    #[test]
+    fn build_rules_reject_empty_sample_key() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"sample":{"rate":25,"key":[]}}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().unwrap_err().contains("sample.key"));
+    }
+
+    #[test]
+    fn build_rules_reject_invalid_sample_key() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"sample":{"rate":25,"key":["bad-key"]}}]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().unwrap_err().contains("sample.key[0]"));
+    }
+
+    #[test]
+    fn build_rules_reject_conflicting_attr_fields_on_same_zoom() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[
+             {"minZoom":0,"maxZoom":4,"attrFields":["name"]},
+             {"minZoom":2,"maxZoom":6,"attrFields":["kind"]}
+           ]}"#,
+        )
+        .unwrap();
+        assert!(c.validate().unwrap_err().contains("conflicting attrFields"));
+    }
+
+    #[test]
+    fn build_rules_allow_identical_attr_fields_on_same_zoom() {
+        let c = PyramidConfig::parse(
+            r#"{"buildRules":[
+             {"minZoom":0,"maxZoom":4,"attrFields":["name","kind"]},
+             {"minZoom":2,"maxZoom":6,"attrFields":["name","kind"]}
+           ]}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
     }
 }

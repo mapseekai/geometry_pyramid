@@ -99,9 +99,12 @@ fn build_into(
     // never leaves a partial pyramid. `AND false` makes it a pure parse/column
     // check that scans nothing.
     for (k, rule) in src.cfg.build_rules.iter().enumerate() {
+        let Some(filter) = &rule.filter else {
+            continue;
+        };
         let probe = format!(
             r#"SELECT 1 FROM "{}" WHERE ({}) AND false LIMIT 1"#,
-            src.source_table, rule.filter
+            src.source_table, filter
         );
         Spi::run(&probe).map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!(
@@ -717,6 +720,7 @@ fn run_zoom_strips(
 /// empty; they are spliced after a fixed column list. Column names are
 /// revalidated defensively because they ride into dynamic SQL — a name failing
 /// the validation is skipped with a notice rather than silently dropped.
+#[cfg(test)]
 pub(crate) fn attribute_projections_for(
     cfg: &PyramidConfig,
     inner_alias: &str,
@@ -725,6 +729,73 @@ pub(crate) fn attribute_projections_for(
     let mut inner = String::new();
     let mut outer = String::new();
     for col in &cfg.attributes {
+        append_attribute_projection(&mut inner, &mut outer, inner_alias, outer_alias, col);
+    }
+    (inner, outer)
+}
+
+pub(crate) fn effective_attributes_for_zoom(cfg: &PyramidConfig, z: u8) -> &[String] {
+    for rule in &cfg.build_rules {
+        if z >= rule.min_zoom && z <= rule.max_zoom {
+            if let Some(attrs) = &rule.attr_fields {
+                return attrs.as_slice();
+            }
+        }
+    }
+    cfg.attributes.as_slice()
+}
+
+fn append_attribute_projection(
+    inner: &mut String,
+    outer: &mut String,
+    inner_alias: &str,
+    outer_alias: &str,
+    col: &str,
+) {
+    if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        notice!(
+            "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
+            col
+        );
+        return;
+    }
+    write!(inner, r#", {inner_alias}."{col}" AS "{col}""#).expect("write to String");
+    write!(outer, r#", {outer_alias}."{col}""#).expect("write to String");
+}
+
+pub(crate) fn attribute_projections_for_zoom(
+    cfg: &PyramidConfig,
+    z: u8,
+    inner_alias: &str,
+    outer_alias: &str,
+) -> (String, String) {
+    let mut inner = String::new();
+    let mut outer = String::new();
+    for col in effective_attributes_for_zoom(cfg, z) {
+        append_attribute_projection(&mut inner, &mut outer, inner_alias, outer_alias, col);
+    }
+    (inner, outer)
+}
+
+pub(crate) fn prepared_attribute_projections(cfg: &PyramidConfig, src_alias: &str) -> String {
+    let mut cols: Vec<&str> = Vec::new();
+    for col in &cfg.attributes {
+        if !cols.contains(&col.as_str()) {
+            cols.push(col);
+        }
+    }
+    for rule in &cfg.build_rules {
+        if let Some(attrs) = &rule.attr_fields {
+            for col in attrs {
+                if !cols.contains(&col.as_str()) {
+                    cols.push(col);
+                }
+            }
+        }
+    }
+
+    let mut s = String::new();
+    for col in cols {
         if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             notice!(
                 "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
@@ -732,14 +803,28 @@ pub(crate) fn attribute_projections_for(
             );
             continue;
         }
-        write!(inner, r#", {inner_alias}."{col}" AS "{col}""#).expect("write to String");
-        write!(outer, r#", {outer_alias}."{col}""#).expect("write to String");
+        write!(&mut s, r#", {src_alias}."{col}" AS "{col}""#).expect("write to String");
     }
-    (inner, outer)
+    s
 }
 
-pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
-    attribute_projections_for(cfg, "src", "prep")
+pub(crate) fn sample_key_projections_for(cfg: &PyramidConfig, src_alias: &str) -> String {
+    let mut s = String::new();
+    for (rule_idx, rule) in cfg.build_rules.iter().enumerate() {
+        if let Some(sample) = &rule.sample {
+            for (key_idx, key) in sample.key.iter().enumerate() {
+                if key == "fid" {
+                    continue;
+                }
+                write!(
+                    &mut s,
+                    r#", {src_alias}."{key}"::text AS _gp_sample_{rule_idx}_{key_idx}"#
+                )
+                .expect("write to String");
+            }
+        }
+    }
+    s
 }
 
 /// LOD rule predicate columns for the prepared-table CTAS: one boolean column
@@ -748,7 +833,9 @@ pub(crate) fn attribute_projections(cfg: &PyramidConfig) -> (String, String) {
 pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
-        write!(s, r#", ({}) AS _gp_rule_{k}"#, rule.filter).expect("write to String");
+        if let Some(filter) = &rule.filter {
+            write!(&mut s, r#", ({filter}) AS _gp_rule_{k}"#).expect("write to String");
+        }
     }
     s
 }
@@ -756,26 +843,94 @@ pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
 /// Which side a per-zoom rule clause targets: the prepared table (precomputed
 /// `_gp_rule_k` booleans) or the raw src table (the inline filter expr).
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum RuleTarget {
+pub(crate) enum RuleTarget<'a> {
     Prepared,
-    Source,
+    Source {
+        geom_column: &'a str,
+        fid_column: &'a str,
+    },
+}
+
+fn sample_key_expr(rule_idx: usize, key_idx: usize, key: &str, target: RuleTarget<'_>) -> String {
+    match target {
+        RuleTarget::Prepared => {
+            if key == "fid" {
+                "prep_src.fid::text".to_string()
+            } else {
+                format!("prep_src._gp_sample_{rule_idx}_{key_idx}")
+            }
+        }
+        RuleTarget::Source { fid_column, .. } => {
+            if key == "fid" {
+                format!(r#"src."{fid_column}"::text"#)
+            } else {
+                format!(r#"src."{key}"::text"#)
+            }
+        }
+    }
+}
+
+fn sample_clause_for_rule(
+    rule_idx: usize,
+    sample: &crate::config::BuildRuleSample,
+    target: RuleTarget<'_>,
+) -> String {
+    if sample.rate >= 100.0 {
+        return String::new();
+    }
+
+    let threshold = sample.rate / 100.0;
+    let keys = sample
+        .key
+        .iter()
+        .enumerate()
+        .map(|(key_idx, key)| sample_key_expr(rule_idx, key_idx, key, target))
+        .collect::<Vec<_>>();
+    let hash_input = if keys.len() == 1 {
+        keys[0].clone()
+    } else {
+        format!("concat_ws('|', {})", keys.join(", "))
+    };
+    let hash = format!(
+        "(abs(hashtextextended({hash_input}, 0::bigint)) % 1000000)::float8 / 1000000.0 < {threshold}"
+    );
+    if sample.geometry_types.is_empty() {
+        return format!(" AND ({hash})");
+    }
+
+    let list = sample
+        .geometry_types
+        .iter()
+        .map(|g| format!("'{g}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let geom_expr = match target {
+        RuleTarget::Prepared => "prep_src.geom_type".to_string(),
+        RuleTarget::Source { geom_column, .. } => format!(r#"GeometryType(src."{geom_column}")"#),
+    };
+    format!(" AND ({geom_expr} NOT IN ({list}) OR {hash})")
 }
 
 /// The ` AND …` clause restricting zoom `z` to features passing every rule whose
 /// band covers `z`. Empty when no rule covers `z`. `Prepared` references the
 /// precomputed `prep_src._gp_rule_k`; `src` inlines the raw filter (unqualified
 /// columns resolve against the single src table in scope).
-pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarget) -> String {
+pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarget<'_>) -> String {
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
         if z >= rule.min_zoom && z <= rule.max_zoom {
-            match target {
-                RuleTarget::Prepared => {
-                    write!(s, " AND prep_src._gp_rule_{k}").expect("write to String");
+            if let Some(filter) = &rule.filter {
+                match target {
+                    RuleTarget::Prepared => {
+                        write!(&mut s, " AND prep_src._gp_rule_{k}").expect("write to String")
+                    }
+                    RuleTarget::Source { .. } => {
+                        write!(&mut s, " AND ({filter})").expect("write to String")
+                    }
                 }
-                RuleTarget::Source => {
-                    write!(s, " AND ({})", rule.filter).expect("write to String");
-                }
+            }
+            if let Some(sample) = &rule.sample {
+                s.push_str(&sample_clause_for_rule(k, sample, target));
             }
         }
     }
@@ -1078,9 +1233,16 @@ pub(crate) fn build_zoom_level(
     let min_len_m = knobs.min_len_m;
     let drop_threshold = knobs.drop_threshold;
 
-    let (attrs_inner, attrs_outer) = attribute_projections(cfg);
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "src", "prep");
 
-    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Source);
+    let rule_where = rules_clause_for_zoom(
+        cfg,
+        z,
+        RuleTarget::Source {
+            geom_column: src.geom_column,
+            fid_column: src.fid_column,
+        },
+    );
     let pipeline = tile_pipeline_from_sql(
         src.source_table,
         src.geom_column,
@@ -1146,7 +1308,7 @@ fn build_zoom_level_prepared(
     let min_area_m2 = knobs.min_area_m2;
     let min_len_m = knobs.min_len_m;
     let drop_threshold = knobs.drop_threshold;
-    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "prep");
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "prep");
 
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline =
@@ -1201,8 +1363,8 @@ fn build_zoom_level_prepared_points_feature_major(
     let z = rect.z;
     let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
     let drop_threshold = knobs.drop_threshold;
-    let (attrs_inner, attrs_outer) = attribute_projections_for(cfg, "prep_src", "raw");
-    let (_, attrs_mvt) = attribute_projections_for(cfg, "prep_src", "f");
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "raw");
+    let (_, attrs_mvt) = attribute_projections_for_zoom(cfg, z, "prep_src", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline = point_feature_major_pipeline_sql(
         &prepared.table,
@@ -1255,9 +1417,10 @@ fn build_zoom_level_prepared_feature_driven(
     let cfg = src.cfg;
     let z = rect.z;
     let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
-    let (attrs_inner, attrs_from_prepped) = attribute_projections_for(cfg, "prep_src", "prepped");
-    let (_, attrs_from_kept) = attribute_projections_for(cfg, "x", "kept");
-    let (_, attrs_mvt) = attribute_projections_for(cfg, "x", "f");
+    let (attrs_inner, attrs_from_prepped) =
+        attribute_projections_for_zoom(cfg, z, "prep_src", "prepped");
+    let (_, attrs_from_kept) = attribute_projections_for_zoom(cfg, z, "x", "kept");
+    let (_, attrs_mvt) = attribute_projections_for_zoom(cfg, z, "x", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
     let pipeline = feature_driven_pipeline_sql(
         &prepared.table,
@@ -1580,6 +1743,103 @@ mod tests {
     }
 
     #[test]
+    fn effective_attributes_fall_back_to_global_attributes() {
+        let cfg = PyramidConfig::parse(
+            r#"{"attributes":["name","kind"],
+                "buildRules":[{"minZoom":0,"maxZoom":4,"filter":"rank < 5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(effective_attributes_for_zoom(&cfg, 2), ["name", "kind"]);
+    }
+
+    #[test]
+    fn effective_attributes_use_rule_attr_fields() {
+        let cfg = PyramidConfig::parse(
+            r#"{"attributes":["name","kind","detail"],
+                "buildRules":[{"minZoom":0,"maxZoom":4,"attrFields":["name"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(effective_attributes_for_zoom(&cfg, 2), ["name"]);
+        assert_eq!(
+            effective_attributes_for_zoom(&cfg, 5),
+            ["name", "kind", "detail"]
+        );
+    }
+
+    #[test]
+    fn attribute_projections_can_use_zoom_effective_attrs() {
+        let cfg = PyramidConfig::parse(
+            r#"{"attributes":["detail"],
+                "buildRules":[{"minZoom":0,"maxZoom":4,"attrFields":["kind"]}]}"#,
+        )
+        .unwrap();
+        let (inner, outer) = attribute_projections_for_zoom(&cfg, 2, "src", "prep");
+        assert!(inner.contains(r#"src."kind" AS "kind""#));
+        assert!(outer.contains(r#"prep."kind""#));
+        assert!(!inner.contains("detail"));
+    }
+
+    #[test]
+    fn prepared_attribute_projection_includes_global_and_rule_attrs() {
+        let cfg = PyramidConfig::parse(
+            r#"{"attributes":["detail"],
+                "buildRules":[{"minZoom":0,"maxZoom":4,"attrFields":["kind"]}]}"#,
+        )
+        .unwrap();
+        let inner = prepared_attribute_projections(&cfg, "src");
+        assert!(inner.contains(r#"src."detail" AS "detail""#));
+        assert!(inner.contains(r#"src."kind" AS "kind""#));
+    }
+
+    #[test]
+    fn sample_key_projection_includes_non_fid_keys() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,
+                "sample":{"rate":25,"key":["fid","kind"]}}]}"#,
+        )
+        .unwrap();
+        let inner = sample_key_projections_for(&cfg, "src");
+        assert!(inner.contains(r#"src."kind"::text AS _gp_sample_0_1"#));
+        assert!(!inner.contains(r#"src."fid"::text AS _gp_sample_0_0"#));
+    }
+
+    #[test]
+    fn source_rules_clause_inlines_filter_and_sample() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,
+                  "filter":"rank < 5",
+                  "sample":{"rate":25,"key":["fid"],"geometryTypes":["POINT"]}}]}"#,
+        )
+        .unwrap();
+        let clause = rules_clause_for_zoom(
+            &cfg,
+            2,
+            RuleTarget::Source {
+                geom_column: "geom",
+                fid_column: "gid",
+            },
+        );
+        assert!(clause.contains("AND (rank < 5)"));
+        assert!(clause.contains(r#"GeometryType(src."geom") NOT IN ('POINT')"#));
+        assert!(clause.contains(r#"hashtextextended(src."gid"::text"#));
+        assert!(clause.contains("< 0.25"));
+    }
+
+    #[test]
+    fn prepared_rules_clause_uses_rule_booleans_and_sample_keys() {
+        let cfg = PyramidConfig::parse(
+            r#"{"buildRules":[{"minZoom":0,"maxZoom":4,
+                  "filter":"rank < 5",
+                  "sample":{"rate":25,"key":["fid","kind"]}}]}"#,
+        )
+        .unwrap();
+        let clause = rules_clause_for_zoom(&cfg, 2, RuleTarget::Prepared);
+        assert!(clause.contains("AND prep_src._gp_rule_0"));
+        assert!(clause.contains("prep_src.fid::text"));
+        assert!(clause.contains("prep_src._gp_sample_0_1"));
+    }
+
+    #[test]
     fn rules_clause_prepared_ands_covering_booleans() {
         let cfg = PyramidConfig::parse(
             r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"},
@@ -1603,7 +1863,14 @@ mod tests {
             PyramidConfig::parse(r#"{"buildRules":[{"minZoom":0,"maxZoom":4,"filter":"a < 5"}]}"#)
                 .unwrap();
         assert_eq!(
-            rules_clause_for_zoom(&cfg, 2, RuleTarget::Source),
+            rules_clause_for_zoom(
+                &cfg,
+                2,
+                RuleTarget::Source {
+                    geom_column: "geom",
+                    fid_column: "gid",
+                },
+            ),
             " AND (a < 5)"
         );
     }
