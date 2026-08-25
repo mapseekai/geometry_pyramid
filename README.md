@@ -1,5 +1,7 @@
 # geometry_pyramid
 
+[中文说明](README.zh-CN.md)
+
 A PostgreSQL extension that builds **vector tile pyramids** over geometry
 tables, exposing a SQL surface compatible with Alibaba Cloud
 [GanosBase `ganos_geometry_pyramid`][ganos]. Built with
@@ -26,7 +28,7 @@ non-empty tile within `maxZoom` is materialized; raising `splitSize` defers
 sparse tiles (feature count below it) to on-demand slicing by `ST_Tile` instead
 of materializing them. **Per-level feature filtering** (`buildRules`,
 level-of-detail) restricts coarse zooms to features matching a SQL predicate.
-PNG rendering and coalesce-densest remain on the roadmap.
+Coalesce-densest remains on the roadmap.
 
 ## SQL surface
 
@@ -311,12 +313,10 @@ For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 8. ~~**Parallelism** — honour `parallel` config; partition tile range across workers using PG background workers.~~ ✅
 9. ~~**Incremental updates** — `ST_UpdatePyramid(name, where_clause)` rebuilds tiles intersecting matched rows.~~ ✅
    - **Limitation:** incremental refresh rebuilds the tiles that intersect the rows matched by the `where_clause`. A feature that moved or was deleted leaves a stale tile at its **old** location unless the clause also covers that region. Pure-delete and move-out cases require either a clause that covers the old bounding area or a full rebuild. `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid)` covers these cases: it re-slices the given region from the current source regardless of which rows changed.
-10. **Rendering** — optional `ST_AsPNG(name, tile, style_json)` for
-    server-side raster output, matching Ganos.
-11. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
-12. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics.~~ ✅
-13. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅
-14. ~~**buildRules** — per-level feature filtering (LOD): each `{minZoom, maxZoom, filter}` restricts a zoom band to source features matching a raw SQL predicate; zooms covered by no rule keep all features, and multiple rules covering a zoom are ANDed.~~ ✅
+10. ~~**Statistics** — per-zoom row counts, byte size, build duration in `ST_Pyramid()` output.~~ ✅
+11. ~~**On-demand slicing beyond maxZoom** — `ST_Tile` serves materialized tiles within `maxZoom`; requests with z > maxZoom are sliced live from the source table when `dynamicBeyondMaxZoom` is true (default), mirroring Ganos `maxLevel` semantics.~~ ✅
+12. ~~**splitSize** — density boundary: sub-threshold tiles deferred to on-demand slicing.~~ ✅
+13. ~~**buildRules** — per-level feature filtering (LOD): each `{minZoom, maxZoom, filter}` restricts a zoom band to source features matching a raw SQL predicate; zooms covered by no rule keep all features, and multiple rules covering a zoom are ANDed.~~ ✅
 
 [ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
 

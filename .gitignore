@@ -6,6 +6,7 @@
 Cargo.lock
 sql/geometry_pyramid--*.sql
 results/
+data/local/
 *.swp
 __pycache__/
 *.pyc

@@ -6,6 +6,7 @@
 
 use crate::source::PyramidSource;
 use pgrx::prelude::*;
+use std::error::Error;
 
 /// Slice a single (z, x, y) tile from the source table and return its MVT
 /// bytes, or None when the source has no features there (or the source table
@@ -16,7 +17,7 @@ pub(crate) fn generate_tile(
     z: u8,
     x: i32,
     y: i32,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
     let cfg = src.cfg;
     // Defense-in-depth: these identifiers are interpolated into dynamic SQL.
     // Callers pass catalog values (validated at build time), but this is a

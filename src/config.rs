@@ -2,6 +2,7 @@
 //! `ST_BuildPyramid`. Mirrors the option surface of GanosBase.
 
 use serde::{Deserialize, Serialize};
+use std::thread;
 
 pub const DEFAULT_TILE_SIZE: u32 = 4096;
 pub const DEFAULT_TILE_EXTEND: u32 = 8;
@@ -9,7 +10,7 @@ pub const DEFAULT_MIN_ZOOM: u8 = 0;
 pub const DEFAULT_MAX_ZOOM: u8 = 18;
 pub const DEFAULT_PARALLEL: u32 = 1;
 /// Upper bound on the auto-resolved worker count (`parallel = 0`). Keeps a very
-/// large host from spawning an absurd number of per-zoom spec files; the build
+/// large host from spawning an absurd number of per-zoom job files; the build
 /// degrades gracefully below this anyway (unspawnable slots run inline).
 pub const PARALLEL_AUTO_CAP: u32 = 32;
 pub const DEFAULT_PREPARED_BUILD: bool = false;
@@ -481,7 +482,7 @@ impl PyramidConfig {
 /// Available parallelism for `parallel = 0` (auto), clamped to
 /// `[1, PARALLEL_AUTO_CAP]`. Falls back to 1 when the platform can't report it.
 fn auto_parallelism() -> u32 {
-    std::thread::available_parallelism()
+    thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1)
         .clamp(1, PARALLEL_AUTO_CAP)

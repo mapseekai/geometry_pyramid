@@ -13,6 +13,7 @@
 use crate::source::PyramidSource;
 use crate::storage;
 use pgrx::prelude::*;
+use std::error::Error;
 
 /// `ST_Tile(pyramid_name, z, x, y) -> bytea`
 ///
@@ -27,7 +28,7 @@ fn st_tile(
     z: i32,
     x: i32,
     y: i32,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
     crate::pyramid::validate_identifier(name)?;
     if !(0..=24).contains(&z) {
         return Err(format!("zoom level {z} out of range").into());

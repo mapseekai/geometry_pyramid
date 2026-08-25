@@ -5,6 +5,7 @@ use crate::config::{CatalogRow, PyramidConfig};
 use crate::source::PyramidSource;
 use crate::storage;
 use pgrx::prelude::*;
+use std::error::Error;
 
 /// `ST_BuildPyramid(table, geom_column, fid_column, config_json) -> bool`
 ///
@@ -17,7 +18,7 @@ fn st_build_pyramid(
     geom_column: &str,
     fid_column: &str,
     config: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let cfg = PyramidConfig::parse(config)?;
     validate_identifier(table)?;
     validate_identifier(geom_column)?;
@@ -68,7 +69,7 @@ fn st_build_pyramid(
 
 /// `ST_DropPyramid(name) -> bool`
 #[pg_extern(name = "st_droppyramid")]
-fn st_drop_pyramid(name: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+fn st_drop_pyramid(name: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
     validate_identifier(name)?;
     let removed = Spi::get_one_with_args::<i64>(
         "WITH d AS (DELETE FROM geometry_pyramid_catalog WHERE pyramid_name = $1 RETURNING 1) \
@@ -132,9 +133,7 @@ fn st_drop_pyramid(name: &str) -> Result<bool, Box<dyn std::error::Error + Send 
 /// (one pass, no intermediate `Value` clone). The three identifiers are
 /// re-validated before they ride into dynamic SQL — defense-in-depth, matching
 /// ST_BuildPyramid.
-pub(crate) fn catalog_meta(
-    name: &str,
-) -> Result<Option<CatalogRow>, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn catalog_meta(name: &str) -> Result<Option<CatalogRow>, Box<dyn Error + Send + Sync>> {
     // to_regclass($2) folds the storage-table existence check into this same
     // round-trip (it returns NULL rather than erroring on a missing relation),
     // so the hot ST_Tile path no longer needs a separate to_regclass query.
@@ -159,10 +158,7 @@ pub(crate) fn catalog_meta(
 }
 
 #[pg_extern(name = "st_updatepyramid")]
-fn st_update_pyramid(
-    name: &str,
-    where_clause: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+fn st_update_pyramid(name: &str, where_clause: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
     validate_identifier(name)?;
 
     let Some(meta) = catalog_meta(name)? else {
@@ -222,7 +218,7 @@ fn st_update_pyramid_by_extent(
     xmax: f64,
     ymax: f64,
     srid: i32,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     validate_identifier(name)?;
     let Some(meta) = catalog_meta(name)? else {
         return Ok(false);
@@ -310,9 +306,7 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
 ///
 /// The 45-char cap reserves headroom for PG's 63-byte identifier limit:
 /// the longest derived name is `_gp_tiles_`(10) + name(45) + `__shadow`(8) = 63.
-pub(crate) fn validate_identifier(
-    ident: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn validate_identifier(ident: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if ident.is_empty() {
         return Err("identifier must not be empty".into());
     }

@@ -11,6 +11,7 @@ import re
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import psycopg
 
@@ -28,6 +29,8 @@ _STATIC = {
     "/maplibre-gl.css": ("maplibre-gl.css", "text/css; charset=utf-8"),
 }
 
+_CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
 
 def parse_tile_path(path):
     """Return (name, z, x, y) for a valid tile path, else None.
@@ -41,20 +44,24 @@ def parse_tile_path(path):
 
 
 # Lazily-initialized module connection (set in main(), not at import time).
-_CONN = None
+_CONN: psycopg.Connection[Any] | None = None
 
 
 def _fetch_tile(name, z, x, y):
     """Run ST_Tile; return bytes (possibly empty) or None on SQL NULL."""
     global _CONN
+    conn = _CONN
+    if conn is None:
+        raise RuntimeError("database connection is not initialized")
     try:
-        with _CONN.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("SELECT ST_Tile(%s, %s, %s, %s)", (name, z, x, y))
             row = cur.fetchone()
     except psycopg.Error:
         # One reconnect attempt, then let errors propagate to the handler (→ 500).
-        _CONN = psycopg.connect(os.environ.get("DATABASE_URL", ""), autocommit=True)
-        with _CONN.cursor() as cur:
+        conn = psycopg.connect(os.environ.get("DATABASE_URL", ""), autocommit=True)
+        _CONN = conn
+        with conn.cursor() as cur:
             cur.execute("SELECT ST_Tile(%s, %s, %s, %s)", (name, z, x, y))
             row = cur.fetchone()
     return row[0] if row else None
@@ -62,13 +69,16 @@ def _fetch_tile(name, z, x, y):
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+        except _CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -97,8 +107,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, bytes(mvt), "application/vnd.mapbox-vector-tile")
 
-    def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+    def log_message(self, format, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
 
 def main():

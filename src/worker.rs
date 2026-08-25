@@ -1,16 +1,26 @@
-//! Background-worker control plane. Specs and completion status travel
+//! Background-worker control plane. Jobs and completion status travel
 //! through files under $PGDATA/gp_tmp/ because the coordinator's
 //! transaction is uncommitted — its catalog rows and job rows would be
 //! invisible to workers under MVCC; files are not.
 
 use crate::config::PyramidConfig;
 use crate::tile_rect::TileRect;
+use pgrx::bgworkers::{
+    BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
+};
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::ffi::CStr;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::slice;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct WorkerSpec {
+pub(crate) struct Job {
     pub db_oid: u32,
     pub mode: WorkerMode,
 }
@@ -42,7 +52,7 @@ pub(crate) enum WorkerMode {
 }
 
 /// Serializable snapshot of build.rs's ZoomKnobs (the budget-retry loop
-/// tightens these per attempt, so they ride along with each round's spec).
+/// tightens these per attempt, so they ride along with each round's job).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub(crate) struct KnobValues {
     pub simplify_tol_m: f64,
@@ -51,48 +61,48 @@ pub(crate) struct KnobValues {
     pub drop_threshold: f64,
 }
 
-pub(crate) fn spec_filename(backend_pid: u32, idx: u32) -> String {
+pub(crate) fn job_filename(backend_pid: u32, idx: u32) -> String {
     format!("gp_{backend_pid}_{idx}.json")
 }
 
 /// $PGDATA/gp_tmp — created on demand. Must only be called inside a backend
 /// or background-worker process, where `pg_sys::DataDir` is initialized; the
 /// assertion guards against misuse from early `_PG_init`.
-pub(crate) fn spec_dir() -> PathBuf {
+pub(crate) fn job_dir() -> PathBuf {
     let datadir = unsafe {
         let ptr = pg_sys::DataDir;
         assert!(
             !ptr.is_null(),
-            "DataDir is NULL — spec_dir called outside backend context"
+            "DataDir is NULL — job_dir called outside backend context"
         );
-        std::ffi::CStr::from_ptr(ptr as *const _)
+        CStr::from_ptr(ptr as *const _)
             .to_string_lossy()
             .into_owned()
     };
     PathBuf::from(datadir).join("gp_tmp")
 }
 
-/// Write a spec file, clearing any stale `.done`/`.err` status. The caller
-/// MUST write the spec BEFORE starting the worker that reads it: the worker
+/// Write a job file, clearing any stale `.done`/`.err` status. The caller
+/// MUST write the job BEFORE starting the worker that reads it: the worker
 /// opens the file by name, so an overwrite after it has opened would not be
 /// observed.
-pub(crate) fn write_spec(
+pub(crate) fn write_job(
     filename: &str,
-    spec: &WorkerSpec,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let dir = spec_dir();
-    std::fs::create_dir_all(&dir)?;
+    job: &Job,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let dir = job_dir();
+    fs::create_dir_all(&dir)?;
     let path = dir.join(filename);
-    let _ = std::fs::remove_file(path.with_extension("done"));
-    let _ = std::fs::remove_file(path.with_extension("err"));
-    std::fs::write(&path, serde_json::to_vec(spec)?)?;
+    let _ = fs::remove_file(path.with_extension("done"));
+    let _ = fs::remove_file(path.with_extension("err"));
+    fs::write(&path, serde_json::to_vec(job)?)?;
     Ok(path)
 }
 
-pub(crate) fn cleanup_spec(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("done"));
-    let _ = std::fs::remove_file(path.with_extension("err"));
+pub(crate) fn cleanup_job(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("done"));
+    let _ = fs::remove_file(path.with_extension("err"));
 }
 
 #[cfg(test)]
@@ -102,8 +112,8 @@ mod tests {
     use crate::tile_rect::TileRect;
 
     #[test]
-    fn spec_roundtrips_through_json() {
-        let spec = WorkerSpec {
+    fn job_roundtrips_through_json() {
+        let job = Job {
             db_oid: 16384,
             mode: WorkerMode::BuildStrips {
                 pyramid_name: "p".into(),
@@ -129,8 +139,8 @@ mod tests {
                 feature_driven: true,
             },
         };
-        let json = serde_json::to_string(&spec).unwrap();
-        let back: WorkerSpec = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&job).unwrap();
+        let back: Job = serde_json::from_str(&json).unwrap();
         let WorkerMode::BuildStrips {
             strips,
             knobs,
@@ -150,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn spec_filename_fits_bgw_extra() {
+    fn job_filename_fits_bgw_extra() {
         // bgw_extra is 128 bytes including NUL.
-        let name = spec_filename(u32::MAX, u32::MAX);
+        let name = job_filename(u32::MAX, u32::MAX);
         assert!(name.len() < 127);
     }
 }
@@ -161,58 +171,52 @@ mod tests {
 // Background-worker runtime (entry point + helpers)
 // ---------------------------------------------------------------------------
 
-use pgrx::bgworkers::{
-    BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
-};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-
-/// Per-backend counter so successive workers never reuse a spec filename
+/// Per-backend counter so successive workers never reuse a job filename
 /// within the same backend (which would clobber each other's status files,
-/// or let a slow-to-start worker read a spec already overwritten by a later
-/// round). Combined with the backend PID this makes every spec path unique.
-pub(crate) static NEXT_SPEC_IDX: AtomicU32 = AtomicU32::new(0);
+/// or let a slow-to-start worker read a job already overwritten by a later
+/// round). Combined with the backend PID this makes every job path unique.
+pub(crate) static NEXT_JOB_IDX: AtomicU32 = AtomicU32::new(0);
 
-/// Allocate a process-unique spec index. Use for every spawned worker.
-pub(crate) fn next_spec_idx() -> u32 {
-    NEXT_SPEC_IDX.fetch_add(1, Ordering::Relaxed)
+/// Allocate a process-unique job index. Use for every spawned worker.
+pub(crate) fn next_job_idx() -> u32 {
+    NEXT_JOB_IDX.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Entry point for dynamic background workers. bgw_extra carries the spec
+/// Entry point for dynamic background workers. bgw_extra carries the job
 /// FILENAME; the worker derives the directory from its own DataDir.
 #[pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
     let filename = BackgroundWorker::get_extra().to_string();
-    let path = spec_dir().join(&filename);
+    let path = job_dir().join(&filename);
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let spec: WorkerSpec = match std::fs::read_to_string(&path)
+    let job: Job = match fs::read_to_string(&path)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
     {
         Ok(s) => s,
         Err(e) => {
-            let _ = std::fs::write(path.with_extension("err"), format!("bad spec: {e}"));
+            let _ = fs::write(path.with_extension("err"), format!("bad job: {e}"));
             return;
         }
     };
 
-    BackgroundWorker::connect_worker_to_spi_by_oid(Some(pg_sys::Oid::from(spec.db_oid)), None);
+    BackgroundWorker::connect_worker_to_spi_by_oid(Some(pg_sys::Oid::from(job.db_oid)), None);
 
-    match run_spec(&spec) {
+    match run_job(&job) {
         Ok(()) => {
-            let _ = std::fs::write(path.with_extension("done"), b"ok");
+            let _ = fs::write(path.with_extension("done"), b"ok");
         }
         Err(e) => {
-            let _ = std::fs::write(path.with_extension("err"), e.to_string());
+            let _ = fs::write(path.with_extension("err"), e.to_string());
         }
     }
 }
 
-fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match &spec.mode {
+fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match &job.mode {
         WorkerMode::ExecSql { sql } => {
             let result: Result<(), pgrx::spi::Error> =
                 BackgroundWorker::transaction(|| pgrx::Spi::run(sql));
@@ -264,12 +268,12 @@ fn run_spec(spec: &WorkerSpec) -> Result<(), Box<dyn std::error::Error + Send + 
     }
 }
 
-/// Spawn one dynamic worker for an already-written spec file. Returns the
+/// Spawn one dynamic worker for an already-written job file. Returns the
 /// handle, or Err when no worker slot is available (caller degrades to
 /// inline execution).
 pub(crate) fn spawn(
     filename: &str,
-) -> Result<DynamicBackgroundWorker, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DynamicBackgroundWorker, Box<dyn Error + Send + Sync>> {
     BackgroundWorkerBuilder::new("geometry_pyramid worker")
         .set_function("gp_worker_main")
         .set_library("geometry_pyramid")
@@ -286,29 +290,27 @@ pub(crate) fn spawn(
 pub(crate) fn exec_sql_autonomous_timeout(
     sql: &str,
     timeout_ms: i64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filename = spec_filename(unsafe { pg_sys::MyProcPid } as u32, next_spec_idx());
-    let spec = WorkerSpec {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let filename = job_filename(unsafe { pg_sys::MyProcPid } as u32, next_job_idx());
+    let job = Job {
         db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
         mode: WorkerMode::ExecSql {
             sql: sql.to_string(),
         },
     };
-    let path = write_spec(&filename, &spec)?;
+    let path = write_job(&filename, &job)?;
     let _handle = spawn(&filename)?;
-    let result = wait_for(std::slice::from_ref(&path), timeout_ms);
-    cleanup_spec(&path);
+    let result = wait_for(slice::from_ref(&path), timeout_ms);
+    cleanup_job(&path);
     result
 }
 
 /// Run committed DDL with the default 60s budget (fast schema-only work).
-pub(crate) fn exec_sql_autonomous(
-    sql: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn exec_sql_autonomous(sql: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     exec_sql_autonomous_timeout(sql, 60_000)
 }
 
-/// Poll status files until every spec is done, any errors out, or the
+/// Poll status files until every job is done, any errors out, or the
 /// timeout (ms, 0 = unbounded) elapses.
 ///
 /// A worker that dies without writing a status file (e.g. an OS kill, or a
@@ -319,14 +321,14 @@ pub(crate) fn exec_sql_autonomous(
 pub(crate) fn wait_for(
     paths: &[PathBuf],
     timeout_ms: i64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let started = std::time::Instant::now();
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let started = Instant::now();
     loop {
         let mut pending = 0usize;
         for p in paths {
             let err_path = p.with_extension("err");
             if err_path.exists() {
-                let msg = std::fs::read_to_string(&err_path).unwrap_or_default();
+                let msg = fs::read_to_string(&err_path).unwrap_or_default();
                 return Err(format!("worker failed: {msg}").into());
             }
             if !p.with_extension("done").exists() {
@@ -340,6 +342,6 @@ pub(crate) fn wait_for(
             return Err(format!("timed out waiting for {pending} worker(s)").into());
         }
         pgrx::check_for_interrupts!();
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
     }
 }

@@ -1,0 +1,7 @@
+{
+  "updatedAt": "2026-07-16T14:02:12.587Z",
+  "command": "chat-usage-config-clarification-update",
+  "gitHead": "a5ae46591ec4369f71e3a5696110dd83878f949a",
+  "model": "gpt-5.5",
+  "notes": "Expanded English and Chinese usage guides with detailed parameter meanings, tuning guidance, tradeoffs, and buildRules nested field explanations."
+}

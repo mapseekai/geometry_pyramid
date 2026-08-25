@@ -1,0 +1,10 @@
+{
+  "name": "geometry-pyramid-openwiki-workflow",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "openwiki": "0.3.3"
+  }
+}

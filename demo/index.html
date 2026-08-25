@@ -26,15 +26,38 @@
             #hud b {
                 color: #6cf;
             }
+            #hud label {
+                display: block;
+                margin-top: 5px;
+                color: #d6e3ea;
+                white-space: nowrap;
+            }
+            #hud input {
+                margin: 0 5px 0 0;
+                vertical-align: -2px;
+            }
         </style>
     </head>
     <body>
         <div id="map"></div>
-        <div id="hud">z=<b id="z">0</b> · <span id="mode"></span></div>
+        <div id="hud">
+            z=<b id="z">0</b> · <span id="mode"></span>
+            <label
+                ><input id="basemap-toggle" type="checkbox" />online
+                basemap</label
+            >
+        </div>
         <script src="./maplibre-gl.js"></script>
         <script>
-            const PYRAMID = "fhd2ehoeaqairlr5w8fl7acw";
-            const MAX_ZOOM = 8; // pyramid maxZoom; beyond this -> dynamic slicing
+            const PYRAMID = "points_3857";
+            const MAX_ZOOM = 12; // pyramid maxZoom; beyond this -> dynamic slicing
+            const BASEMAP_SOURCE_ID = "osm";
+            const BASEMAP_LAYER_ID = "osm-raster";
+            const BASEMAP_TILES = [
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            ];
+            const BASEMAP_ATTRIBUTION =
+                '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
             const map = new maplibregl.Map({
                 container: "map",
                 style: {
@@ -70,15 +93,57 @@
                 center: [120.23, 30.3],
                 zoom: 3,
             });
+            let styleReady = false;
             map.addControl(new maplibregl.NavigationControl());
+            function setBasemapVisible(visible) {
+                if (!styleReady) {
+                    return;
+                }
+                if (visible) {
+                    if (!map.getSource(BASEMAP_SOURCE_ID)) {
+                        map.addSource(BASEMAP_SOURCE_ID, {
+                            type: "raster",
+                            tiles: BASEMAP_TILES,
+                            tileSize: 256,
+                            maxzoom: 19,
+                            attribution: BASEMAP_ATTRIBUTION,
+                        });
+                    }
+                    if (!map.getLayer(BASEMAP_LAYER_ID)) {
+                        map.addLayer(
+                            {
+                                id: BASEMAP_LAYER_ID,
+                                type: "raster",
+                                source: BASEMAP_SOURCE_ID,
+                            },
+                            "f",
+                        );
+                    }
+                    return;
+                }
+                if (map.getLayer(BASEMAP_LAYER_ID)) {
+                    map.removeLayer(BASEMAP_LAYER_ID);
+                }
+                if (map.getSource(BASEMAP_SOURCE_ID)) {
+                    map.removeSource(BASEMAP_SOURCE_ID);
+                }
+            }
             function updateHud() {
                 const z = map.getZoom();
                 document.getElementById("z").textContent = z.toFixed(1);
                 document.getElementById("mode").textContent =
                     z > MAX_ZOOM ? "DYNAMIC (z > maxZoom)" : "materialized";
             }
+            const basemapToggle = document.getElementById("basemap-toggle");
+            basemapToggle.addEventListener("change", () => {
+                setBasemapVisible(basemapToggle.checked);
+            });
             map.on("zoom", updateHud);
-            map.on("load", updateHud);
+            map.on("load", () => {
+                styleReady = true;
+                updateHud();
+                setBasemapVisible(basemapToggle.checked);
+            });
         </script>
     </body>
 </html>

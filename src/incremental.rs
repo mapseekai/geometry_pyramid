@@ -7,14 +7,13 @@ use crate::source::PyramidSource;
 use crate::storage;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
+use std::error::Error;
+use std::time::Instant;
 
 /// Rebuild the tiles intersecting the extent of rows matched by
 /// `where_clause`. Returns the number of tiles rebuilt. Runs entirely in the
 /// caller's transaction: a failure rolls back to the intact pyramid.
-pub fn update(
-    src: PyramidSource,
-    where_clause: &str,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+pub fn update(src: PyramidSource, where_clause: &str) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Defensive pre-flight: surface a syntax / unknown-column error cleanly
     // before it is embedded in the larger extent query.
     Spi::run(&format!(
@@ -51,11 +50,11 @@ pub(crate) fn rebuild_extent(
     ymin_m: f64,
     xmax_m: f64,
     ymax_m: f64,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
     let storage_table = storage::tile_table_name(src.name);
     let mut rebuilt: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
         // Wipe the dirty rectangle, then rebuild it in place. Budget retry is
         // intentionally NOT applied here: a partial MAX(octet_length) check
@@ -119,7 +118,7 @@ pub fn update_extent(
     xmax: f64,
     ymax: f64,
     srid: i32,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Transform the caller bbox from `srid` into tileSRS, then take its four
     // edges. ST_MakeEnvelope normalizes min/max; bbox_from_query's CASE→NULL
     // guard turns a NULL transform result into a no-op Ok(0).

@@ -14,6 +14,7 @@
 
 use crate::source::PyramidSource;
 use pgrx::prelude::*;
+use std::error::Error;
 
 #[derive(Debug)]
 pub(crate) struct PreparedBuildSource {
@@ -52,10 +53,10 @@ impl PreparedBuildOptions {
 pub(crate) fn prepare_source_for_build(
     src: PyramidSource<'_>,
     options: PreparedBuildOptions,
-) -> Result<PreparedBuildSource, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PreparedBuildSource, Box<dyn Error + Send + Sync>> {
     let table = prepared_table_name(
         unsafe { pg_sys::MyProcPid } as u32,
-        crate::worker::next_spec_idx(),
+        crate::worker::next_job_idx(),
     );
     let attrs_inner = format!(
         "{}{}",
@@ -102,7 +103,7 @@ pub(crate) fn prepare_source_committed(
     src: PyramidSource<'_>,
     options: PreparedBuildOptions,
     timeout_ms: i64,
-) -> Result<PreparedBuildSource, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PreparedBuildSource, Box<dyn Error + Send + Sync>> {
     let table = prepared_table_name_for(src.name);
     let attrs_inner = format!(
         "{}{}",

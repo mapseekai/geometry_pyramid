@@ -9,7 +9,10 @@ use crate::config::PyramidConfig;
 use crate::source::PyramidSource;
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
+use std::error::Error;
 use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::time::Instant;
 
 /// Per-zoom build outcome, consumed by the stats layer.
 #[derive(Clone, Copy, Debug)]
@@ -23,10 +26,7 @@ pub struct ZoomBuildResult {
 }
 
 /// (tile_count, total_bytes, max_tile_bytes) for one zoom of a tile table.
-fn zoom_stats(
-    storage_table: &str,
-    z: u8,
-) -> Result<(i64, i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+fn zoom_stats(storage_table: &str, z: u8) -> Result<(i64, i64, i64), Box<dyn Error + Send + Sync>> {
     let row: Option<String> = Spi::get_one_with_args(
         &format!(
             r#"SELECT json_build_array(
@@ -48,7 +48,7 @@ fn zoom_stats(
 /// a shadow table, then atomically swaps the shadow into place as the main
 /// tile table. If anything fails before the swap, the transaction aborts and
 /// the shadow DDL is rolled back — leaving the previous main table untouched.
-pub fn build(src: PyramidSource) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Serialize concurrent builds of the same pyramid for this transaction.
     // The advisory-lock namespace is cluster-global (shared across all
     // databases); the `geometry_pyramid:` prefix makes a collision with an
@@ -93,7 +93,7 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn std::error::Error + Send
 fn build_into(
     src: PyramidSource,
     storage_table: &str,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Validate each LOD rule's filter against the src up front, so a bad
     // expr fails cleanly (naming the rule) before any prep/shadow work and
     // never leaves a partial pyramid. `AND false` makes it a pure parse/column
@@ -107,9 +107,7 @@ fn build_into(
             src.source_table, filter
         );
         Spi::run(&probe).map_err(|e| {
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "buildRules[{k}] filter is invalid: {e}"
-            ))
+            Box::<dyn Error + Send + Sync>::from(format!("buildRules[{k}] filter is invalid: {e}"))
         })?;
     }
 
@@ -301,7 +299,7 @@ fn config_allows_feature_driven(cfg: &PyramidConfig) -> bool {
 fn feature_driven_prep_stats(
     prepared: &crate::prepared::PreparedBuildSource,
     max_zoom: u8,
-) -> Result<(i64, i64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(i64, i64), Box<dyn Error + Send + Sync>> {
     // `tw` (tile side in metres at maxZoom) is computed in SQL from the integer
     // zoom so no float is interpolated into the statement.
     let sql = format!(
@@ -335,7 +333,7 @@ fn should_use_feature_driven(
     src: PyramidSource,
     prepared: &crate::prepared::PreparedBuildSource,
     bbox_m: (f64, f64, f64, f64),
-) -> Result<(bool, i64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(bool, i64), Box<dyn Error + Send + Sync>> {
     if !src.cfg.feature_driven_enum {
         return Ok((false, 0));
     }
@@ -389,9 +387,9 @@ fn build_zoom_level_with_budget(
     prepared: Option<&crate::prepared::PreparedBuildSource>,
     feature_major_points: bool,
     feature_driven: bool,
-) -> Result<ZoomBuildResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ZoomBuildResult, Box<dyn Error + Send + Sync>> {
     let cfg = src.cfg;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let z = rect.z;
     let pixel_m = cfg.pixel_size_m(z);
     let mut knobs = ZoomKnobs::from_config(cfg, z);
@@ -522,7 +520,7 @@ impl ZoomKnobs {
 pub(crate) fn bbox_from_query(
     inner_sql: &str,
     args: &[pgrx::datum::DatumWithOid],
-) -> Result<Option<[f64; 4]>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<[f64; 4]>, Box<dyn Error + Send + Sync>> {
     let sql = format!(
         "SELECT CASE WHEN g IS NOT NULL \
                 THEN json_build_array(ST_XMin(g), ST_YMin(g), ST_XMax(g), ST_YMax(g))::text \
@@ -538,7 +536,7 @@ fn source_bbox(
     table: &str,
     geom_column: &str,
     tile_srs: i32,
-) -> Result<Option<(f64, f64, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<(f64, f64, f64, f64)>, Box<dyn Error + Send + Sync>> {
     // Identifiers are validated by callers.
     let inner = format!(
         r#"SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS g
@@ -609,7 +607,7 @@ fn run_zoom_strips(
     prepared: Option<&crate::prepared::PreparedBuildSource>,
     feature_major_points: bool,
     feature_driven: bool,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
     let workers = src.cfg.effective_parallel() - 1;
     if workers == 0 || rect.cell_count() <= PARALLEL_MIN_CELLS {
         build_zoom_level_dispatch(
@@ -639,7 +637,7 @@ fn run_zoom_strips(
     // feature-major-points path never reaches here (it stays parallel=1).
     let prepared_table = prepared.map(|p| p.table.clone());
 
-    let mut spec_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut job_paths: Vec<PathBuf> = Vec::new();
     let mut handles: Vec<pgrx::bgworkers::DynamicBackgroundWorker> = Vec::new();
     let mut inline_strips: Vec<TileRect> = Vec::new();
 
@@ -652,13 +650,13 @@ fn run_zoom_strips(
             continue;
         }
         // Use a process-unique index, not `slot`: slot numbers repeat every
-        // zoom round, so a worker slow to start could otherwise read a spec
+        // zoom round, so a worker slow to start could otherwise read a job
         // file already overwritten by a later round.
-        let filename = crate::worker::spec_filename(
+        let filename = crate::worker::job_filename(
             unsafe { pg_sys::MyProcPid } as u32,
-            crate::worker::next_spec_idx(),
+            crate::worker::next_job_idx(),
         );
-        let spec = crate::worker::WorkerSpec {
+        let job = crate::worker::Job {
             db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
             mode: crate::worker::WorkerMode::BuildStrips {
                 pyramid_name: src.name.to_string(),
@@ -673,10 +671,10 @@ fn run_zoom_strips(
                 feature_driven,
             },
         };
-        let path = crate::worker::write_spec(&filename, &spec)?;
+        let path = crate::worker::write_job(&filename, &job)?;
         match crate::worker::spawn(&filename) {
             Ok(handle) => {
-                spec_paths.push(path);
+                job_paths.push(path);
                 handles.push(handle);
             }
             Err(e) => {
@@ -685,7 +683,7 @@ fn run_zoom_strips(
                     slot,
                     e
                 );
-                crate::worker::cleanup_spec(&path);
+                crate::worker::cleanup_job(&path);
                 inline_strips.extend(chunk);
             }
         }
@@ -704,9 +702,9 @@ fn run_zoom_strips(
         )?;
     }
 
-    let wait_result = crate::worker::wait_for(&spec_paths, src.cfg.build_timeout_ms);
-    for p in &spec_paths {
-        crate::worker::cleanup_spec(p);
+    let wait_result = crate::worker::wait_for(&job_paths, src.cfg.build_timeout_ms);
+    for p in &job_paths {
+        crate::worker::cleanup_job(p);
     }
     // Keep worker handles alive until after wait_for; drop them now.
     drop(handles);
