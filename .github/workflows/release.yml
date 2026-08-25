@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Package PostgreSQL 17 extension
+    runs-on: ubuntu-24.04
+    env:
+      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Verify the tag matches the crate version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "geometry_pyramid") | .version')"
+          expected_tag="v${cargo_version}"
+
+          if [ "${TAG}" != "${expected_tag}" ]; then
+            echo "Tag ${TAG} does not match Cargo.toml version ${cargo_version}; expected ${expected_tag}." >&2
+            exit 1
+          fi
+
+          printf 'tag=%s\n' "${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install PostgreSQL 17 development files
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /tmp/postgresql.asc
+          sudo gpg --dearmor --yes --output /etc/apt/keyrings/postgresql.gpg /tmp/postgresql.asc
+          printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-server-dev-17
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx --version 0.18.0
+
+      - name: Build the PostgreSQL 17 package
+        run: cargo pgrx package --pg-config "${PG_CONFIG}" --out-dir package
+
+      - name: Create a release archive and checksum
+        id: archive
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p dist
+          archive="dist/geometry_pyramid-${TAG}-pg17-ubuntu-24.04-x86_64.tar.gz"
+          tar --directory package --create --gzip --file "${archive}" .
+          (
+            cd dist
+            sha256sum "$(basename "${archive}")" > "$(basename "${archive}").sha256"
+          )
+          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
+          printf 'checksum=%s\n' "${archive}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.archive.outputs.archive }}
+          CHECKSUM: ${{ steps.archive.outputs.checksum }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ARCHIVE}" "${CHECKSUM}" --clobber
+          else
+            gh release create "${TAG}" --verify-tag --title "geometry_pyramid ${TAG}" --generate-notes "${ARCHIVE}" "${CHECKSUM}"
+          fi
