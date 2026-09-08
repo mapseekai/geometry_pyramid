@@ -1,0 +1,1107 @@
+{
+  "method": "one warmup + three timed full ST_BuildPyramid calls; client wall includes commit; drop excluded",
+  "cases": [
+    {
+      "source": "points_3857",
+      "source_rows": 250988,
+      "source_vertices": 250988,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": false,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": [
+          "id"
+        ]
+      },
+      "runs_ms": [
+        4672.919,
+        4537.331,
+        4581.657,
+        4667.81
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          6727175,
+          6727175,
+          382,
+          1
+        ],
+        [
+          1,
+          1,
+          6727175,
+          6727175,
+          392,
+          1
+        ],
+        [
+          2,
+          1,
+          6727175,
+          6727175,
+          391,
+          1
+        ],
+        [
+          3,
+          1,
+          6727175,
+          6727175,
+          391,
+          1
+        ],
+        [
+          4,
+          1,
+          6727175,
+          6727175,
+          385,
+          1
+        ],
+        [
+          5,
+          1,
+          6727175,
+          6727175,
+          545,
+          1
+        ],
+        [
+          6,
+          1,
+          6727175,
+          6727175,
+          403,
+          1
+        ],
+        [
+          7,
+          1,
+          6727175,
+          6727175,
+          416,
+          1
+        ],
+        [
+          8,
+          1,
+          6727175,
+          6727175,
+          399,
+          1
+        ],
+        [
+          9,
+          4,
+          6807748,
+          3560358,
+          416,
+          1
+        ],
+        [
+          10,
+          11,
+          6741418,
+          3493654,
+          519,
+          1
+        ]
+      ],
+      "median_ms": 4581.657,
+      "semantic_sha256": "a01f6912e07d46e8d68f6a286c7441bc1f1035e1e9c7d4de829ab769c18ff4b7",
+      "feature_count": 2769411
+    },
+    {
+      "source": "points_3857",
+      "source_rows": 250988,
+      "source_vertices": 250988,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": [
+          "id"
+        ]
+      },
+      "runs_ms": [
+        5532.899,
+        5561.611,
+        5145.853,
+        5161.122
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          6727175,
+          6727175,
+          435,
+          1
+        ],
+        [
+          1,
+          1,
+          6727175,
+          6727175,
+          464,
+          1
+        ],
+        [
+          2,
+          1,
+          6727175,
+          6727175,
+          421,
+          1
+        ],
+        [
+          3,
+          1,
+          6727175,
+          6727175,
+          426,
+          1
+        ],
+        [
+          4,
+          1,
+          6727175,
+          6727175,
+          435,
+          1
+        ],
+        [
+          5,
+          1,
+          6727175,
+          6727175,
+          446,
+          1
+        ],
+        [
+          6,
+          1,
+          6727175,
+          6727175,
+          442,
+          1
+        ],
+        [
+          7,
+          1,
+          6727175,
+          6727175,
+          445,
+          1
+        ],
+        [
+          8,
+          1,
+          6727175,
+          6727175,
+          462,
+          1
+        ],
+        [
+          9,
+          4,
+          6807748,
+          3560358,
+          440,
+          1
+        ],
+        [
+          10,
+          11,
+          6741418,
+          3493654,
+          408,
+          1
+        ]
+      ],
+      "median_ms": 5161.122,
+      "semantic_sha256": "a01f6912e07d46e8d68f6a286c7441bc1f1035e1e9c7d4de829ab769c18ff4b7",
+      "feature_count": 2769411
+    },
+    {
+      "source": "big_line_3857",
+      "source_rows": 251014,
+      "source_vertices": 1534849,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": false,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        18635.69,
+        16936.289,
+        16873.573,
+        17151.162
+      ],
+      "zoom_stats": [
+        [
+          0,
+          0,
+          0,
+          0,
+          1125,
+          1
+        ],
+        [
+          1,
+          0,
+          0,
+          0,
+          1127,
+          1
+        ],
+        [
+          2,
+          0,
+          0,
+          0,
+          1127,
+          1
+        ],
+        [
+          3,
+          1,
+          112,
+          112,
+          1146,
+          1
+        ],
+        [
+          4,
+          1,
+          1366,
+          1366,
+          1115,
+          1
+        ],
+        [
+          5,
+          1,
+          26019,
+          26019,
+          1239,
+          1
+        ],
+        [
+          6,
+          1,
+          291082,
+          291082,
+          1274,
+          1
+        ],
+        [
+          7,
+          1,
+          1574563,
+          1574563,
+          1608,
+          1
+        ],
+        [
+          8,
+          1,
+          3752972,
+          3752972,
+          2183,
+          1
+        ],
+        [
+          9,
+          4,
+          5578919,
+          2913430,
+          2535,
+          1
+        ],
+        [
+          10,
+          11,
+          6079455,
+          3138346,
+          2635,
+          1
+        ]
+      ],
+      "median_ms": 16936.289,
+      "semantic_sha256": "e4598a9bac93c4cc8ff33705b502876482ccc3dfecb0f87b66007911ce45529d",
+      "feature_count": 765669
+    },
+    {
+      "source": "big_line_3857",
+      "source_rows": 251014,
+      "source_vertices": 1534849,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        17595.382,
+        16946.537,
+        17836.469,
+        17056.234
+      ],
+      "zoom_stats": [
+        [
+          0,
+          0,
+          0,
+          0,
+          1103,
+          1
+        ],
+        [
+          1,
+          0,
+          0,
+          0,
+          1129,
+          1
+        ],
+        [
+          2,
+          0,
+          0,
+          0,
+          1107,
+          1
+        ],
+        [
+          3,
+          1,
+          112,
+          112,
+          1109,
+          1
+        ],
+        [
+          4,
+          1,
+          1366,
+          1366,
+          1108,
+          1
+        ],
+        [
+          5,
+          1,
+          26019,
+          26019,
+          1126,
+          1
+        ],
+        [
+          6,
+          1,
+          291082,
+          291082,
+          1220,
+          1
+        ],
+        [
+          7,
+          1,
+          1574563,
+          1574563,
+          1638,
+          1
+        ],
+        [
+          8,
+          1,
+          3752972,
+          3752972,
+          2128,
+          1
+        ],
+        [
+          9,
+          4,
+          5578919,
+          2913430,
+          2499,
+          1
+        ],
+        [
+          10,
+          11,
+          6079455,
+          3138346,
+          2576,
+          1
+        ]
+      ],
+      "median_ms": 17056.234,
+      "semantic_sha256": "e4598a9bac93c4cc8ff33705b502876482ccc3dfecb0f87b66007911ce45529d",
+      "feature_count": 765669
+    },
+    {
+      "source": "building_3857",
+      "source_rows": 251014,
+      "source_vertices": 1534849,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": false,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        20201.566,
+        19746.654,
+        19498.735,
+        19424.041
+      ],
+      "zoom_stats": [
+        [
+          0,
+          0,
+          0,
+          0,
+          1358,
+          1
+        ],
+        [
+          1,
+          0,
+          0,
+          0,
+          1378,
+          1
+        ],
+        [
+          2,
+          0,
+          0,
+          0,
+          1387,
+          1
+        ],
+        [
+          3,
+          0,
+          0,
+          0,
+          1376,
+          1
+        ],
+        [
+          4,
+          0,
+          0,
+          0,
+          1370,
+          1
+        ],
+        [
+          5,
+          1,
+          221,
+          221,
+          1730,
+          1
+        ],
+        [
+          6,
+          1,
+          4163,
+          4163,
+          1394,
+          1
+        ],
+        [
+          7,
+          1,
+          50376,
+          50376,
+          1439,
+          1
+        ],
+        [
+          8,
+          1,
+          434680,
+          434680,
+          1724,
+          1
+        ],
+        [
+          9,
+          4,
+          1920807,
+          1055958,
+          2674,
+          1
+        ],
+        [
+          10,
+          11,
+          4753912,
+          2479794,
+          3555,
+          1
+        ]
+      ],
+      "median_ms": 19498.735,
+      "semantic_sha256": "699856c3d6dcd36174d3c97c879365feedc60629c11e1ea9a286f9d10af66699",
+      "feature_count": 320152
+    },
+    {
+      "source": "building_3857",
+      "source_rows": 251014,
+      "source_vertices": 1534849,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        21309.28,
+        21055.376,
+        29252.999,
+        23909.697
+      ],
+      "zoom_stats": [
+        [
+          0,
+          0,
+          0,
+          0,
+          2141,
+          1
+        ],
+        [
+          1,
+          0,
+          0,
+          0,
+          2129,
+          1
+        ],
+        [
+          2,
+          0,
+          0,
+          0,
+          2165,
+          1
+        ],
+        [
+          3,
+          0,
+          0,
+          0,
+          2135,
+          1
+        ],
+        [
+          4,
+          0,
+          0,
+          0,
+          2026,
+          1
+        ],
+        [
+          5,
+          1,
+          221,
+          221,
+          1356,
+          1
+        ],
+        [
+          6,
+          1,
+          4163,
+          4163,
+          1376,
+          1
+        ],
+        [
+          7,
+          1,
+          50376,
+          50376,
+          1840,
+          1
+        ],
+        [
+          8,
+          1,
+          434680,
+          434680,
+          1806,
+          1
+        ],
+        [
+          9,
+          4,
+          1920807,
+          1055958,
+          2812,
+          1
+        ],
+        [
+          10,
+          11,
+          4753912,
+          2479794,
+          3623,
+          1
+        ]
+      ],
+      "median_ms": 23909.697,
+      "semantic_sha256": "699856c3d6dcd36174d3c97c879365feedc60629c11e1ea9a286f9d10af66699",
+      "feature_count": 320152
+    },
+    {
+      "source": "lucc_sample",
+      "source_rows": 250,
+      "source_vertices": 71042,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 6,
+        "preparedBuild": false,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        697.625,
+        698.374,
+        688.592,
+        684.781
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          258,
+          258,
+          61,
+          1
+        ],
+        [
+          1,
+          1,
+          1071,
+          1071,
+          71,
+          1
+        ],
+        [
+          2,
+          1,
+          3270,
+          3270,
+          84,
+          1
+        ],
+        [
+          3,
+          1,
+          7019,
+          7019,
+          93,
+          1
+        ],
+        [
+          4,
+          2,
+          14640,
+          13275,
+          104,
+          1
+        ],
+        [
+          5,
+          2,
+          27278,
+          24664,
+          121,
+          1
+        ],
+        [
+          6,
+          2,
+          47246,
+          42809,
+          145,
+          1
+        ]
+      ],
+      "median_ms": 688.592,
+      "semantic_sha256": "7c480c3d3958e7443b43c9e4246db2b4183135698ce54b4a08a6e6011eadaf88",
+      "feature_count": 1079
+    },
+    {
+      "source": "lucc_sample",
+      "source_rows": 250,
+      "source_vertices": 71042,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 6,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": []
+      },
+      "runs_ms": [
+        694.72,
+        697.926,
+        694.732,
+        708.163
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          258,
+          258,
+          61,
+          1
+        ],
+        [
+          1,
+          1,
+          1071,
+          1071,
+          71,
+          1
+        ],
+        [
+          2,
+          1,
+          3270,
+          3270,
+          84,
+          1
+        ],
+        [
+          3,
+          1,
+          7019,
+          7019,
+          93,
+          1
+        ],
+        [
+          4,
+          2,
+          14640,
+          13275,
+          109,
+          1
+        ],
+        [
+          5,
+          2,
+          27278,
+          24664,
+          125,
+          1
+        ],
+        [
+          6,
+          2,
+          47246,
+          42809,
+          150,
+          1
+        ]
+      ],
+      "median_ms": 697.926,
+      "semantic_sha256": "7c480c3d3958e7443b43c9e4246db2b4183135698ce54b4a08a6e6011eadaf88",
+      "feature_count": 1079
+    },
+    {
+      "source": "points_4326",
+      "source_rows": 250988,
+      "source_vertices": 250988,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 4326,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": false,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": [
+          "id"
+        ]
+      },
+      "runs_ms": [
+        5380.917,
+        5086.284,
+        5102.396,
+        5004.74
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          6727175,
+          6727175,
+          486,
+          1
+        ],
+        [
+          1,
+          1,
+          6727175,
+          6727175,
+          487,
+          1
+        ],
+        [
+          2,
+          1,
+          6727175,
+          6727175,
+          422,
+          1
+        ],
+        [
+          3,
+          1,
+          6727175,
+          6727175,
+          445,
+          1
+        ],
+        [
+          4,
+          1,
+          6727175,
+          6727175,
+          443,
+          1
+        ],
+        [
+          5,
+          1,
+          6727175,
+          6727175,
+          436,
+          1
+        ],
+        [
+          6,
+          1,
+          6727175,
+          6727175,
+          438,
+          1
+        ],
+        [
+          7,
+          1,
+          6727175,
+          6727175,
+          446,
+          1
+        ],
+        [
+          8,
+          1,
+          6727175,
+          6727175,
+          453,
+          1
+        ],
+        [
+          9,
+          4,
+          6807382,
+          3560304,
+          453,
+          1
+        ],
+        [
+          10,
+          11,
+          6741054,
+          3493600,
+          447,
+          1
+        ]
+      ],
+      "median_ms": 5086.284,
+      "semantic_sha256": "3a8c49800ad5ad7ef342b1c8005eb4db4d07dfc6fa892dfdbdea0342cbb599d2",
+      "feature_count": 2769383
+    },
+    {
+      "source": "points_4326",
+      "source_rows": 250988,
+      "source_vertices": 250988,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 4326,
+        "tileSRS": 3857,
+        "minZoom": 0,
+        "maxZoom": 10,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": false,
+        "attributes": [
+          "id"
+        ]
+      },
+      "runs_ms": [
+        5028.278,
+        5162.027,
+        5729.357,
+        5176.417
+      ],
+      "zoom_stats": [
+        [
+          0,
+          1,
+          6727175,
+          6727175,
+          437,
+          1
+        ],
+        [
+          1,
+          1,
+          6727175,
+          6727175,
+          415,
+          1
+        ],
+        [
+          2,
+          1,
+          6727175,
+          6727175,
+          413,
+          1
+        ],
+        [
+          3,
+          1,
+          6727175,
+          6727175,
+          440,
+          1
+        ],
+        [
+          4,
+          1,
+          6727175,
+          6727175,
+          443,
+          1
+        ],
+        [
+          5,
+          1,
+          6727175,
+          6727175,
+          481,
+          1
+        ],
+        [
+          6,
+          1,
+          6727175,
+          6727175,
+          452,
+          1
+        ],
+        [
+          7,
+          1,
+          6727175,
+          6727175,
+          452,
+          1
+        ],
+        [
+          8,
+          1,
+          6727175,
+          6727175,
+          445,
+          1
+        ],
+        [
+          9,
+          4,
+          6807748,
+          3560358,
+          448,
+          1
+        ],
+        [
+          10,
+          11,
+          6741418,
+          3493654,
+          399,
+          1
+        ]
+      ],
+      "median_ms": 5176.417,
+      "semantic_sha256": "a01f6912e07d46e8d68f6a286c7441bc1f1035e1e9c7d4de829ab769c18ff4b7",
+      "feature_count": 2769411
+    }
+  ],
+  "build_library": "/tmp/gpopt-baseline",
+  "environment": [
+    "PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+    "POSTGIS=\"3.6.4 0\" [EXTENSION] PGSQL=\"170\" GEOS=\"3.14.1-CAPI-1.20.5\" PROJ=\"9.8.1 NETWORK_ENABLED=OFF URL_ENDPOINT=https://cdn.proj.org USER_WRITABLE_DIRECTORY=/Users/zhang/Library/Application Support/proj DATABASE_PATH=/opt/homebrew/Cellar/proj/9.8.1/share/proj/proj.db\" (compiled against PROJ 9.8.1) LIBXML=\"2.15.3\" LIBJSON=\"0.18\" LIBPROTOBUF=\"1.5.2\" WAGYU=\"0.5.0 (Internal)\"",
+    "4MB",
+    "off",
+    "0"
+  ]
+}

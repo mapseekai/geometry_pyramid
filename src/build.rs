@@ -73,6 +73,29 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
                 .into(),
         );
     }
+    // Every zoom in a small extent already runs inline in run_zoom_strips.
+    // Decide before creating worker-visible tables so such builds also avoid
+    // autonomous preparation, index/WAL overhead and worker startup entirely.
+    let source_bounds = if workers > 0 {
+        source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?
+    } else {
+        None
+    };
+    let mut execution_cfg = src.cfg.clone();
+    if workers > 0
+        && source_bounds.is_none_or(|(xmin, ymin, xmax, ymax)| {
+            TileRect::from_bbox_m(src.cfg.max_zoom, xmin, ymin, xmax, ymax).cell_count()
+                <= PARALLEL_MIN_CELLS
+        })
+    {
+        execution_cfg.parallel = 1;
+        notice!("geometry_pyramid: small extent uses local preparation and inline builds");
+    }
+    let src = PyramidSource {
+        cfg: &execution_cfg,
+        ..src
+    };
+    let workers = src.cfg.effective_parallel() - 1;
     if workers == 0 {
         // parallel=1: shadow lives in this transaction (no external worker needs to see it).
         crate::shadow::create(src.name)?;
@@ -83,7 +106,13 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
     }
     let shadow_table = crate::shadow::shadow_table_name(src.name);
 
-    let total = build_into(src, &shadow_table)?;
+    // A prepared table is authoritative for its own snapshot. Only reuse the
+    // source extent directly on the non-prepared path.
+    let total = build_into(
+        src,
+        &shadow_table,
+        source_bounds.filter(|_| !uses_prepared_build(src.cfg)),
+    )?;
 
     crate::shadow::swap(src.name)?;
     Ok(total)
@@ -93,6 +122,7 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
 fn build_into(
     src: PyramidSource,
     storage_table: &str,
+    source_bounds: Option<(f64, f64, f64, f64)>,
 ) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Validate each LOD rule's filter against the src up front, so a bad
     // expr fails cleanly (naming the rule) before any prep/shadow work and
@@ -111,16 +141,6 @@ fn build_into(
         })?;
     }
 
-    let bbox = source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?;
-    let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
-        notice!(
-            "geometry_pyramid: source table '{}' has no rows; pyramid '{}' is empty",
-            src.source_table,
-            src.name
-        );
-        return Ok(0); // empty shadow still gets swapped: empty source -> empty pyramid
-    };
-
     let parallel = src.cfg.effective_parallel() > 1;
     let mut prepared = if uses_prepared_build(src.cfg) {
         let options = if config_allows_feature_major_points(src.cfg) {
@@ -138,6 +158,32 @@ fn build_into(
         })
     } else {
         None
+    };
+    // Prepared geometry is already in tile SRS. Computing its extent here
+    // avoids transforming the complete source a second time just for the bbox.
+    let bbox = match prepared.as_ref() {
+        Some(p) => bbox_from_query(
+            &format!(r#"SELECT ST_Extent(geom_tile) AS g FROM "{}""#, p.table),
+            &[],
+        )?
+        .map(|[xmin, ymin, xmax, ymax]| (xmin, ymin, xmax, ymax)),
+        None => match source_bounds {
+            Some(bounds) => Some(bounds),
+            None => source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?,
+        },
+    };
+    let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
+        if parallel {
+            if let Some(p) = prepared.as_ref() {
+                crate::prepared::drop_prepared_committed(&p.table)?;
+            }
+        }
+        notice!(
+            "geometry_pyramid: source table '{}' has no rows; pyramid '{}' is empty",
+            src.source_table,
+            src.name
+        );
+        return Ok(0); // The caller still publishes the empty shadow.
     };
     let feature_major_points = if let Some(prepared) = prepared.as_mut() {
         should_use_feature_major_points(src, prepared)?
@@ -169,7 +215,7 @@ fn build_into(
             storage_table,
             &rect,
             prepared.as_ref(),
-            feature_major_points,
+            feature_major_points && rect.cell_count() > 1,
             feature_driven,
         )?;
         crate::stats::upsert_zoom_stats(src.name, &result)?;
@@ -296,27 +342,42 @@ fn config_allows_feature_driven(cfg: &PyramidConfig) -> bool {
 /// second value is exactly what the feature-driven path would enumerate at the
 /// most favorable zoom (largest `R(z)`); comparing it to `R(maxZoom)` decides
 /// whether the explode is ever worth it.
-fn feature_driven_prep_stats(
+pub(crate) fn feature_driven_prep_stats(
     prepared: &crate::prepared::PreparedBuildSource,
-    max_zoom: u8,
+    rect: &TileRect,
+    cfg: &PyramidConfig,
 ) -> Result<(i64, i64), Box<dyn Error + Send + Sync>> {
-    // `tw` (tile side in metres at maxZoom) is computed in SQL from the integer
-    // zoom so no float is interpolated into the statement.
+    // Match the actual buffer + safety-pad expansion and clamp to the same
+    // build rect. Unpadded envelope counts can underestimate work by 9x for
+    // small features and accidentally select the slower strategy.
     let sql = format!(
         r#"SELECT json_build_array(
                count(*),
-               COALESCE(sum(
-                 (floor((ST_XMax(geom_tile) + 20037508.342789244) / tw.w)
-                - floor((ST_XMin(geom_tile) + 20037508.342789244) / tw.w) + 1)
-               * (floor((20037508.342789244 - ST_YMin(geom_tile)) / tw.w)
-                - floor((20037508.342789244 - ST_YMax(geom_tile)) / tw.w) + 1)
-               ), 0)::bigint)::text
-           FROM "{table}",
-                (SELECT 40075016.685578488 / power(2.0, {max_zoom}::float8) AS w) tw
-           WHERE geom_tile IS NOT NULL"#,
+               LEAST(COALESCE(sum(
+                 GREATEST(0, LEAST(floor((ST_XMax(geom_tile) + k.mm + 20037508.342789244) / k.tw) + 1, $4::int)
+                           - GREATEST(floor((ST_XMin(geom_tile) - k.mm + 20037508.342789244) / k.tw) - 1, $3::int) + 1)
+               * GREATEST(0, LEAST(floor((20037508.342789244 - ST_YMin(geom_tile) + k.mm) / k.tw) + 1, $6::int)
+                           - GREATEST(floor((20037508.342789244 - ST_YMax(geom_tile) - k.mm) / k.tw) - 1, $5::int) + 1)
+               ), 0)::numeric, 9223372036854775807::numeric)::bigint)::text
+           FROM "{table}"
+           CROSS JOIN (
+               SELECT 40075016.685578488 / power(2.0, $1::float8) AS tw,
+                      $2::float8 * (40075016.685578488 / power(2.0, $1::float8)) AS mm
+           ) k
+           WHERE geom_tile IS NOT NULL AND NOT ST_IsEmpty(geom_tile)"#,
         table = prepared.table
     );
-    let row: Option<String> = Spi::get_one(&sql)?;
+    let row: Option<String> = Spi::get_one_with_args(
+        &sql,
+        &[
+            (rect.z as i32).into(),
+            (cfg.tile_extend as f64 / cfg.tile_size as f64).into(),
+            (rect.xmin as i32).into(),
+            (rect.xmax as i32).into(),
+            (rect.ymin as i32).into(),
+            (rect.ymax as i32).into(),
+        ],
+    )?;
     let s = row.ok_or("feature_driven_prep_stats returned no row")?;
     let arr: [i64; 2] = serde_json::from_str(&s)?;
     Ok((arr[0], arr[1]))
@@ -346,10 +407,10 @@ fn should_use_feature_driven(
         return Ok((false, 0));
     }
 
-    let (rows, pairs_at_maxzoom) = feature_driven_prep_stats(prepared, src.cfg.max_zoom)?;
     let (xmin_m, ymin_m, xmax_m, ymax_m) = bbox_m;
-    let r_maxzoom =
-        TileRect::from_bbox_m(src.cfg.max_zoom, xmin_m, ymin_m, xmax_m, ymax_m).cell_count();
+    let rect = TileRect::from_bbox_m(src.cfg.max_zoom, xmin_m, ymin_m, xmax_m, ymax_m);
+    let (rows, pairs_at_maxzoom) = feature_driven_prep_stats(prepared, &rect, src.cfg)?;
+    let r_maxzoom = rect.cell_count();
 
     if rows <= 0 || pairs_at_maxzoom >= r_maxzoom {
         notice!(
@@ -596,9 +657,9 @@ fn morton_grid(slots: usize) -> u32 {
 /// — clamped to their block's tile coordinates, which makes every (z,x,y) owned
 /// by exactly one block (no overlap, no gap). Blocks are assigned to workers
 /// **interleaved** in Morton order (block i → slot i mod slots) so a contiguous
-/// dense core spreads across workers rather than landing on one. Returns the
-/// total tile count for the zoom (recounted from the table so it includes rows
-/// committed by workers).
+/// dense core spreads across workers rather than landing on one. Returns
+/// after all workers finish. The caller collects the authoritative zoom stats
+/// once; per-block INSERT row counts need no full-zoom scans.
 fn run_zoom_strips(
     src: PyramidSource,
     storage_table: &str,
@@ -607,7 +668,7 @@ fn run_zoom_strips(
     prepared: Option<&crate::prepared::PreparedBuildSource>,
     feature_major_points: bool,
     feature_driven: bool,
-) -> Result<i64, Box<dyn Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let workers = src.cfg.effective_parallel() - 1;
     if workers == 0 || rect.cell_count() <= PARALLEL_MIN_CELLS {
         build_zoom_level_dispatch(
@@ -619,7 +680,7 @@ fn run_zoom_strips(
             feature_major_points,
             feature_driven,
         )?;
-        return Ok(inserted_count(storage_table, rect.z)?);
+        return Ok(());
     }
 
     let slots = workers as usize + 1;
@@ -710,7 +771,7 @@ fn run_zoom_strips(
     drop(handles);
     wait_result?;
 
-    Ok(inserted_count(storage_table, rect.z)?)
+    Ok(())
 }
 
 /// Attribute projection fragments for the feature pipeline: (inner, outer).
@@ -980,6 +1041,9 @@ pub(crate) fn tile_pipeline_from_sql(
                           ST_TileEnvelope($1, t.x, t.y, margin => ($9::float8 / $3::float8)),
                           $10
                        ){rule_where}
+                 -- Keep the projected/simplified geometry in a tuple slot:
+                 -- area/length checks and clipping must not re-evaluate it.
+                 OFFSET 0
               ) prep
               WHERE
                  ($12::float8 <= 0
@@ -992,6 +1056,9 @@ pub(crate) fn tile_pipeline_from_sql(
                       OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
                       OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
                          / 1000000.0 < $14::float8)
+              -- A per-tile evaluation barrier, not a materialized whole zoom.
+              -- The outer null check and aggregate share the clipped geometry.
+              OFFSET 0
            ) features
            WHERE features.geom IS NOT NULL"#
     )
@@ -1032,6 +1099,7 @@ pub(crate) fn tile_pipeline_from_prepared_sql(
                  WHERE prep_src.geom_tile && ST_TileEnvelope(
                     $1, t.x, t.y, margin => ($9::float8 / $3::float8)
                  ){rule_where}
+                 OFFSET 0
               ) prep
               WHERE
                  ($12::float8 <= 0
@@ -1044,6 +1112,7 @@ pub(crate) fn tile_pipeline_from_prepared_sql(
                       OR prep.geom_type NOT IN ('POINT','MULTIPOINT')
                       OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
                          / 1000000.0 < $14::float8)
+              OFFSET 0
            ) features
            WHERE features.geom IS NOT NULL"#
     )
@@ -1059,35 +1128,48 @@ pub(crate) fn point_feature_major_pipeline_sql(
     format!(
         r#"WITH raw AS (
              SELECT
-                floor((ST_X(prep_src.geom_tile) + 20037508.342789244)
-                      / (40075016.685578488 / power(2.0, $1::float8)))::int AS x,
-                floor((20037508.342789244 - ST_Y(prep_src.geom_tile))
-                      / (40075016.685578488 / power(2.0, $1::float8)))::int AS y,
+                (ST_X(prep_src.geom_tile) + 20037508.342789244)
+                      / (40075016.685578488 / power(2.0, $1::float8)) AS tile_x,
+                (20037508.342789244 - ST_Y(prep_src.geom_tile))
+                      / (40075016.685578488 / power(2.0, $1::float8)) AS tile_y,
                 prep_src.geom_tile,
                 prep_src.fid
                 {attrs_inner}
              FROM "{prepared_table}" prep_src
              WHERE prep_src.geom_type = 'POINT'
+               AND NOT ST_IsEmpty(prep_src.geom_tile)
                AND ($14::float8 >= 1.0
                     OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
                        / 1000000.0 < $14::float8){rule_where}
+             OFFSET 0
            ),
            features AS (
              SELECT
-                raw.x,
-                raw.y,
+                gx AS x,
+                gy AS y,
                 ST_AsMVTGeom(raw.geom_tile,
-                             ST_TileEnvelope($1, raw.x, raw.y),
+                             ST_TileEnvelope($1, gx, gy),
                              $3, $9, true) AS geom,
                 raw.fid
                 {attrs_outer}
              FROM raw
-             WHERE raw.x BETWEEN $4::int AND $5::int
-               AND raw.y BETWEEN $6::int AND $7::int
-               AND raw.x >= 0
-               AND raw.y >= 0
-               AND raw.x < power(2.0, $1::float8)::int
-               AND raw.y < power(2.0, $1::float8)::int
+             -- Enumerate only this point's buffer neighbours, not the bbox
+             -- lattice. One extra MVT unit safely includes rounded boundary
+             -- points; the identical tile-major bbox filter decides membership.
+             CROSS JOIN LATERAL generate_series(
+                GREATEST(ceil(raw.tile_x - ($9::float8 + 1) / $3)::int - 1, $4::int, 0),
+                LEAST(floor(raw.tile_x + ($9::float8 + 1) / $3)::int, $5::int,
+                      power(2.0, $1::float8)::int - 1)
+             ) AS gx
+             CROSS JOIN LATERAL generate_series(
+                GREATEST(ceil(raw.tile_y - ($9::float8 + 1) / $3)::int - 1, $6::int, 0),
+                LEAST(floor(raw.tile_y + ($9::float8 + 1) / $3)::int, $7::int,
+                      power(2.0, $1::float8)::int - 1)
+             ) AS gy
+             WHERE raw.geom_tile && ST_TileEnvelope(
+                $1, gx, gy, margin => ($9::float8 / $3::float8)
+             )
+             OFFSET 0
            ),
            grouped AS (
              SELECT f.x AS x, f.y AS y,
@@ -1148,6 +1230,7 @@ pub(crate) fn feature_driven_pipeline_sql(
                        * (40075016.685578488 / power(2.0, $1::float8)) AS mm
              ) k
              WHERE prep_src.geom_tile IS NOT NULL
+               AND NOT ST_IsEmpty(prep_src.geom_tile)
                -- Strip read-filter: skip features whose envelope cannot reach
                -- any tile in the build rect [$4..$5]x[$6..$7], so a parallel
                -- worker GiST-scans only its block instead of every feature. The
@@ -1167,6 +1250,8 @@ pub(crate) fn feature_driven_pipeline_sql(
                     OR prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
                     OR (abs(hashtextextended(prep_src.fid::text, 0::bigint)) % 1000000)::float8
                        / 1000000.0 < $14::float8){rule_where}
+             -- Prevent simplify from being pulled above candidate fanout.
+             OFFSET 0
            ),
            kept AS (
              SELECT
@@ -1198,6 +1283,8 @@ pub(crate) fn feature_driven_pipeline_sql(
                 generate_series(GREATEST(kept.ty0, $6::int), LEAST(kept.ty1, $7::int)) AS gy
              WHERE gx >= 0 AND gx < power(2.0, $1::float8)::int
                AND gy >= 0 AND gy < power(2.0, $1::float8)::int
+             -- Sort and encode clipped tuples, never the original geometry.
+             OFFSET 0
            ),
            grouped AS (
              SELECT f.x AS x, f.y AS y,
@@ -1268,8 +1355,7 @@ pub(crate) fn build_zoom_level(
            WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
     );
 
-    let inserted_before = inserted_count(storage_table, z)?;
-    Spi::run_with_args(
+    insert_tiles(
         &sql,
         &[
             (z as i32).into(),
@@ -1287,9 +1373,7 @@ pub(crate) fn build_zoom_level(
             min_len_m.into(),
             drop_threshold.into(),
         ],
-    )?;
-    let inserted_after = inserted_count(storage_table, z)?;
-    Ok(inserted_after - inserted_before)
+    )
 }
 
 fn build_zoom_level_prepared(
@@ -1326,8 +1410,7 @@ fn build_zoom_level_prepared(
            WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
     );
 
-    let inserted_before = inserted_count(storage_table, z)?;
-    Spi::run_with_args(
+    insert_tiles(
         &sql,
         &[
             (z as i32).into(),
@@ -1345,9 +1428,7 @@ fn build_zoom_level_prepared(
             min_len_m.into(),
             drop_threshold.into(),
         ],
-    )?;
-    let inserted_after = inserted_count(storage_table, z)?;
-    Ok(inserted_after - inserted_before)
+    )
 }
 
 fn build_zoom_level_prepared_points_feature_major(
@@ -1381,8 +1462,7 @@ fn build_zoom_level_prepared_points_feature_major(
              AND mvt IS NOT NULL"#
     );
 
-    let inserted_before = inserted_count(storage_table, z)?;
-    Spi::run_with_args(
+    insert_tiles(
         &sql,
         &[
             (z as i32).into(),
@@ -1400,9 +1480,7 @@ fn build_zoom_level_prepared_points_feature_major(
             knobs.min_len_m.into(),
             drop_threshold.into(),
         ],
-    )?;
-    let inserted_after = inserted_count(storage_table, z)?;
-    Ok(inserted_after - inserted_before)
+    )
 }
 
 fn build_zoom_level_prepared_feature_driven(
@@ -1438,8 +1516,7 @@ fn build_zoom_level_prepared_feature_driven(
              AND mvt IS NOT NULL"#
     );
 
-    let inserted_before = inserted_count(storage_table, z)?;
-    Spi::run_with_args(
+    insert_tiles(
         &sql,
         &[
             (z as i32).into(),
@@ -1457,17 +1534,13 @@ fn build_zoom_level_prepared_feature_driven(
             knobs.min_len_m.into(),
             knobs.drop_threshold.into(),
         ],
-    )?;
-    let inserted_after = inserted_count(storage_table, z)?;
-    Ok(inserted_after - inserted_before)
+    )
 }
 
-fn inserted_count(storage_table: &str, z: u8) -> Result<i64, spi::Error> {
-    Spi::get_one_with_args(
-        &format!(r#"SELECT count(*)::bigint FROM "{storage_table}" WHERE z = $1"#),
-        &[(z as i32).into()],
-    )
-    .map(|opt: Option<i64>| opt.unwrap_or(0))
+/// SPI reports the rows this INSERT processed even without a RETURNING clause.
+/// Unlike before/after table counts this is local to the command under workers.
+fn insert_tiles(sql: &str, args: &[pgrx::datum::DatumWithOid]) -> Result<i64, spi::Error> {
+    Spi::connect_mut(|client| client.update(sql, None, args).map(|rows| rows.len() as i64))
 }
 
 #[cfg(test)]
@@ -1661,9 +1734,11 @@ mod tests {
     fn point_feature_major_pipeline_does_not_enumerate_bbox_tiles() {
         let sql = point_feature_major_pipeline_sql("_gp_prep_test", "", "", "", "");
         assert!(
-            !sql.contains("generate_series"),
+            !sql.contains("generate_series($4::int, $5::int)"),
             "point feature-major path must not enumerate bbox tile cells"
         );
+        assert!(sql.contains("ceil(raw.tile_x"));
+        assert!(sql.contains("raw.geom_tile && ST_TileEnvelope"));
         assert!(sql.contains("ST_X(prep_src.geom_tile)"));
         assert!(sql.contains("GROUP BY f.x, f.y"));
     }

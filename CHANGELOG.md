@@ -32,10 +32,25 @@ All notable changes to `geometry_pyramid` are documented here. The format follow
 
 ### Changed
 
+- Build and dynamic tile SQL keep projected/simplified and clipped geometries
+  in separate evaluation stages, avoiding repeated geometry work for null
+  filtering and MVT aggregation and sorting smaller clipped records.
+- Full builds use SPI's processed INSERT row counts instead of scanning the
+  entire zoom before and after every block. Prepared builds derive the extent
+  from the already-projected source; one-cell point zooms avoid point binning.
+- Feature-driven strategy estimates now include the actual buffer and safety
+  padding, clamp to the build rectangle, and ignore empty geometries.
+- Builds whose maximum-zoom rectangle contains at most 64 cells use local
+  preparation before any worker setup, since all their zooms already run inline.
+  The requested catalog configuration and budget/parallel validation stay intact.
+
 - **`splitSize` now defaults to `0`** (materialize every non-empty tile within
   `maxZoom`). Set `splitSize > 0` to defer sub-threshold tiles to on-demand
   slicing by `ST_Tile`. Reads are pure storage lookups at the default.
 
 ### Fixed
 
+- Point feature-major builds include neighbouring tile buffers and exact
+  boundary points, matching the normal prepared path's feature membership.
+  Empty points are excluded before candidate enumeration.
 - `ST_DropPyramid` no longer emits a spurious "does not exist, skipping" NOTICE.

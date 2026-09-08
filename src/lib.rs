@@ -54,6 +54,469 @@ mod tests {
             .expect("tile should exist")
     }
 
+    // Decode just the MVT fields needed for semantic equality. Dictionary and
+    // feature ordering are irrelevant; duplicate features remain visible.
+    type MvtFeature = (u64, u64, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+    fn mvt_varint(bytes: &mut &[u8]) -> u64 {
+        let mut value = 0;
+        for shift in (0..70).step_by(7) {
+            let byte = bytes[0];
+            *bytes = &bytes[1..];
+            value |= u64::from(byte & 127) << shift;
+            if byte & 128 == 0 {
+                return value;
+            }
+        }
+        panic!("invalid MVT varint")
+    }
+
+    fn mvt_fields(mut bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut fields = Vec::new();
+        while !bytes.is_empty() {
+            let tag = mvt_varint(&mut bytes);
+            let value = match tag & 7 {
+                0 => mvt_varint(&mut bytes).to_le_bytes().to_vec(),
+                wire => {
+                    let len = match wire {
+                        1 => 8,
+                        2 => mvt_varint(&mut bytes) as usize,
+                        5 => 4,
+                        _ => panic!("unsupported MVT wire type {wire}"),
+                    };
+                    let value = bytes[..len].to_vec();
+                    bytes = &bytes[len..];
+                    value
+                }
+            };
+            fields.push((tag >> 3, value));
+        }
+        fields
+    }
+
+    fn decoded_mvt_features(bytes: &[u8]) -> Vec<MvtFeature> {
+        let mut features = Vec::new();
+        for (_, layer) in mvt_fields(bytes).into_iter().filter(|(tag, _)| *tag == 3) {
+            let fields = mvt_fields(&layer);
+            let keys: Vec<_> = fields.iter().filter(|(tag, _)| *tag == 3).collect();
+            let values: Vec<_> = fields.iter().filter(|(tag, _)| *tag == 4).collect();
+            for (_, feature) in fields.iter().filter(|(tag, _)| *tag == 2) {
+                let (mut id, mut kind, mut geometry, mut attributes) =
+                    (0, 0, Vec::new(), Vec::new());
+                for (tag, value) in mvt_fields(feature) {
+                    match tag {
+                        1 => id = u64::from_le_bytes(value.try_into().unwrap()),
+                        2 => {
+                            let mut packed = value.as_slice();
+                            while !packed.is_empty() {
+                                let key = mvt_varint(&mut packed) as usize;
+                                let val = mvt_varint(&mut packed) as usize;
+                                attributes.push((keys[key].1.clone(), values[val].1.clone()));
+                            }
+                        }
+                        3 => kind = u64::from_le_bytes(value.try_into().unwrap()),
+                        4 => geometry = value,
+                        _ => {}
+                    }
+                }
+                attributes.sort();
+                features.push((id, kind, geometry, attributes));
+            }
+        }
+        features.sort();
+        features
+    }
+
+    fn decoded_stored_tiles(
+        name: &str,
+    ) -> std::collections::BTreeMap<(i32, i32, i32), Vec<MvtFeature>> {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!("SELECT z, x, y, mvt FROM _gp_tiles_{name}"),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    let z = i32::from(row["z"].value::<i16>().unwrap().unwrap());
+                    let x = row["x"].value::<i32>().unwrap().unwrap();
+                    let y = row["y"].value::<i32>().unwrap().unwrap();
+                    let bytes = row["mvt"].value::<Vec<u8>>().unwrap().unwrap();
+                    ((z, x, y), decoded_mvt_features(&bytes))
+                })
+                .collect()
+        })
+    }
+
+    #[pg_test]
+    fn feature_major_points_buffer_semantics_match_prepared() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        // Offsets from the z=2 central corner are in MVT pixels. Include exact
+        // edges, inside/outside the default and large buffers, and world limits.
+        Spi::run(
+            "CREATE TABLE _gp_buffer_semantics (gid serial PRIMARY KEY, label text,
+                 geom geometry(Point,3857));
+             INSERT INTO _gp_buffer_semantics(label, geom)
+             SELECT 'offset-' || dx || '-' || dy,
+                    ST_SetSRID(ST_Point(dx * 2445.98490512564, dy * 2445.98490512564),3857)
+             FROM (VALUES (-257),(-255),(-9),(-7),(-1),(0),(1),(7),(9),(255),(257)) a(dx)
+             CROSS JOIN (VALUES (-7),(0),(7)) b(dy);
+             INSERT INTO _gp_buffer_semantics(label, geom) VALUES
+                 ('world-nw', ST_SetSRID(ST_Point(-20037508.342789244,20037508.342789244),3857)),
+                 ('world-se', ST_SetSRID(ST_Point(20037508.342789244,-20037508.342789244),3857)),
+                 ('empty', ST_GeomFromText('POINT EMPTY',3857)),
+                 ('null', NULL)",
+        )
+        .unwrap();
+        for buffer in [0, 8, 256] {
+            let mut snapshots = Vec::new();
+            for feature_major in [false, true] {
+                let mut config = serde_json::json!({
+                    "name":"buffer_semantics", "minZoom":2, "maxZoom":2,
+                    "splitSize":0, "preparedBuild":true, "featureMajorPoints":feature_major,
+                    "featureMajorMinZoom":0, "attributes":["label"], "dropRate":1
+                });
+                // Exercise the default rather than merely explicitly setting 8.
+                if buffer != 8 {
+                    config["tileExtend"] = buffer.into();
+                }
+                assert_eq!(
+                    Spi::get_one::<bool>(&format!(
+                        "SELECT ST_BuildPyramid('_gp_buffer_semantics','geom','gid','{config}')"
+                    ))
+                    .unwrap(),
+                    Some(true)
+                );
+                snapshots.push(decoded_stored_tiles("buffer_semantics"));
+                Spi::run("SELECT ST_DropPyramid('buffer_semantics')").unwrap();
+            }
+            assert!(!snapshots[0].is_empty());
+            assert_eq!(
+                snapshots[0], snapshots[1],
+                "buffer {buffer}: feature IDs, types, geometry or attributes differ"
+            );
+        }
+        Spi::run("DROP TABLE _gp_buffer_semantics").unwrap();
+    }
+
+    #[pg_test]
+    fn prepared_geometry_functions_run_once_per_feature() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis; SET LOCAL track_functions = 'all'")
+            .unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_eval_once (gid serial PRIMARY KEY, geom geometry(Polygon,3857));
+             INSERT INTO _gp_eval_once(geom)
+             SELECT ST_Buffer(ST_SetSRID(ST_Point(i * 10000, 1000000),3857), 50000, 32)
+             FROM generate_series(1,100) i",
+        )
+        .unwrap();
+        let calls = || {
+            Spi::get_one::<i64>(
+                "SELECT coalesce(sum(calls),0)::bigint FROM pg_stat_xact_user_functions
+                 WHERE funcname IN ('st_simplifypreservetopology','st_asmvtgeom')",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let before = calls();
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT ST_BuildPyramid('_gp_eval_once','geom','gid',
+             '{\"name\":\"eval_once\",\"minZoom\":0,\"maxZoom\":0,
+               \"preparedBuild\":true,\"simplifyPixels\":1,\"splitSize\":0}')"
+            )
+            .unwrap(),
+            Some(true)
+        );
+        let after = calls();
+        let tiles = decoded_stored_tiles("eval_once");
+        assert_eq!(tiles.values().map(Vec::len).sum::<usize>(), 100);
+        assert_eq!(
+            after - before,
+            200,
+            "100 surviving polygons must each simplify and clip exactly once"
+        );
+        // Shrink the same polygons into the center of z8 tile (128,127).
+        // All 100 features expand to exactly nine padded candidates each.
+        Spi::run(
+            "CREATE TEMP TABLE _gp_eval_driven AS SELECT gid::bigint AS fid,
+             'POLYGON'::text AS geom_type,
+             ST_Translate(ST_Scale(geom,0.001,0.001),78000,77000) AS geom_tile
+             FROM _gp_eval_once",
+        )
+        .unwrap();
+        let function_calls = |name: &str| {
+            Spi::get_one_with_args::<i64>(
+            "SELECT coalesce(sum(calls),0)::bigint FROM pg_stat_xact_user_functions WHERE funcname=$1",
+            &[name.into()]
+        ).unwrap().unwrap()
+        };
+        let simplify_before = function_calls("st_simplifypreservetopology");
+        let clip_before = function_calls("st_asmvtgeom");
+        let cfg: crate::config::PyramidConfig = serde_json::from_value(serde_json::json!({
+            "minZoom":8,"maxZoom":8,"splitSize":0,"simplifyPixels":1,"sourceSRS":3857
+        }))
+        .unwrap();
+        let source = crate::source::PyramidSource {
+            name: "eval_once",
+            source_table: "_gp_eval_once",
+            geom_column: "geom",
+            fid_column: "gid",
+            cfg: &cfg,
+        };
+        let rect = crate::tile_rect::TileRect {
+            z: 8,
+            xmin: 127,
+            xmax: 129,
+            ymin: 126,
+            ymax: 128,
+        };
+        let prepared = crate::prepared::PreparedBuildSource::new("_gp_eval_driven".into(), false);
+        let knobs = crate::build::ZoomKnobs::from_config(&cfg, 8);
+        assert_eq!(
+            crate::build::build_zoom_level_dispatch(
+                source,
+                "_gp_tiles_eval_once",
+                &rect,
+                &knobs,
+                Some(&prepared),
+                false,
+                true
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            function_calls("st_simplifypreservetopology") - simplify_before,
+            100,
+            "feature-driven simplification must happen once before candidate expansion"
+        );
+        assert_eq!(
+            function_calls("st_asmvtgeom") - clip_before,
+            900,
+            "each of the nine candidates per polygon must clip exactly once"
+        );
+        assert_eq!(decoded_stored_tiles("eval_once")[&(8, 128, 127)].len(), 100);
+        Spi::run("DROP TABLE _gp_eval_driven").unwrap();
+        Spi::run("SELECT ST_DropPyramid('eval_once'); DROP TABLE _gp_eval_once").unwrap();
+    }
+
+    #[pg_test]
+    fn zoom_insert_count_excludes_existing_tiles() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_insert_count_src(gid int, geom geometry(Point,4326));
+             INSERT INTO _gp_insert_count_src VALUES (1,ST_SetSRID(ST_Point(30,-30),4326));
+             CREATE TABLE _gp_insert_count_tiles(z smallint,x int,y int,format text,srid int,mvt bytea);
+             INSERT INTO _gp_insert_count_tiles VALUES (1,0,0,'pbf',3857,'\\x'::bytea)"
+        ).unwrap();
+        let cfg: crate::config::PyramidConfig = serde_json::from_value(serde_json::json!({
+            "minZoom":1,"maxZoom":1,"splitSize":0
+        }))
+        .unwrap();
+        let source = crate::source::PyramidSource {
+            name: "insert_count",
+            source_table: "_gp_insert_count_src",
+            geom_column: "geom",
+            fid_column: "gid",
+            cfg: &cfg,
+        };
+        let rect = crate::tile_rect::TileRect {
+            z: 1,
+            xmin: 1,
+            xmax: 1,
+            ymin: 1,
+            ymax: 1,
+        };
+        let knobs = crate::build::ZoomKnobs::from_config(&cfg, 1);
+        assert_eq!(
+            crate::build::build_zoom_level(source, "_gp_insert_count_tiles", &rect, &knobs)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM _gp_insert_count_tiles").unwrap(),
+            Some(2)
+        );
+        let empty = crate::tile_rect::TileRect {
+            z: 1,
+            xmin: 0,
+            xmax: 0,
+            ymin: 1,
+            ymax: 1,
+        };
+        assert_eq!(
+            crate::build::build_zoom_level(source, "_gp_insert_count_tiles", &empty, &knobs)
+                .unwrap(),
+            0
+        );
+        Spi::run("DROP TABLE _gp_insert_count_src, _gp_insert_count_tiles").unwrap();
+    }
+
+    #[pg_test]
+    fn mixed_geometry_build_paths_preserve_lod_semantics() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run(
+            "CREATE TABLE _gp_mixed_semantics(gid int PRIMARY KEY, kind text, detail text,
+                 geom geometry(Geometry,3857));
+             INSERT INTO _gp_mixed_semantics VALUES
+               (1,'point','point-detail',ST_SetSRID(ST_Point(100000,100000),3857)),
+               (2,'line','line-detail',ST_GeomFromText('LINESTRING(80000 80000,100000 100010,120000 120000)',3857)),
+               (3,'polygon','polygon-detail',ST_Buffer(ST_SetSRID(ST_Point(100000,100000),3857),20000,32)),
+               (4,'tiny-line','filtered',ST_GeomFromText('LINESTRING(100000 100000,100001 100001)',3857)),
+               (5,'tiny-polygon','filtered',ST_MakeEnvelope(100000,100000,100001,100001,3857)),
+               (6,'excluded','filtered',ST_SetSRID(ST_Point(100000,100000),3857)),
+               (7,'sparse','deferred',ST_SetSRID(ST_Point(-19000000,-19000000),3857)),
+               (8,'sparse','deferred',ST_SetSRID(ST_Point(19000000,19000000),3857))"
+        ).unwrap();
+        let mut snapshots = Vec::new();
+        for (prepared, driven) in [(false, false), (true, false), (true, true)] {
+            let config = serde_json::json!({
+                "name":"mixed_semantics","sourceSRS":3857,"minZoom":5,"maxZoom":6,"splitSize":2,
+                "simplifyPixels":1,"minFeatureSizePixels":2,"dropRate":1,
+                "preparedBuild":prepared,"featureDrivenEnum":driven,
+                "attributes":["kind","detail"],
+                "buildRules":[{"minZoom":5,"maxZoom":6,"filter":"gid <> 6"},
+                              {"minZoom":5,"maxZoom":5,"attrFields":["kind"]}]
+            });
+            assert_eq!(
+                Spi::get_one::<bool>(&format!(
+                    "SELECT ST_BuildPyramid('_gp_mixed_semantics','geom','gid','{config}')"
+                ))
+                .unwrap(),
+                Some(true)
+            );
+            let tiles = decoded_stored_tiles("mixed_semantics");
+            assert_eq!(
+                tiles.len(),
+                2,
+                "only the dense tile should survive at each zoom"
+            );
+            for ((z, _, _), features) in &tiles {
+                assert_eq!(
+                    features.iter().map(|f| f.0).collect::<Vec<_>>(),
+                    vec![1, 2, 3]
+                );
+                for feature in features {
+                    let names: Vec<_> = feature.3.iter().map(|(key, _)| key.as_slice()).collect();
+                    assert_eq!(
+                        names,
+                        if *z == 5 {
+                            vec![b"kind".as_slice()]
+                        } else {
+                            vec![b"detail".as_slice(), b"kind".as_slice()]
+                        }
+                    );
+                }
+            }
+            snapshots.push(tiles);
+            Spi::run("SELECT ST_DropPyramid('mixed_semantics')").unwrap();
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "source and prepared MVT semantics differ"
+        );
+        assert_eq!(
+            snapshots[0], snapshots[2],
+            "source and feature-driven MVT semantics differ"
+        );
+        Spi::run("DROP TABLE _gp_mixed_semantics").unwrap();
+    }
+
+    #[pg_test]
+    fn feature_driven_candidate_counts_include_padding_and_ignore_empty() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        // The valid point lies at tile coordinates (1.5, 1.5) at z=2.
+        Spi::run(
+            "CREATE TABLE _gp_candidate_stats(geom_tile geometry(Point,3857));
+             INSERT INTO _gp_candidate_stats VALUES
+               (ST_SetSRID(ST_Point(-5009377.085697311,5009377.085697311),3857)),
+               (ST_GeomFromText('POINT EMPTY',3857)), (NULL)",
+        )
+        .unwrap();
+        let prepared =
+            crate::prepared::PreparedBuildSource::new("_gp_candidate_stats".into(), false);
+        let rect = crate::tile_rect::TileRect {
+            z: 2,
+            xmin: 0,
+            xmax: 3,
+            ymin: 0,
+            ymax: 3,
+        };
+        let mut cfg = crate::config::PyramidConfig::default();
+        cfg.tile_size = 4096;
+        for (buffer, pairs) in [(0, 9), (4096, 16)] {
+            // Direct statistics invocation deliberately includes a full-tile
+            // buffer to exercise clamping independently of config validation.
+            cfg.tile_extend = buffer;
+            assert_eq!(
+                crate::build::feature_driven_prep_stats(&prepared, &rect, &cfg).unwrap(),
+                (1, pairs)
+            );
+        }
+        let strip = crate::tile_rect::TileRect {
+            z: 2,
+            xmin: 1,
+            xmax: 1,
+            ymin: 1,
+            ymax: 2,
+        };
+        assert_eq!(
+            crate::build::feature_driven_prep_stats(&prepared, &strip, &cfg).unwrap(),
+            (1, 2)
+        );
+        Spi::run("DELETE FROM _gp_candidate_stats WHERE geom_tile IS NOT NULL AND NOT ST_IsEmpty(geom_tile)").unwrap();
+        assert_eq!(
+            crate::build::feature_driven_prep_stats(&prepared, &rect, &cfg).unwrap(),
+            (0, 0),
+            "empty and null geometry must not enumerate the tile lattice"
+        );
+        Spi::run("DROP TABLE _gp_candidate_stats").unwrap();
+    }
+
+    #[pg_test]
+    fn small_parallel_build_uses_local_preparation() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        // This uncommitted relation is deliberately invisible to autonomous
+        // workers. Every zoom fits in a single tile, so the build stays local.
+        Spi::run(
+            "CREATE TABLE _gp_small_parallel_src(gid int PRIMARY KEY, geom geometry(Point,3857));
+             INSERT INTO _gp_small_parallel_src
+             SELECT i, ST_SetSRID(ST_Point(100000 + i * 100,100000 + i * 100),3857)
+             FROM generate_series(1,10) i",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT ST_BuildPyramid('_gp_small_parallel_src','geom','gid',
+             '{\"name\":\"small_parallel\",\"preparedBuild\":true,\"parallel\":4,
+               \"minZoom\":0,\"maxZoom\":6,\"sourceSRS\":3857,
+               \"splitSize\":0,\"dropRate\":1,\"buildTimeoutMs\":2000}')"
+            )
+            .unwrap(),
+            Some(true)
+        );
+        let tiles = decoded_stored_tiles("small_parallel");
+        assert_eq!(
+            tiles.len(),
+            7,
+            "one populated tile at every zoom from 0 through 6"
+        );
+        for features in tiles.values() {
+            assert_eq!(
+                features.iter().map(|feature| feature.0).collect::<Vec<_>>(),
+                (1..=10).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT to_regclass('_gp_prep_small_parallel') IS NULL").unwrap(),
+            Some(true)
+        );
+        Spi::run("SELECT ST_DropPyramid('small_parallel'); DROP TABLE _gp_small_parallel_src")
+            .unwrap();
+    }
+
     /// End-to-end smoke test: register a tiny table, build a pyramid over
     /// it, fetch a tile, then drop it. Requires PostGIS (declared in the
     /// .control file's `requires`).
