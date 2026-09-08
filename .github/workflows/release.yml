@@ -52,7 +52,7 @@ jobs:
           sudo gpg --dearmor --yes --output /etc/apt/keyrings/postgresql.gpg /tmp/postgresql.asc
           printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update
-          sudo apt-get install --yes postgresql-server-dev-17
+          sudo apt-get install --yes postgresql-17 postgresql-server-dev-17
 
       - name: Install cargo-pgrx
         run: cargo install --locked cargo-pgrx --version 0.18.0
