@@ -4,7 +4,7 @@ All notable changes to `geometry_pyramid` are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/), and the project targets pgrx 0.18
 / PostgreSQL 17 / PostGIS 3.6.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-08
 
 ### Added
 
