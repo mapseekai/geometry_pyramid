@@ -1,0 +1,121 @@
+{
+  "method": "one warmup + three timed full ST_BuildPyramid calls; client wall includes commit; drop excluded",
+  "cases": [
+    {
+      "source": "sparse_circles",
+      "source_rows": 1000,
+      "source_vertices": 513000,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 12,
+        "maxZoom": 14,
+        "preparedBuild": true,
+        "featureMajorPoints": false,
+        "featureDrivenEnum": true,
+        "attributes": [],
+        "tileExtend": 8,
+        "simplifyPixels": 1,
+        "featureMajorMinZoom": 12
+      },
+      "runs_ms": [
+        7263.278,
+        7444.304,
+        7312.249,
+        7357.453
+      ],
+      "zoom_stats": [
+        [
+          12,
+          1000,
+          55872,
+          56,
+          2299,
+          1
+        ],
+        [
+          13,
+          1000,
+          71872,
+          72,
+          2400,
+          1
+        ],
+        [
+          14,
+          1000,
+          71872,
+          72,
+          2552,
+          1
+        ]
+      ],
+      "median_ms": 7357.453,
+      "semantic_sha256": "b4a56888e7cad1ea77407dcf9586e6748371ffb99fb9b3728f6aec6a9c492fdc",
+      "feature_count": 3000
+    },
+    {
+      "source": "sparse_points",
+      "source_rows": 10000,
+      "source_vertices": 10000,
+      "config": {
+        "name": "gpopt_measurement",
+        "sourceSRS": 3857,
+        "tileSRS": 3857,
+        "minZoom": 12,
+        "maxZoom": 14,
+        "preparedBuild": true,
+        "featureMajorPoints": true,
+        "featureDrivenEnum": false,
+        "attributes": [],
+        "tileExtend": 8,
+        "simplifyPixels": 1,
+        "featureMajorMinZoom": 12
+      },
+      "runs_ms": [
+        53.134,
+        52.283,
+        56.054,
+        55.064
+      ],
+      "zoom_stats": [
+        [
+          12,
+          1000,
+          166872,
+          167,
+          11,
+          1
+        ],
+        [
+          13,
+          1000,
+          166872,
+          167,
+          12,
+          1
+        ],
+        [
+          14,
+          1000,
+          166872,
+          167,
+          12,
+          1
+        ]
+      ],
+      "median_ms": 55.064,
+      "semantic_sha256": "59cd2838a343721d0aa7d18b023bb61d700b7b16378c199eb4c163d83db37992",
+      "feature_count": 30000
+    }
+  ],
+  "build_library": "/tmp/gpopt-baseline",
+  "environment": [
+    "PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+    "POSTGIS=\"3.6.4 0\" [EXTENSION] PGSQL=\"170\" GEOS=\"3.14.1-CAPI-1.20.5\" PROJ=\"9.8.1 NETWORK_ENABLED=OFF URL_ENDPOINT=https://cdn.proj.org USER_WRITABLE_DIRECTORY=/Users/zhang/Library/Application Support/proj DATABASE_PATH=/opt/homebrew/Cellar/proj/9.8.1/share/proj/proj.db\" (compiled against PROJ 9.8.1) LIBXML=\"2.15.3\" LIBJSON=\"0.18\" LIBPROTOBUF=\"1.5.2\" WAGYU=\"0.5.0 (Internal)\"",
+    "4MB",
+    "off",
+    "0"
+  ]
+}

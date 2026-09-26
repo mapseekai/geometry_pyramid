@@ -13,14 +13,10 @@
 use crate::storage;
 use pgrx::prelude::*;
 
-pub const SHADOW_SUFFIX: &str = "__shadow";
-
 pub fn shadow_table_name(pyramid_name: &str) -> String {
-    format!(
-        "{}{}",
-        storage::tile_table_name(pyramid_name),
-        SHADOW_SUFFIX
-    )
+    // A disjoint prefix is essential: appending __shadow to a main name
+    // collides with the main table of a valid pyramid named foo__shadow.
+    format!("_gp_shadow_{pyramid_name}")
 }
 
 /// SQL that (re)creates the shadow table. Factored out so the parallel
@@ -92,13 +88,17 @@ mod tests {
 
     #[test]
     fn shadow_name_is_derived_from_main() {
-        assert_eq!(shadow_table_name("foo"), "_gp_tiles_foo__shadow");
+        assert_eq!(shadow_table_name("foo"), "_gp_shadow_foo");
+        assert_ne!(
+            shadow_table_name("foo"),
+            storage::tile_table_name("foo__shadow")
+        );
     }
 
     #[test]
     fn longest_derived_name_fits_pg_limit() {
-        // validate_identifier caps names at 45 → prefix(10) + 45 + 8 = 63
+        // Include the bigserial sequence suffix in the identifier budget.
         let longest = "a".repeat(45);
-        assert!(shadow_table_name(&longest).len() <= 63);
+        assert!(format!("{}_id_seq", shadow_table_name(&longest)).len() <= 63);
     }
 }

@@ -55,7 +55,16 @@ pub(crate) fn rebuild_extent(
     let mut rebuilt: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
         let started = Instant::now();
-        let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
+        // A changed feature contributes to neighbours whose buffer reaches it.
+        // Include closed grid boundaries even with tileExtend=0.
+        let buffer_m = src.cfg.tile_extend as f64 * src.cfg.pixel_size_m(z);
+        let rect = TileRect::intersecting_bbox_m(
+            z,
+            xmin_m - buffer_m,
+            ymin_m - buffer_m,
+            xmax_m + buffer_m,
+            ymax_m + buffer_m,
+        );
         // Wipe the dirty rectangle, then rebuild it in place. Budget retry is
         // intentionally NOT applied here: a partial MAX(octet_length) check
         // would be skewed by untouched tiles; reuse the knobs from config.

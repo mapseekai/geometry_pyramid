@@ -49,7 +49,7 @@
 |---|---|---|
 | `name` | 源表名 | 金字塔名称；允许同一源表构建多个金字塔。 |
 | `sourceSRS` | `4326` | 源 geometry 列的 SRID。 |
-| `tileSRS` | `3857` | 瓦片坐标系，默认 Web Mercator。 |
+| `tileSRS` | `3857` | 瓦片坐标系，目前仅支持 Web Mercator（`3857`），其他值会被拒绝。 |
 | `tileSize` | `4096` | MVT extent，必须大于 0。 |
 | `tileExtend` | `8` | 瓦片边缘 buffer，用于减少边界裁剪问题。 |
 | `minZoom` / `maxZoom` | `0` / `18` | 需要物化构建的 zoom 范围。 |
@@ -65,7 +65,7 @@
 | `dropRate` | `1.0` | tippecanoe 风格点保留率：`dropRate^(maxZoom - z)`；`1.0` 表示关闭。 |
 | `tileSizeBudgetBytes` | `0` | 单瓦片 MVT 大小上限；超限时收紧参数重建该 zoom；`0` 表示关闭。 |
 | `maxTileSizeAttempts` | `5` | 追逐瓦片大小预算时，每个 zoom 的最大重试次数。 |
-| `buildTimeoutMs` | `0` | 并行 worker 每个 zoom 的等待上限；`0` 表示不限时。 |
+| `buildTimeoutMs` | `0` | 每个并行 zoom 及共享源预处理的等待上限（毫秒）；`0` 表示不限时。超时或取消查询时，会先停止 worker 再返回。 |
 | `splitSize` | `0` | `0` 表示物化所有非空瓦片；大于 0 时，低于该要素数的瓦片延迟到请求时实时切片。 |
 | `buildRules` | `[]` | 按 zoom 的 LOD 规则，形如 `{minZoom, maxZoom, filter?, attrFields?, sample?}`。 |
 
