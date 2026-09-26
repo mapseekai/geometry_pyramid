@@ -52,14 +52,14 @@ keys mirror Ganos:
 |---|---|---|
 | `name` | _table name_ | Allow multiple pyramids on the same table. |
 | `sourceSRS` | `4326` | SRID of the source `geom` column. |
-| `tileSRS` | `3857` | Tile coordinate system (Web Mercator). |
+| `tileSRS` | `3857` | Tile coordinate system. Only Web Mercator (`3857`) is supported; other values are rejected. |
 | `tileSize` | `4096` | MVT extent (must be > 0). |
 | `tileExtend` | `8` | Tile-edge buffer to avoid clipping artefacts. |
 | `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
 | `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
 | `preparedBuild` | `false` | Slice pre-projected source geometries. Serial builds derive their extent from the prepared table, avoiding a second projection pass. Uses an indexed session-local temp table with `parallel=1`, or a committed prepared table shared by background workers with `parallel>1`. If the maximum-zoom rectangle has at most 64 cells, execution uses local preparation regardless of the requested parallelism. Simplification still follows each zoom's configured tolerance. |
-| `featureMajorPoints` | `false` | Experimental sparse path for pure `POINT` sources. Requires `preparedBuild=true`, `parallel=1`, and `tileSRS=3857`; computes each point's candidate tiles, including buffer neighbours and exact boundaries, instead of probing every bbox tile. Single-cell zooms scan the prepared points directly. Mixed, line, polygon, or non-Web-Mercator builds fall back to prepared tile-major. |
+| `featureMajorPoints` | `false` | Experimental sparse path for pure `POINT` sources. Requires `preparedBuild=true`, `parallel=1`, and `tileSRS=3857`; computes each point's candidate tiles, including buffer neighbours and exact boundaries, instead of probing every bbox tile. Single-cell zooms scan the prepared points directly. Mixed, line, or polygon builds fall back to prepared tile-major. |
 | `featureMajorMinZoom` | `13` | Minimum `maxZoom` at which `featureMajorPoints` engages — it only wins once the high zoom levels (where tile-major's empty-cell probing explodes) dominate the build, and slightly regresses shallow pyramids. Below this, eligible point builds fall back to prepared tile-major (with a `NOTICE`). Set `0` to always use feature-major when eligible. |
 | `featureDrivenEnum` | `false` | Derive candidate tiles from each feature's envelope instead of probing every bbox cell. Requires `preparedBuild=true` and `tileSRS=3857`; supports background workers. A preparation check counts buffer-expanded, padded candidates clamped to the build rectangle, ignoring empty geometries; per zoom it also requires `R(z) > 2·rows`. This is a cost heuristic, not a guarantee of speedup. |
 | `attributes` | `[]` | Columns to include in MVT features. |
@@ -68,11 +68,16 @@ keys mirror Ganos:
 | `dropRate` | `1.0` | Tippecanoe-style point retention: keep `dropRate^(maxZoom − z)`. 1.0 disables; 0.4 mimics `tippecanoe -r2.5`. |
 | `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
-| `buildTimeoutMs` | `0` | Per-zoom upper bound (ms) the coordinator waits for parallel workers; 0 = unbounded. Only relevant when `parallel` > 1. |
+| `buildTimeoutMs` | `0` | Wait budget (ms) for each parallel zoom and committed source preparation; 0 = unbounded. Timeout or query cancellation stops workers before returning. |
 | `splitSize` | `0` | `0` (default) materializes every non-empty tile. A value > 0 is a density boundary: tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source on every request. |
 | `buildRules` | `[]` | Per-zoom LOD rules. Each rule uses the project-native shape `{minZoom, maxZoom, filter?, attrFields?, sample?}`: `filter` restricts features, `attrFields` overrides emitted MVT properties for that zoom band, and `sample` applies deterministic row sampling. Zooms not covered by any rule include all features and the global `attributes`; multiple rules covering a zoom are ANDed. Empty (default) = no LOD override. |
 
 ## Creating a pyramid
+
+Parallel workers inherit the caller's effective role, `search_path`, and
+`row_security` setting. Source data must be committed for workers to read it.
+Incremental refresh includes neighbouring tiles reached by `tileExtend`;
+full rebuilds replace all zoom statistics, including when the source is empty.
 
 A pyramid is built from an existing PostGIS table with a geometry column and a
 stable feature-id column. The full lifecycle is build → fetch → inspect →
@@ -293,7 +298,7 @@ back to the prepared tile-major path.
 For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 
 1. **Bbox prefilter** in source SRS — `src.geom && ST_Transform(ST_TileEnvelope(z,x,y, margin => tileExtend/tileSize), sourceSRS)` — an index-only `&&` against the buffer-expanded tile envelope, so the source's GiST index drives the scan and buffer-band edge geometry is included (seamless tile borders).
-2. **Project to tile SRS** — `ST_Transform(geom, tileSRS)` (Web Mercator by default).
+2. **Project to tile SRS** — `ST_Transform(geom, tileSRS)` (Web Mercator, EPSG:3857).
 3. **Per-zoom simplification** *(tippecanoe-style)* — `ST_SimplifyPreserveTopology(g, tol_m)` where `tol_m = simplifyPixels × (40 075 016.685 / (tileSize × 2^z))`. Points are skipped.
 4. **Min-feature-size filter** — drop polygons with `ST_Area < (minFeatureSizePixels × pixel_m)²`, lines with `ST_Length < minFeatureSizePixels × pixel_m`.
 5. **Deterministic point dropping** *(tippecanoe `-r`)* — `(abs(hashtextextended(fid, 0)) % 1 000 000) / 1 000 000 < dropRate^(maxZoom − z)`. Same fid → same decision across rebuilds.

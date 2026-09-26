@@ -123,6 +123,7 @@ fn st_drop_pyramid(name: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
 ///   rows and is a no-op — the old tile is never cleaned. Use a clause that
 ///   matches by region (e.g. `ST_Intersects(geom_or_bbox, ...)` against a
 ///   captured old extent), or a full rebuild.
+///
 /// Load and validate a pyramid's catalog row (source/geom/fid identifiers plus
 /// parsed config). Returns `None` when the pyramid is unknown.
 ///
@@ -151,6 +152,7 @@ pub(crate) fn catalog_meta(name: &str) -> Result<Option<CatalogRow>, Box<dyn Err
     )?;
     let Some(json) = row else { return Ok(None) };
     let meta: CatalogRow = serde_json::from_str(&json)?;
+    meta.config.validate()?;
     validate_identifier(&meta.source_table)?;
     validate_identifier(&meta.geom_column)?;
     validate_identifier(&meta.fid_column)?;
@@ -305,7 +307,7 @@ fn st_pyramid_info(name: &str) -> Result<Option<pgrx::JsonB>, spi::Error> {
 /// underscores. SQL identifier injection guard for the dynamic SQL paths.
 ///
 /// The 45-char cap reserves headroom for PG's 63-byte identifier limit:
-/// the longest derived name is `_gp_tiles_`(10) + name(45) + `__shadow`(8) = 63.
+/// the longest derived name is `_gp_shadow_`(11) + name(45) + `_id_seq`(7) = 63.
 pub(crate) fn validate_identifier(ident: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if ident.is_empty() {
         return Err("identifier must not be empty".into());

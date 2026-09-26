@@ -11,8 +11,9 @@ use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::time::Instant;
+
+type Bbox = (f64, f64, f64, f64);
 
 /// Per-zoom build outcome, consumed by the stats layer.
 #[derive(Clone, Copy, Debug)]
@@ -122,8 +123,11 @@ pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
 fn build_into(
     src: PyramidSource,
     storage_table: &str,
-    source_bounds: Option<(f64, f64, f64, f64)>,
+    source_bounds: Option<Bbox>,
 ) -> Result<i64, Box<dyn Error + Send + Sync>> {
+    // A full build replaces the complete zoom set, including an empty source.
+    // This shares the publication transaction, so failures restore old stats.
+    crate::stats::delete_stats(src.name)?;
     // Validate each LOD rule's filter against the src up front, so a bad
     // expr fails cleanly (naming the rule) before any prep/shadow work and
     // never leaves a partial pyramid. `AND false` makes it a pure parse/column
@@ -597,7 +601,7 @@ fn source_bbox(
     table: &str,
     geom_column: &str,
     tile_srs: i32,
-) -> Result<Option<(f64, f64, f64, f64)>, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<Bbox>, Box<dyn Error + Send + Sync>> {
     // Identifiers are validated by callers.
     let inner = format!(
         r#"SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS g
@@ -698,8 +702,7 @@ fn run_zoom_strips(
     // feature-major-points path never reaches here (it stays parallel=1).
     let prepared_table = prepared.map(|p| p.table.clone());
 
-    let mut job_paths: Vec<PathBuf> = Vec::new();
-    let mut handles: Vec<pgrx::bgworkers::DynamicBackgroundWorker> = Vec::new();
+    let mut jobs = Vec::new();
     let mut inline_strips: Vec<TileRect> = Vec::new();
 
     for slot in 0..slots {
@@ -717,34 +720,26 @@ fn run_zoom_strips(
             unsafe { pg_sys::MyProcPid } as u32,
             crate::worker::next_job_idx(),
         );
-        let job = crate::worker::Job {
-            db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
-            mode: crate::worker::WorkerMode::BuildStrips {
-                pyramid_name: src.name.to_string(),
-                storage_table: storage_table.to_string(),
-                source_table: src.source_table.to_string(),
-                geom_column: src.geom_column.to_string(),
-                fid_column: src.fid_column.to_string(),
-                config: src.cfg.clone(),
-                knobs: knobs.to_values(),
-                strips: chunk.clone(),
-                prepared_table: prepared_table.clone(),
-                feature_driven,
-            },
-        };
-        let path = crate::worker::write_job(&filename, &job)?;
-        match crate::worker::spawn(&filename) {
-            Ok(handle) => {
-                job_paths.push(path);
-                handles.push(handle);
-            }
+        let job = crate::worker::Job::new(crate::worker::WorkerMode::BuildStrips {
+            pyramid_name: src.name.to_string(),
+            storage_table: storage_table.to_string(),
+            source_table: src.source_table.to_string(),
+            geom_column: src.geom_column.to_string(),
+            fid_column: src.fid_column.to_string(),
+            config: Box::new(src.cfg.clone()),
+            knobs: knobs.to_values(),
+            strips: chunk.clone(),
+            prepared_table: prepared_table.clone(),
+            feature_driven,
+        })?;
+        match crate::worker::WorkerJob::start(&filename, &job) {
+            Ok(worker) => jobs.push(worker),
             Err(e) => {
                 notice!(
                     "geometry_pyramid: worker slot {} unavailable ({}); running inline",
                     slot,
                     e
                 );
-                crate::worker::cleanup_job(&path);
                 inline_strips.extend(chunk);
             }
         }
@@ -763,15 +758,7 @@ fn run_zoom_strips(
         )?;
     }
 
-    let wait_result = crate::worker::wait_for(&job_paths, src.cfg.build_timeout_ms);
-    for p in &job_paths {
-        crate::worker::cleanup_job(p);
-    }
-    // Keep worker handles alive until after wait_for; drop them now.
-    drop(handles);
-    wait_result?;
-
-    Ok(())
+    crate::worker::wait_for(&jobs, src.cfg.build_timeout_ms)
 }
 
 /// Attribute projection fragments for the feature pipeline: (inner, outer).

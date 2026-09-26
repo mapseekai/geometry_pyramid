@@ -444,8 +444,10 @@ mod tests {
             ymin: 0,
             ymax: 3,
         };
-        let mut cfg = crate::config::PyramidConfig::default();
-        cfg.tile_size = 4096;
+        let mut cfg = crate::config::PyramidConfig {
+            tile_size: 4096,
+            ..Default::default()
+        };
         for (buffer, pairs) in [(0, 9), (4096, 16)] {
             // Direct statistics invocation deliberately includes a full-tile
             // buffer to exercise clamping independently of config validation.
@@ -1073,11 +1075,10 @@ mod tests {
             .expect("previous tile must survive a failed rebuild");
         assert_eq!(before, after);
 
-        let shadow_left = Spi::get_one::<bool>(
-            "SELECT to_regclass('\"_gp_tiles__gp_atomic__shadow\"') IS NOT NULL",
-        )
-        .unwrap()
-        .unwrap();
+        let shadow_left =
+            Spi::get_one::<bool>("SELECT to_regclass('\"_gp_shadow__gp_atomic\"') IS NOT NULL")
+                .unwrap()
+                .unwrap();
         assert!(!shadow_left);
 
         Spi::run("SELECT ST_DropPyramid('_gp_atomic')").unwrap();
@@ -2983,6 +2984,237 @@ mod tests {
             "invalid buildRules filter must leave no pyramid (no tile table, no catalog row)"
         );
         Spi::run("DROP TABLE _gp_bri").unwrap();
+    }
+    #[pg_test]
+    fn shadow_names_do_not_destroy_other_pyramids() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_name_src AS SELECT 1::bigint AS id, ST_SetSRID(ST_MakePoint(1,1),4326) AS geom").unwrap();
+        for name in ["name_collision__shadow", "name_collision"] {
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('_gp_name_src','geom','id','{{"name":"{name}","minZoom":0,"maxZoom":0}}')"#)).unwrap();
+        }
+        let before = tile_bytes("SELECT ST_Tile('name_collision__shadow',0,0,0)");
+        Spi::run(
+            "SELECT ST_UpdatePyramid('name_collision',''); SELECT ST_DropPyramid('name_collision')",
+        )
+        .unwrap();
+        assert_eq!(
+            tile_bytes("SELECT ST_Tile('name_collision__shadow',0,0,0)"),
+            before
+        );
+        // Exercise the longest permitted name, including its owned sequence.
+        let long_name = "n".repeat(45);
+        Spi::run(&format!(r#"SELECT ST_BuildPyramid('_gp_name_src','geom','id','{{"name":"{long_name}","minZoom":0,"maxZoom":0}}'); SELECT ST_UpdatePyramid('{long_name}',''); SELECT ST_DropPyramid('{long_name}')"#)).unwrap();
+        Spi::run("SELECT ST_DropPyramid('name_collision__shadow'); DROP TABLE _gp_name_src")
+            .unwrap();
+    }
+
+    #[pg_test]
+    fn full_rebuild_replaces_zoom_stats_including_empty_source() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_replace_stats AS SELECT 1::bigint AS id, ST_SetSRID(ST_MakePoint(1,1),4326) AS geom").unwrap();
+        for (min_zoom, max_zoom) in [(0, 2), (1, 1)] {
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('_gp_replace_stats','geom','id','{{"minZoom":{min_zoom},"maxZoom":{max_zoom}}}')"#)).unwrap();
+        }
+        assert_eq!(Spi::get_one::<String>("SELECT array_agg(z ORDER BY z)::text FROM geometry_pyramid_stats WHERE pyramid_name='_gp_replace_stats'").unwrap().as_deref(), Some("{1}"));
+        // Failure after deleting stats must restore the old statistics as well.
+        Spi::run(r#"DO $$ BEGIN
+          PERFORM ST_BuildPyramid('_gp_replace_stats','geom','id','{"minZoom":0,"maxZoom":0,"attributes":["missing_column"]}');
+          EXCEPTION WHEN undefined_column THEN NULL; END $$"#).unwrap();
+        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM geometry_pyramid_stats WHERE pyramid_name='_gp_replace_stats' AND z=1 AND tile_count>0").unwrap(), Some(1));
+        Spi::run("DELETE FROM _gp_replace_stats; SELECT ST_UpdatePyramid('_gp_replace_stats','')")
+            .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM _gp_tiles__gp_replace_stats").unwrap(),
+            Some(0)
+        );
+        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM geometry_pyramid_stats WHERE pyramid_name='_gp_replace_stats'").unwrap(), Some(0));
+        Spi::run("SELECT ST_DropPyramid('_gp_replace_stats'); DROP TABLE _gp_replace_stats")
+            .unwrap();
+    }
+
+    #[pg_test]
+    fn incremental_refresh_matches_full_build_at_buffer_boundaries() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        Spi::run("CREATE TABLE _gp_buffer_src (id bigint, geom geometry(Point,3857), label text)")
+            .unwrap();
+        Spi::run("INSERT INTO _gp_buffer_src VALUES (1,ST_SetSRID(ST_MakePoint(-10000000,-10000000),3857),'anchor'),(2,ST_SetSRID(ST_MakePoint(10000000,10000000),3857),'anchor')").unwrap();
+        for (buffer, x) in [(0, 0), (8, 1), (256, 1)] {
+            Spi::run(&format!("INSERT INTO _gp_buffer_src VALUES (3,ST_SetSRID(ST_MakePoint({x},1000000),3857),'before')")).unwrap();
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('_gp_buffer_src','geom','id','{{"name":"buffer_refresh","sourceSRS":3857,"minZoom":1,"maxZoom":3,"tileExtend":{buffer},"attributes":["label"]}}')"#)).unwrap();
+            Spi::run("UPDATE _gp_buffer_src SET label='after' WHERE id=3; SELECT ST_UpdatePyramid('buffer_refresh','id=3')").unwrap();
+            let incremental = decoded_stored_tiles("buffer_refresh");
+            Spi::run("SELECT ST_UpdatePyramid('buffer_refresh','')").unwrap();
+            assert_eq!(
+                incremental,
+                decoded_stored_tiles("buffer_refresh"),
+                "attribute update, buffer={buffer}"
+            );
+            Spi::run("DELETE FROM _gp_buffer_src WHERE id=3").unwrap();
+            Spi::run(&format!(
+                "SELECT ST_UpdatePyramidByExtent('buffer_refresh',{x},1000000,{x},1000000,3857)"
+            ))
+            .unwrap();
+            let incremental = decoded_stored_tiles("buffer_refresh");
+            Spi::run("SELECT ST_UpdatePyramid('buffer_refresh','')").unwrap();
+            assert_eq!(
+                incremental,
+                decoded_stored_tiles("buffer_refresh"),
+                "deletion, buffer={buffer}"
+            );
+            Spi::run("SELECT ST_DropPyramid('buffer_refresh')").unwrap();
+        }
+        Spi::run("DROP TABLE _gp_buffer_src").unwrap();
+    }
+
+    #[pg_test(error = "tileSRS must be 3857; other tile coordinate systems are not supported")]
+    fn build_rejects_unsupported_tile_srs_before_registering() {
+        Spi::run(r#"SELECT ST_BuildPyramid('unused_source','geom','id','{"tileSRS":4326}')"#)
+            .unwrap();
+    }
+
+    #[pg_test(error = "tileSRS must be 3857; other tile coordinate systems are not supported")]
+    fn tile_rejects_unsupported_srs_in_existing_catalog() {
+        Spi::run(r#"INSERT INTO geometry_pyramid_catalog (pyramid_name,source_table,geom_column,fid_column,config) VALUES ('invalid_srs','unused_source','geom','id','{"tileSRS":4326}')"#).unwrap();
+        Spi::run("SELECT ST_Tile('invalid_srs',0,0,0)").unwrap();
+    }
+
+    #[pg_test]
+    fn worker_sql_error_reports_cause_and_rolls_back() {
+        use crate::worker::{exec_sql_autonomous, exec_sql_autonomous_timeout};
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_worker_rollback; CREATE TABLE _gp_worker_rollback (id int)",
+        )
+        .unwrap();
+        let error = exec_sql_autonomous_timeout(
+            "INSERT INTO _gp_worker_rollback VALUES (1); SELECT 1/0",
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("division by zero"), "{error}");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM _gp_worker_rollback").unwrap(),
+            Some(0)
+        );
+        Spi::run("DROP TABLE _gp_worker_rollback").unwrap();
+    }
+
+    #[pg_test]
+    fn worker_exit_without_status_is_reported_without_timeout() {
+        let error = crate::worker::exec_sql_autonomous_timeout(
+            "SELECT pg_terminate_backend(pg_backend_pid())",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("worker exited without reporting completion"),
+            "{error}"
+        );
+    }
+
+    #[pg_test]
+    fn worker_timeout_stops_process_and_removes_ipc() {
+        use crate::worker::{exec_sql_autonomous, exec_sql_autonomous_timeout};
+        exec_sql_autonomous(
+            "DROP TABLE IF EXISTS _gp_worker_timeout; CREATE TABLE _gp_worker_timeout (id int)",
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let error = exec_sql_autonomous_timeout(
+            "INSERT INTO _gp_worker_timeout VALUES (1); SELECT pg_sleep(10)",
+            200,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "termination must interrupt SQL"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM _gp_worker_timeout").unwrap(),
+            Some(0)
+        );
+        let prefix = format!("gp_{}_", unsafe { pg_sys::MyProcPid });
+        assert!(
+            !std::fs::read_dir(crate::worker::job_dir())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix)),
+            "worker IPC files must be removed after shutdown"
+        );
+        Spi::run("DROP TABLE _gp_worker_timeout").unwrap();
+    }
+
+    #[pg_test]
+    fn worker_guard_stops_process_on_coordinator_error() {
+        use crate::worker::{Job, WorkerJob, WorkerMode};
+        let job = Job::new(WorkerMode::ExecSql {
+            sql: "SELECT pg_sleep(10)".into(),
+        })
+        .unwrap();
+        let filename = crate::worker::job_filename(
+            unsafe { pg_sys::MyProcPid } as u32,
+            crate::worker::next_job_idx(),
+        );
+        let start = std::time::Instant::now();
+        // A Rust panic follows the same Drop path as PostgreSQL errors converted
+        // by pgrx. It avoids poisoning the coordinator transaction in this test.
+        let result = std::panic::catch_unwind(|| {
+            let _worker = WorkerJob::start(&filename, &job).unwrap();
+            panic!("coordinator failed after spawning a worker");
+        });
+        assert!(result.is_err());
+        assert!(start.elapsed().as_secs() < 5);
+        assert!(!crate::worker::job_dir().join(&filename).exists());
+    }
+
+    #[pg_test]
+    fn parallel_build_preserves_effective_role_rls_and_search_path() {
+        use crate::worker::exec_sql_autonomous;
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+        exec_sql_autonomous(r#"
+            CREATE ROLE gp_context_role NOLOGIN NOSUPERUSER;
+            CREATE SCHEMA gp_context;
+            GRANT USAGE, CREATE ON SCHEMA gp_context TO gp_context_role;
+            CREATE TABLE gp_context.source (id bigint, geom geometry(Point,4326), allowed bool);
+            INSERT INTO gp_context.source VALUES
+                (1,ST_SetSRID(ST_MakePoint(-170,70),4326),true),
+                (2,ST_SetSRID(ST_MakePoint(170,-70),4326),true),
+                (3,ST_SetSRID(ST_MakePoint(10,10),4326),false);
+            ALTER TABLE gp_context.source ENABLE ROW LEVEL SECURITY;
+            CREATE POLICY visible_rows ON gp_context.source USING (allowed AND current_user='gp_context_role');
+            GRANT SELECT ON gp_context.source TO gp_context_role;
+            CREATE FUNCTION gp_context.check_role() RETURNS bool LANGUAGE plpgsql AS $$ BEGIN
+                IF current_user <> 'gp_context_role' THEN RAISE EXCEPTION 'worker changed effective role'; END IF;
+                RETURN true;
+            END $$;
+        "#).unwrap();
+        Spi::run("GRANT SELECT,INSERT,UPDATE,DELETE ON geometry_pyramid_catalog,geometry_pyramid_stats TO gp_context_role; SET LOCAL search_path=gp_context,public; SET LOCAL ROLE gp_context_role").unwrap();
+        for (name, parallel, prepared) in [
+            ("context_serial", 1, false),
+            ("context_parallel", 2, false),
+            ("context_prepared", 2, true),
+        ] {
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('source','geom','id','{{"name":"{name}","minZoom":4,"maxZoom":4,"parallel":{parallel},"preparedBuild":{prepared},"buildTimeoutMs":5000,"buildRules":[{{"minZoom":4,"maxZoom":4,"filter":"check_role()"}}]}}')"#)).unwrap();
+        }
+        let serial = decoded_stored_tiles("context_serial");
+        assert!(!serial.is_empty());
+        assert!(
+            serial.values().flatten().all(|f| f.0 != 3),
+            "RLS must hide fid=3"
+        );
+        assert_eq!(serial, decoded_stored_tiles("context_parallel"));
+        assert_eq!(serial, decoded_stored_tiles("context_prepared"));
+        // A session row_security=off must continue to reject a protected read,
+        // rather than silently re-enabling RLS inside a worker.
+        Spi::run("SET LOCAL row_security=off").unwrap();
+        let error = exec_sql_autonomous("SELECT count(*) FROM source").unwrap_err();
+        assert!(error.to_string().contains("row-level security"), "{error}");
+        Spi::run("SET LOCAL row_security=on; SELECT ST_DropPyramid('context_serial'); SELECT ST_DropPyramid('context_parallel'); SELECT ST_DropPyramid('context_prepared'); RESET ROLE; SET LOCAL search_path=public; DROP SCHEMA gp_context CASCADE; REVOKE ALL ON geometry_pyramid_catalog,geometry_pyramid_stats FROM gp_context_role; DROP ROLE gp_context_role").unwrap();
     }
 }
 

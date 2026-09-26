@@ -6,7 +6,8 @@
 use crate::config::PyramidConfig;
 use crate::tile_rect::TileRect;
 use pgrx::bgworkers::{
-    BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
+    BackgroundWorker, BackgroundWorkerBuilder, BackgroundWorkerStatus, DynamicBackgroundWorker,
+    SignalWakeFlags,
 };
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -19,10 +20,49 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+unsafe extern "C-unwind" {
+    // A signal handler must use the raw backend symbol, not pgrx's Rust FFI
+    // wrapper (which establishes a panic boundary and is not signal-safe).
+    #[link_name = "die"]
+    fn backend_die(signal: i32);
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Job {
     pub db_oid: u32,
+    pub user_oid: u32,
+    #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+    pub login_oid: u32,
+    pub search_path: String,
+    pub row_security: String,
     pub mode: WorkerMode,
+}
+
+impl Job {
+    pub(crate) fn new(mode: WorkerMode) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Ok(Self {
+            // Capture the effective role, including SET ROLE, rather than the login role.
+            db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
+            user_oid: unsafe { pg_sys::GetUserId() }.to_u32(),
+            #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+            login_oid: unsafe { pg_sys::GetAuthenticatedUserId() }.to_u32(),
+            search_path: Spi::get_one("SELECT current_setting('search_path')")?
+                .ok_or("search_path is unavailable")?,
+            row_security: Spi::get_one("SELECT current_setting('row_security')")?
+                .ok_or("row_security is unavailable")?,
+            mode,
+        })
+    }
+
+    fn apply_settings(&self) -> Result<(), spi::Error> {
+        Spi::run_with_args(
+            "SELECT set_config('search_path', $1, true), set_config('row_security', $2, true)",
+            &[
+                self.search_path.as_str().into(),
+                self.row_security.as_str().into(),
+            ],
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,7 +81,7 @@ pub(crate) enum WorkerMode {
         source_table: String,
         geom_column: String,
         fid_column: String,
-        config: PyramidConfig,
+        config: Box<PyramidConfig>,
         knobs: KnobValues,
         strips: Vec<TileRect>,
         /// Committed prepared table the workers read (None = baseline path).
@@ -108,20 +148,24 @@ pub(crate) fn cleanup_job(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PyramidConfig;
     use crate::tile_rect::TileRect;
 
     #[test]
     fn job_roundtrips_through_json() {
         let job = Job {
             db_oid: 16384,
+            user_oid: 16385,
+            #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+            login_oid: 10,
+            search_path: "data, public".into(),
+            row_security: "on".into(),
             mode: WorkerMode::BuildStrips {
                 pyramid_name: "p".into(),
-                storage_table: "_gp_tiles_p__shadow".into(),
+                storage_table: "_gp_shadow_p".into(),
                 source_table: "src".into(),
                 geom_column: "geom".into(),
                 fid_column: "gid".into(),
-                config: PyramidConfig::default(),
+                config: Box::default(),
                 knobs: KnobValues {
                     simplify_tol_m: 1.0,
                     min_area_m2: 2.0,
@@ -152,6 +196,9 @@ mod tests {
             panic!("wrong mode");
         };
         assert_eq!(back.db_oid, 16384);
+        assert_eq!(back.user_oid, 16385);
+        assert_eq!(back.search_path, "data, public");
+        assert_eq!(back.row_security, "on");
         assert_eq!(strips.len(), 1);
         assert_eq!(strips[0].z, 3);
         assert!((knobs.drop_threshold - 0.4).abs() < 1e-9);
@@ -190,7 +237,16 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
     let filename = BackgroundWorker::get_extra().to_string();
     let path = job_dir().join(&filename);
 
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // The pgrx SIGTERM handler only sets a shutdown flag for cooperative loops.
+    // These workers execute SQL: use the backend handler so CHECK_FOR_INTERRUPTS
+    // cancels a long query (including pg_sleep) and rolls its transaction back.
+    unsafe {
+        #[cfg(not(feature = "pg18"))]
+        pg_sys::pqsignal(pg_sys::SIGTERM as i32, Some(backend_die));
+        #[cfg(feature = "pg18")]
+        pg_sys::pqsignal_be(pg_sys::SIGTERM as i32, Some(backend_die));
+    }
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP);
 
     let job: Job = match fs::read_to_string(&path)
         .map_err(|e| e.to_string())
@@ -203,9 +259,57 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
         }
     };
 
-    BackgroundWorker::connect_worker_to_spi_by_oid(Some(pg_sys::Oid::from(job.db_oid)), None);
+    let result = PgTryBuilder::new(|| {
+        if job.user_oid == 0 {
+            return Err("worker job has no effective user".into());
+        }
+        // SET ROLE may select a NOLOGIN role. The coordinator already runs as
+        // this role; allow its internal connection without granting extra SQL
+        // privileges. PG13-16 have no bypass flag: initialize with the original
+        // authenticated role, then narrow the session before executing job SQL.
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        let flags = pg_sys::BGWORKER_BYPASS_ROLELOGINCHECK;
+        #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+        let flags = 0;
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        let connection_user = job.user_oid;
+        #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+        let connection_user = job.login_oid;
+        if connection_user == 0 {
+            return Err("worker job has no connection user".into());
+        }
+        unsafe {
+            pg_sys::BackgroundWorkerInitializeConnectionByOid(
+                pg_sys::Oid::from(job.db_oid),
+                pg_sys::Oid::from(connection_user),
+                flags,
+            );
+        }
+        #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+        BackgroundWorker::transaction(|| unsafe {
+            let user = pg_sys::Oid::from(job.user_oid);
+            pg_sys::SetSessionAuthorization(user, pg_sys::superuser_arg(user));
+            pg_sys::SetCurrentRoleId(pg_sys::InvalidOid, false);
+        });
+        run_job(&job)
+    })
+    .catch_others(|cause| {
+        let report = match cause {
+            pg_sys::panic::CaughtError::PostgresError(report)
+            | pg_sys::panic::CaughtError::ErrorReport(report)
+            | pg_sys::panic::CaughtError::RustPanic {
+                ereport: report, ..
+            } => report,
+        };
+        let message = report.message().to_owned();
+        // Do not return to SPI in an aborted transaction or accidentally commit
+        // work preceding the ERROR. This worker exits after writing its status.
+        unsafe { pg_sys::AbortCurrentTransaction() };
+        Err(message.into())
+    })
+    .execute();
 
-    match run_job(&job) {
+    match result {
         Ok(()) => {
             let _ = fs::write(path.with_extension("done"), b"ok");
         }
@@ -218,8 +322,10 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
 fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
     match &job.mode {
         WorkerMode::ExecSql { sql } => {
-            let result: Result<(), pgrx::spi::Error> =
-                BackgroundWorker::transaction(|| pgrx::Spi::run(sql));
+            let result: Result<(), pgrx::spi::Error> = BackgroundWorker::transaction(|| {
+                job.apply_settings()?;
+                pgrx::Spi::run(sql)
+            });
             result?;
             Ok(())
         }
@@ -251,6 +357,7 @@ fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map(|t| crate::prepared::PreparedBuildSource::new(t.clone(), true));
             for rect in strips {
                 let result: Result<i64, pgrx::spi::Error> = BackgroundWorker::transaction(|| {
+                    job.apply_settings()?;
                     crate::build::build_zoom_level_dispatch(
                         src,
                         storage_table,
@@ -265,6 +372,36 @@ fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             Ok(())
         }
+    }
+}
+
+/// Own the process and its IPC files together. Early returns and PostgreSQL
+/// ERROR unwinding stop the worker before removing files it might still write.
+pub(crate) struct WorkerJob {
+    path: PathBuf,
+    handle: Option<DynamicBackgroundWorker>,
+}
+
+impl WorkerJob {
+    pub(crate) fn start(filename: &str, job: &Job) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let path = write_job(filename, job)?;
+        let mut worker = Self { path, handle: None };
+        worker.handle = Some(spawn(filename)?);
+        Ok(worker)
+    }
+}
+
+impl Drop for WorkerJob {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Cleanup also runs while unwinding a query cancellation. Defer a
+            // second interrupt until the child has stopped, avoiding a double
+            // panic and preventing it from racing the next build.
+            unsafe { pg_sys::InterruptHoldoffCount += 1 };
+            let _ = handle.terminate().wait_for_shutdown();
+            unsafe { pg_sys::InterruptHoldoffCount -= 1 };
+        }
+        cleanup_job(&self.path);
     }
 }
 
@@ -292,17 +429,11 @@ pub(crate) fn exec_sql_autonomous_timeout(
     timeout_ms: i64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let filename = job_filename(unsafe { pg_sys::MyProcPid } as u32, next_job_idx());
-    let job = Job {
-        db_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
-        mode: WorkerMode::ExecSql {
-            sql: sql.to_string(),
-        },
-    };
-    let path = write_job(&filename, &job)?;
-    let _handle = spawn(&filename)?;
-    let result = wait_for(slice::from_ref(&path), timeout_ms);
-    cleanup_job(&path);
-    result
+    let job = Job::new(WorkerMode::ExecSql {
+        sql: sql.to_string(),
+    })?;
+    let worker = WorkerJob::start(&filename, &job)?;
+    wait_for(slice::from_ref(&worker), timeout_ms)
 }
 
 /// Run committed DDL with the default 60s budget (fast schema-only work).
@@ -313,26 +444,37 @@ pub(crate) fn exec_sql_autonomous(sql: &str) -> Result<(), Box<dyn Error + Send 
 /// Poll status files until every job is done, any errors out, or the
 /// timeout (ms, 0 = unbounded) elapses.
 ///
-/// A worker that dies without writing a status file (e.g. an OS kill, or a
-/// PG `FATAL`/`PANIC` that longjmps past the `.err` write) is only detected
-/// here by the timeout — hence callers should pass a non-zero `timeout_ms`
-/// for unattended builds. The common failure (a PG `ERROR` inside the
-/// worker's transaction) is caught by pgrx and surfaced as a written `.err`.
+/// A stopped worker without a status file is an error even with no timeout.
 pub(crate) fn wait_for(
-    paths: &[PathBuf],
+    workers: &[WorkerJob],
     timeout_ms: i64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let started = Instant::now();
     loop {
         let mut pending = 0usize;
-        for p in paths {
+        for worker in workers {
+            let p = &worker.path;
             let err_path = p.with_extension("err");
             if err_path.exists() {
                 let msg = fs::read_to_string(&err_path).unwrap_or_default();
                 return Err(format!("worker failed: {msg}").into());
             }
-            if !p.with_extension("done").exists() {
-                pending += 1;
+            if p.with_extension("done").exists() {
+                continue;
+            }
+            match worker.handle.as_ref().expect("started worker").pid() {
+                Ok(_) | Err(BackgroundWorkerStatus::NotYetStarted) => pending += 1,
+                Err(BackgroundWorkerStatus::Stopped) => {
+                    // Status may have been written between our first file check
+                    // and observing process shutdown. Recheck after shutdown.
+                    if let Ok(msg) = fs::read_to_string(&err_path) {
+                        return Err(format!("worker failed: {msg}").into());
+                    }
+                    if !p.with_extension("done").exists() {
+                        return Err("worker exited without reporting completion".into());
+                    }
+                }
+                Err(status) => return Err(format!("worker unavailable: {status:?}").into()),
             }
         }
         if pending == 0 {

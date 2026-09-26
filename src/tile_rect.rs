@@ -31,6 +31,17 @@ impl TileRect {
         }
     }
 
+    /// Tiles whose closed envelopes intersect a bbox. Unlike assigning a point
+    /// to its containing tile, a bbox on a grid line also touches its neighbour.
+    pub fn intersecting_bbox_m(z: u8, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Self {
+        let mut rect = Self::from_bbox_m(z, xmin, ymin, xmax, ymax);
+        let n = 1i64 << z;
+        let span = 2.0 * WEBMERC_HALF_EXTENT / n as f64;
+        rect.xmin = (((xmin + WEBMERC_HALF_EXTENT) / span).ceil() as i64 - 1).clamp(0, n - 1);
+        rect.ymin = (((WEBMERC_HALF_EXTENT - ymax) / span).ceil() as i64 - 1).clamp(0, n - 1);
+        rect
+    }
+
     pub fn width(&self) -> i64 {
         self.xmax - self.xmin + 1
     }
@@ -190,8 +201,8 @@ mod tests {
     fn out_of_range_is_clamped() {
         let r = TileRect::from_bbox_m(5, -1e9, -1e9, -9e8, -9e8);
         let n: i64 = 1 << 5;
-        assert!(r.xmin >= 0 && r.xmax <= n - 1);
-        assert!(r.ymin >= 0 && r.ymax <= n - 1);
+        assert!(r.xmin >= 0 && r.xmax < n);
+        assert!(r.ymin >= 0 && r.ymax < n);
         let r2 = TileRect::from_bbox_m(5, 1e9, 1e9, 2e9, 2e9);
         assert_eq!((r2.xmin, r2.ymin, r2.xmax, r2.ymax), (31, 0, 31, 0));
     }

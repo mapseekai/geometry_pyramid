@@ -32,7 +32,7 @@ pub const DEFAULT_MAX_TILE_SIZE_ATTEMPTS: u32 = 5;
 
 /// Web Mercator full span (m). Used to convert a zoom level + tile extent
 /// into a per-pixel ground distance for simplification / size filters.
-pub const WEBMERC_FULL_SPAN_M: f64 = 40_075_016.685_578_488;
+pub const WEBMERC_FULL_SPAN_M: f64 = 40_075_016.685_578_49;
 
 /// Largest accepted `maxZoom`. Tile indices stay well within i32 and the
 /// build cost stays bounded.
@@ -352,6 +352,11 @@ impl PyramidConfig {
     /// `minZoom <= maxZoom`, `maxZoom <= MAX_ZOOM_LIMIT`, `0 < tileSize <=
     /// MAX_TILE_SIZE`, and `tileExtend < tileSize`.
     pub fn validate(&self) -> Result<(), String> {
+        if self.tile_srs != 3857 {
+            return Err(
+                "tileSRS must be 3857; other tile coordinate systems are not supported".into(),
+            );
+        }
         if self.min_zoom > self.max_zoom {
             return Err(format!(
                 "minZoom ({}) must be <= maxZoom ({})",
