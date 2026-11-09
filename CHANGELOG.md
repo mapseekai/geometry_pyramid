@@ -4,6 +4,17 @@ All notable changes to `geometry_pyramid` are documented here. The format follow
 [Keep a Changelog](https://keepachangelog.com/), and the project targets pgrx 0.18
 / PostgreSQL 17 / PostGIS 3.6.
 
+## [0.1.1] - 2026-11-09
+
+- Bind source and output relations by OID. Full rebuilds preserve the published table and its grants. Existing 0.1.0 installations require explicit relation bindings during upgrade (see README).
+- Keep session-sensitive, uncommitted and small jobs local. Parallel builds check ownership before using shared scratch tables and publish complete worker status messages atomically.
+- Align geographic and projected candidate filters, outer tile buffers and effective zoom budgets across full builds, refreshes and dynamic reads. Upsert statistics on the first refresh after an empty build.
+- Prune regions below `splitSize` before clipping in tile-major builds. Accept the Ganos key `maxLevel` as an alias for `maxZoom`.
+- Skip empty regions in default builds of sufficiently sparse indexed tables. Add opt-in `buildRules.pointGrid` for coarse point layers and warn when the byte budget remains exceeded after retries.
+- Reuse simplification for complex features shared by a few tiles in opt-in serial builds. Skip the intermediate clipped rows for typed point tables using `pointGrid`.
+- Run the requested benchmark case for `--small-parallel`. The synthetic `--sparse` suite runs independently of the imported fixtures.
+- Verify the Ubuntu PG17 package on PRs, manual runs, and release tags. Test upgrades from `v0.1.0` and publish the verified archive on release tags.
+
 ## [0.1.0] - 2026-09-08
 
 ### Added

@@ -294,8 +294,8 @@ mod tests {
         );
         assert_eq!(
             function_calls("st_asmvtgeom") - clip_before,
-            900,
-            "each of the nine candidates per polygon must clip exactly once"
+            100,
+            "only the candidate intersecting each source envelope should be clipped"
         );
         assert_eq!(decoded_stored_tiles("eval_once")[&(8, 128, 127)].len(), 100);
         Spi::run("DROP TABLE _gp_eval_driven").unwrap();
@@ -690,6 +690,7 @@ mod tests {
         )
         .unwrap();
 
+        record_prepared_indexes();
         let before = prepared_geom_index_count();
         let ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_brfm','geom','gid', \
@@ -929,6 +930,7 @@ mod tests {
         )
         .unwrap();
 
+        record_prepared_indexes();
         let before = prepared_geom_index_count();
         let ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_fm_noidx','geom','gid', \
@@ -961,6 +963,7 @@ mod tests {
         )
         .unwrap();
 
+        record_prepared_indexes();
         let before = prepared_geom_index_count();
         let ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_fm_mixed_idx','geom','gid', \
@@ -979,17 +982,26 @@ mod tests {
         Spi::run("DROP TABLE _gp_fm_mixed_idx").unwrap();
     }
 
+    // Observe CREATE INDEX while the prepared table exists, including when
+    // successful builds free their temporary tables before returning.
+    fn record_prepared_indexes() {
+        Spi::run("CREATE TEMP TABLE gp_created_indexes(id oid);
+            CREATE FUNCTION pg_temp.record_index() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+            INSERT INTO pg_temp.gp_created_indexes SELECT c.oid FROM pg_event_trigger_ddl_commands() e
+            JOIN pg_class c ON c.oid=e.objid WHERE c.relnamespace=pg_my_temp_schema()
+                AND c.relkind='i' AND c.relname LIKE '_gp_prep_%_geom_tile_idx'; END $$").unwrap();
+        Spi::run(&format!(
+            "CREATE EVENT TRIGGER gp_index_{} ON ddl_command_end WHEN TAG IN ('CREATE INDEX')
+                   EXECUTE FUNCTION pg_temp.record_index()",
+            unsafe { pgrx::pg_sys::MyProcPid }
+        ))
+        .unwrap();
+    }
+
     fn prepared_geom_index_count() -> i64 {
-        Spi::get_one::<i64>(
-            "SELECT count(*)::bigint \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.oid = pg_my_temp_schema() \
-               AND c.relkind = 'i' \
-               AND c.relname LIKE '_gp_prep_%_geom_tile_idx'",
-        )
-        .unwrap()
-        .unwrap()
+        Spi::get_one("SELECT count(*) FROM pg_temp.gp_created_indexes")
+            .unwrap()
+            .unwrap()
     }
 
     /// Stats rows must be written per zoom and removed on drop.
@@ -1448,7 +1460,7 @@ mod tests {
     /// undetectable ACCESS SHARE vs ACCESS EXCLUSIVE deadlock that burned the full
     /// worker timeout on every parallel build.
     #[pg_test]
-    fn parallel_build_self_heals_and_drops_prepared_table() {
+    fn local_fallback_preserves_an_unmanaged_prepared_name() {
         use crate::worker::exec_sql_autonomous;
         Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
 
@@ -1466,11 +1478,10 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate a leaked prepared table from a crashed run: deterministic name
-        // `_gp_prep_heal` with a deliberately WRONG schema, so a stale read (rather
-        // than a clean recreate) would fail loudly. The build must DROP+recreate it.
+        // An unmarked relation is ordinary user data, even with our old scratch name.
         exec_sql_autonomous(
-            r#"DROP TABLE IF EXISTS "_gp_prep_heal"; CREATE TABLE "_gp_prep_heal" (bogus int)"#,
+            r#"DROP TABLE IF EXISTS "_gp_prep_heal"; CREATE TABLE "_gp_prep_heal" (bogus int);
+               INSERT INTO "_gp_prep_heal" VALUES (73)"#,
         )
         .unwrap();
 
@@ -1492,14 +1503,11 @@ mod tests {
             .unwrap();
         assert!(tiles > 0, "self-healed build must still produce tiles");
 
-        // The committed prepared table must be gone once the build finishes —
-        // dropped in the coordinator transaction, visible as gone within it.
-        let dropped = Spi::get_one::<bool>("SELECT to_regclass('_gp_prep_heal') IS NULL").unwrap();
         assert_eq!(
-            dropped,
-            Some(true),
-            "parallel build must drop its committed prepared table on success"
+            Spi::get_one::<i32>("SELECT bogus FROM _gp_prep_heal").unwrap(),
+            Some(73)
         );
+        Spi::run("DROP TABLE _gp_prep_heal").unwrap();
 
         Spi::run("SELECT ST_DropPyramid('heal')").unwrap();
     }
@@ -1999,6 +2007,279 @@ mod tests {
         Spi::run("SELECT ST_DropPyramid('dyn')").unwrap();
         Spi::run("SELECT ST_DropPyramid('dynoff')").unwrap();
         Spi::run("DROP TABLE _gp_dyn").unwrap();
+    }
+
+    #[pg_test]
+    fn ganos_max_level_caps_materialization_and_allows_dynamic_reads() {
+        Spi::run(
+            r#"CREATE TABLE gp_level_src AS
+                 SELECT 1 AS id, ST_SetSRID(ST_Point(1000,1000),3857) AS geom;
+                 SELECT ST_BuildPyramid('gp_level_src','geom','id',
+                   '{"name":"gp_level","sourceSRS":3857,"maxLevel":1}')"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i16>("SELECT max(z) FROM _gp_tiles_gp_level").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT (ST_Pyramid('gp_level')->'config'->>'maxZoom')::int")
+                .unwrap(),
+            Some(1)
+        );
+        assert!(!tile_bytes("SELECT ST_Tile('gp_level',2,2,1)").is_empty());
+    }
+
+    #[pg_test]
+    fn split_pruning_preserves_buffered_and_deferred_tiles() {
+        Spi::run(
+            "CREATE TABLE gp_split_src (id int, label text, geom geometry(Point,3857));
+             INSERT INTO gp_split_src
+             SELECT i, 'edge-' || i, ST_SetSRID(ST_Point(ST_XMax(g)-100, ST_Y(ST_Centroid(g))),3857)
+             FROM (SELECT ST_TileEnvelope(8,3,4) g) t CROSS JOIN generate_series(1,2) i;
+             INSERT INTO gp_split_src VALUES
+                (3,'outlier',ST_Centroid(ST_TileEnvelope(8,253,249))),
+                (4,'filtered tile',ST_Centroid(ST_TileEnvelope(8,19,21))),
+                (5,'filtered out',ST_Centroid(ST_TileEnvelope(8,19,21)));
+             CREATE INDEX ON gp_split_src USING gist(geom)",
+        )
+        .unwrap();
+        let build = |split, path: &str| {
+            Spi::run(&format!(
+                r#"SELECT ST_BuildPyramid('gp_split_src','geom','id',
+                  '{{"name":"gp_split","sourceSRS":3857,"minZoom":8,"maxZoom":8,
+                     "splitSize":{split},"attributes":["label"],
+                     "buildRules":[{{"minZoom":8,"maxZoom":8,"filter":"id <> 5"}}]{path}}}')"#
+            ))
+            .unwrap();
+        };
+        build(0, "");
+        let all = decoded_stored_tiles("gp_split");
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[&(8, 3, 4)].len(), 2);
+        assert_eq!(all[&(8, 4, 4)].len(), 2);
+        let mut stored = all.clone();
+        stored.retain(|_, features| features.len() >= 2);
+        for path in [
+            "",
+            r#","preparedBuild":true"#,
+            r#","preparedBuild":true,"featureMajorPoints":true,"featureMajorMinZoom":0"#,
+            r#","preparedBuild":true,"featureDrivenEnum":true"#,
+        ] {
+            build(2, path);
+            assert_eq!(decoded_stored_tiles("gp_split"), stored, "{path}");
+            for (&(z, x, y), features) in &all {
+                let bytes = tile_bytes(&format!("SELECT ST_Tile('gp_split',{z},{x},{y})"));
+                assert_eq!(
+                    &decoded_mvt_features(&bytes),
+                    features,
+                    "{path}: {z}/{x}/{y}"
+                );
+            }
+            Spi::run("SELECT ST_UpdatePyramid('gp_split','id=1')").unwrap();
+            assert_eq!(
+                decoded_stored_tiles("gp_split"),
+                stored,
+                "{path} after refresh"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn default_sparse_build_matches_full_grid_including_buffer_tiles() {
+        Spi::run(
+            r#"CREATE TABLE gp_auto_sparse_src (id int, label text, geom geometry(Point,4326));
+               INSERT INTO gp_auto_sparse_src
+               SELECT i, 'scattered-' || i,
+                      ST_Transform(ST_Centroid(ST_TileEnvelope(8,3+(i*37)%250,2+(i*53)%251)),4326)
+               FROM generate_series(1,64) i;
+               INSERT INTO gp_auto_sparse_src
+               SELECT 65, 'near edge',
+                      ST_Transform(ST_SetSRID(ST_Point(ST_XMax(g)-100,ST_Y(ST_Centroid(g))),3857),4326)
+               FROM (SELECT ST_TileEnvelope(8,3,4) AS g) edge"#,
+        )
+        .unwrap();
+        let build = || {
+            Spi::run(
+                r#"SELECT ST_BuildPyramid('gp_auto_sparse_src','geom','id',
+                   '{"name":"gp_auto_sparse","minZoom":8,"maxZoom":8,"attributes":["label"]}')"#,
+            )
+            .unwrap();
+        };
+        build();
+        let full_grid = decoded_stored_tiles("gp_auto_sparse");
+        assert_eq!(full_grid.len(), 66);
+        assert_eq!(full_grid[&(8, 3, 4)][0].0, 65);
+        assert_eq!(full_grid[&(8, 4, 4)][0].0, 65);
+        Spi::run(
+            "CREATE INDEX ON gp_auto_sparse_src USING gist(geom);
+             ANALYZE gp_auto_sparse_src",
+        )
+        .unwrap();
+        build();
+        assert_eq!(decoded_stored_tiles("gp_auto_sparse"), full_grid);
+    }
+
+    #[pg_test]
+    fn point_grid_preserves_key_and_sparse_points_across_tile_paths() {
+        Spi::run(
+            r#"CREATE TABLE gp_grid_src (id int PRIMARY KEY, label text, important boolean,
+                                         geom geometry);
+               INSERT INTO gp_grid_src
+               SELECT id, 'point-' || id, important, ST_SetSRID(ST_Point(x,-200000),3857)
+               FROM (VALUES (1,200000,false),(2,201000,false),(3,202000,true),(4,203000,true),
+                            (5,1000000,false),(6,1001000,false),(7,3000000,NULL)) v(id,x,important);
+               INSERT INTO gp_grid_src VALUES
+                 (8,'multipoint',false,ST_GeomFromText('MULTIPOINT(200000 -200000,450000 -200000)',3857)),
+                 (9,'line',false,ST_GeomFromText('LINESTRING(200000 -200000,3300000 -200000)',3857)),
+                 (10,'measured point',false,ST_GeomFromText('POINT M (1002000 -200000 3)',3857));
+               CREATE INDEX ON gp_grid_src USING gist(geom);
+               SELECT ST_BuildPyramid('gp_grid_src','geom','id',
+                 '{"name":"gp_grid","sourceSRS":3857,"maxZoom":1,"attributes":["label"]}')"#,
+        )
+        .unwrap();
+        let all = decoded_stored_tiles("gp_grid");
+        assert_eq!(all[&(0, 0, 0)].len(), 10);
+        let mut thinned = all.clone();
+        thinned
+            .get_mut(&(0, 0, 0))
+            .unwrap()
+            .retain(|f| ![1, 2, 6, 10].contains(&f.0));
+        let build = |opts: &str| {
+            Spi::run(&format!(
+                r#"SELECT ST_BuildPyramid('gp_grid_src','geom','id',
+                  '{{"name":"gp_grid","sourceSRS":3857,"maxZoom":1,"attributes":["label"],
+                     "buildRules":[{{"minZoom":0,"maxZoom":0,
+                       "pointGrid":{{"cellPixels":64,"keepField":"important"}}}}]{opts}}}')"#
+            ))
+            .unwrap();
+        };
+        build("");
+        assert_eq!(decoded_stored_tiles("gp_grid"), thinned);
+        build(r#","preparedBuild":true,"featureDrivenEnum":true"#);
+        assert_eq!(decoded_stored_tiles("gp_grid"), thinned);
+
+        Spi::run(
+            "UPDATE gp_grid_src SET important=true WHERE id=2;
+             SELECT ST_UpdatePyramid('gp_grid','id=2')",
+        )
+        .unwrap();
+        thinned
+            .get_mut(&(0, 0, 0))
+            .unwrap()
+            .insert(0, all[&(0, 0, 0)][1].clone());
+        assert_eq!(decoded_stored_tiles("gp_grid"), thinned);
+
+        build(r#","splitSize":100"#);
+        assert!(decoded_stored_tiles("gp_grid").is_empty());
+        for ((z, x, y), expected) in thinned {
+            let bytes = tile_bytes(&format!("SELECT ST_Tile('gp_grid',{z},{x},{y})"));
+            assert_eq!(decoded_mvt_features(&bytes), expected);
+        }
+    }
+
+    #[pg_test]
+    fn coarse_overlapping_lines_reuse_simplification() {
+        Spi::run(
+            r#"SET LOCAL track_functions='all';
+               CREATE TABLE gp_reuse_src (id int PRIMARY KEY, label text, geom geometry(LineString,3857));
+               WITH line AS (
+                   SELECT ST_MakeLine(ST_SetSRID(ST_Point(
+                       i*1000-2000000, i*1000-1800000 + CASE WHEN i%2=0 THEN 100 ELSE -100 END
+                   ),3857) ORDER BY i) AS geom
+                   FROM generate_series(0,4096) i
+               )
+               INSERT INTO gp_reuse_src SELECT id, 'line-' || id, geom
+               FROM line CROSS JOIN generate_series(1,24) id"#,
+        )
+        .unwrap();
+        let calls = || {
+            Spi::get_one::<i64>(
+                "SELECT COALESCE(sum(calls),0)::bigint FROM pg_stat_xact_user_functions
+                 WHERE funcname='st_simplifypreservetopology'",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let build = |feature_driven| {
+            Spi::run(&format!(
+                r#"SELECT ST_BuildPyramid('gp_reuse_src','geom','id',
+                   '{{"name":"gp_reuse","sourceSRS":3857,"minZoom":1,"maxZoom":1,
+                      "preparedBuild":true,"featureDrivenEnum":{feature_driven},"attributes":["label"]}}')"#
+            ))
+            .unwrap();
+        };
+        let before = calls();
+        build(false);
+        let tile_major_calls = calls();
+        let expected = decoded_stored_tiles("gp_reuse");
+        assert!(!expected.is_empty());
+        assert_eq!(tile_major_calls - before, 4 * 24);
+        build(true);
+        assert_eq!(calls() - tile_major_calls, 24);
+        assert_eq!(decoded_stored_tiles("gp_reuse"), expected);
+    }
+
+    #[pg_test]
+    fn typed_point_grid_matches_generic_and_dynamic_paths() {
+        Spi::run(
+            r#"CREATE TABLE gp_grid_typed_src (id int PRIMARY KEY, label text, important boolean, geom geometry);
+               INSERT INTO gp_grid_typed_src
+               SELECT id,'point-' || id,keep,ST_SetSRID(ST_Point(x,-200000),3857)
+               FROM (VALUES (1,200000,false),(2,201000,true),(3,202000,true),
+                            (4,1000000,false),(5,1001000,false)) v(id,x,keep)"#,
+        )
+        .unwrap();
+        let build = |options: &str| {
+            Spi::run(&format!(
+                r#"SELECT ST_BuildPyramid('gp_grid_typed_src','geom','id',
+                   '{{"name":"gp_grid_typed","sourceSRS":3857,"maxZoom":0,"attributes":["label"],
+                      "buildRules":[{{"minZoom":0,"maxZoom":0,
+                        "pointGrid":{{"cellPixels":64,"keepField":"important"}}}}]{options}}}')"#
+            ))
+            .unwrap();
+        };
+        build("");
+        let expected = decoded_stored_tiles("gp_grid_typed");
+        assert_eq!(
+            expected[&(0, 0, 0)].iter().map(|f| f.0).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        Spi::run("ALTER TABLE gp_grid_typed_src ALTER COLUMN geom TYPE geometry(Point,3857)")
+            .unwrap();
+        for options in ["", r#","preparedBuild":true"#] {
+            build(options);
+            assert_eq!(decoded_stored_tiles("gp_grid_typed"), expected);
+        }
+        Spi::run(
+            "UPDATE gp_grid_typed_src SET important=true WHERE id=1;
+             SELECT ST_UpdatePyramid('gp_grid_typed','id=1')",
+        )
+        .unwrap();
+        let refreshed = decoded_stored_tiles("gp_grid_typed");
+        assert_eq!(refreshed[&(0, 0, 0)].len(), 4);
+        build(r#","splitSize":10"#);
+        assert!(decoded_stored_tiles("gp_grid_typed").is_empty());
+        assert_eq!(
+            decoded_mvt_features(&tile_bytes("SELECT ST_Tile('gp_grid_typed',0,0,0)")),
+            refreshed[&(0, 0, 0)]
+        );
+    }
+
+    #[pg_test]
+    fn split_pruning_skips_a_view_with_changing_visibility() {
+        Spi::run(
+            r#"CREATE SEQUENCE gp_split_visibility;
+               CREATE VIEW gp_split_view AS
+               SELECT id,ST_SetSRID(ST_Point(1000,1000),3857) AS geom
+               FROM generate_series(1,2) id
+               WHERE CASE WHEN id=2 THEN nextval('gp_split_visibility')=2 ELSE true END;
+               SELECT ST_BuildPyramid('gp_split_view','geom','id',
+                 '{"name":"gp_view_split","sourceSRS":3857,"maxZoom":0,"splitSize":2}')"#,
+        )
+        .unwrap();
+        let tiles = decoded_stored_tiles("gp_view_split");
+        assert_eq!(tiles[&(0, 0, 0)].len(), 2);
     }
 
     /// splitSize defers sub-threshold (sparse) tiles: they are NOT materialized at
@@ -2875,6 +3156,7 @@ mod tests {
         )
         .unwrap();
 
+        record_prepared_indexes();
         let before = prepared_geom_index_count();
         let ok = Spi::get_one::<bool>(
             "SELECT ST_BuildPyramid('_gp_lod_fm','geom','gid',
@@ -3215,6 +3497,231 @@ mod tests {
         let error = exec_sql_autonomous("SELECT count(*) FROM source").unwrap_err();
         assert!(error.to_string().contains("row-level security"), "{error}");
         Spi::run("SET LOCAL row_security=on; SELECT ST_DropPyramid('context_serial'); SELECT ST_DropPyramid('context_parallel'); SELECT ST_DropPyramid('context_prepared'); RESET ROLE; SET LOCAL search_path=public; DROP SCHEMA gp_context CASCADE; REVOKE ALL ON geometry_pyramid_catalog,geometry_pyramid_stats FROM gp_context_role; DROP ROLE gp_context_role").unwrap();
+    }
+    #[pg_test]
+    fn full_refresh_and_dynamic_cover_the_outer_buffer() {
+        Spi::run("CREATE TABLE edge_src AS SELECT 1 id, ST_SetSRID(ST_Point(1,1),3857) geom")
+            .unwrap();
+        for buffer in [0, 8] {
+            if buffer == 0 {
+                Spi::run("UPDATE edge_src SET geom=ST_SetSRID(ST_Point(0,0),3857)").unwrap();
+            } else {
+                Spi::run("UPDATE edge_src SET geom=ST_SetSRID(ST_Point(1,1),3857)").unwrap();
+            }
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('edge_src','geom','id','{{"name":"edge","minZoom":1,"maxZoom":1,"sourceSRS":3857,"tileExtend":{buffer}}}')"#)).unwrap();
+            let before = decoded_stored_tiles("edge");
+            assert_eq!(before.len(), 4);
+            Spi::run("SELECT ST_UpdatePyramid('edge','id=1')").unwrap();
+            assert_eq!(before, decoded_stored_tiles("edge"));
+        }
+    }
+
+    #[pg_test]
+    fn projected_crs_preserves_tiles_across_build_and_refresh() {
+        for (srid, lon, lat) in [(32631, 3, 50), (3413, -90, 75)] {
+            Spi::run(&format!("CREATE TEMP TABLE projected AS SELECT 1 id, ST_Transform(ST_SetSRID(ST_Point({lon},{lat}),4326),{srid}) geom")).unwrap();
+            for prepared in [false, true] {
+                Spi::run(&format!(r#"SELECT ST_BuildPyramid('projected','geom','id','{{"name":"crs","sourceSRS":{srid},"maxZoom":0,"preparedBuild":{prepared}}}')"#)).unwrap();
+                let full = decoded_stored_tiles("crs");
+                assert_eq!(full.len(), 1);
+                Spi::run("SELECT ST_UpdatePyramid('crs','id=1')").unwrap();
+                assert_eq!(full, decoded_stored_tiles("crs"));
+            }
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('projected','geom','id','{{"name":"crs","sourceSRS":{srid},"maxZoom":0,"splitSize":2}}')"#)).unwrap();
+            assert!(
+                Spi::get_one::<bool>("SELECT ST_Tile('crs',0,0,0) IS NOT NULL")
+                    .unwrap()
+                    .unwrap()
+            );
+            Spi::run("SELECT ST_DropPyramid('crs'); DROP TABLE projected").unwrap();
+        }
+    }
+
+    #[pg_test]
+    fn geographic_candidate_keeps_wrapped_longitudes_and_world_edges() {
+        Spi::run("CREATE TABLE geo_edge AS SELECT id,ST_SetSRID(ST_MakePoint(lon,lat),4326) geom FROM
+                  (VALUES (1,181.,1.),(2,-181.,-1.),(3,180.,85.0511287),(4,-180.,-85.0511287),
+                          (5,0.000001,0.000001)) p(id,lon,lat); CREATE INDEX ON geo_edge USING gist(geom)").unwrap();
+        let mut baseline = None;
+        for prepared in [false, true] {
+            Spi::run(&format!(r#"SELECT ST_BuildPyramid('geo_edge','geom','id','{{"name":"geo","maxZoom":3,"preparedBuild":{prepared}}}')"#)).unwrap();
+            let tiles = decoded_stored_tiles("geo");
+            if let Some(previous) = &baseline {
+                assert_eq!(previous, &tiles);
+            }
+            assert!(tiles.values().flatten().any(|f| f.0 == 1));
+            baseline = Some(tiles);
+        }
+    }
+
+    #[pg_test]
+    fn a_wrapped_refresh_extent_removes_tiles_at_the_world_edge() {
+        Spi::run("CREATE TABLE date_edge AS SELECT 1 id,ST_SetSRID(ST_Point(179.99,1),4326) geom")
+            .unwrap();
+        Spi::run(r#"SELECT ST_BuildPyramid('date_edge','geom','id','{"minZoom":9,"maxZoom":9}')"#)
+            .unwrap();
+        assert!(!decoded_stored_tiles("date_edge").is_empty());
+        Spi::run(
+            "DELETE FROM date_edge; SELECT ST_UpdatePyramidByExtent('date_edge',179,0,181,2,4326)",
+        )
+        .unwrap();
+        assert!(decoded_stored_tiles("date_edge").is_empty());
+    }
+
+    #[pg_test]
+    fn prepared_input_is_pinned_to_the_temp_schema() {
+        Spi::run(
+            "SET LOCAL search_path=public,pg_temp; CREATE TABLE actual_src AS
+                 SELECT 1 id,ST_SetSRID(ST_Point(100,200),3857) geom",
+        )
+        .unwrap();
+        let next = crate::worker::next_job_idx() + 1;
+        let pid = unsafe { pgrx::pg_sys::MyProcPid };
+        Spi::run(&format!(
+            "CREATE TABLE public._gp_prep_{pid}_{next}(unrelated int)"
+        ))
+        .unwrap();
+        Spi::run(r#"SELECT ST_BuildPyramid('actual_src','geom','id','{"maxZoom":0,"sourceSRS":3857,"preparedBuild":true}')"#).unwrap();
+        assert_eq!(decoded_stored_tiles("actual_src").len(), 1);
+        assert_eq!(
+            Spi::get_one::<i64>(&format!(
+                "SELECT count(unrelated) FROM public._gp_prep_{pid}_{next}"
+            ))
+            .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[pg_test]
+    fn unmanaged_names_and_replacement_objects_survive_lifecycle_calls() {
+        Spi::run(
+            "CREATE TABLE _gp_tiles_unmanaged(id int); INSERT INTO _gp_tiles_unmanaged VALUES(42)",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT ST_DropPyramid('unmanaged')").unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT id FROM _gp_tiles_unmanaged").unwrap(),
+            Some(42)
+        );
+        Spi::run(
+            "CREATE TABLE _gp_tiles_collision AS SELECT 1 id,ST_SetSRID(ST_Point(1,1),3857) geom",
+        )
+        .unwrap();
+        Spi::run(r#"DO $$ BEGIN
+            BEGIN PERFORM ST_BuildPyramid('_gp_tiles_collision','geom','id','{"name":"collision","sourceSRS":3857,"maxZoom":0}');
+            EXCEPTION WHEN OTHERS THEN RETURN; END;
+            RAISE EXCEPTION 'unmanaged output was accepted'; END $$"#).unwrap();
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT id FROM _gp_tiles_collision WHERE geom IS NOT NULL")
+                .unwrap(),
+            Some(1)
+        );
+        Spi::run(r#"SELECT ST_BuildPyramid('_gp_tiles_collision','geom','id','{"name":"managed","sourceSRS":3857,"maxZoom":0}'); DROP TABLE _gp_tiles_managed; CREATE TABLE _gp_tiles_managed(id int); INSERT INTO _gp_tiles_managed VALUES(73)"#).unwrap();
+        Spi::run("DO $$ BEGIN PERFORM ST_DropPyramid('managed'); EXCEPTION WHEN OTHERS THEN NULL; END $$").unwrap();
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT id FROM _gp_tiles_managed").unwrap(),
+            Some(73)
+        );
+    }
+
+    #[pg_test]
+    fn a_registered_table_can_be_dropped_after_its_config_becomes_invalid() {
+        Spi::run("CREATE TABLE bad_config_src AS SELECT 1 id,ST_SetSRID(ST_Point(1,1),4326) geom")
+            .unwrap();
+        Spi::run(r#"SELECT ST_BuildPyramid('bad_config_src','geom','id','{"maxZoom":0}');
+                  UPDATE public.geometry_pyramid_catalog SET config='{"tileSRS":4326}' WHERE pyramid_name='bad_config_src'"#).unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT ST_DropPyramid('bad_config_src')").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT to_regclass('public._gp_tiles_bad_config_src') IS NULL")
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[pg_test]
+    fn rebuilding_only_writes_the_registered_heap() {
+        Spi::run("CREATE TABLE heap_source AS SELECT 1 id,ST_SetSRID(ST_Point(1,1),3857) geom")
+            .unwrap();
+        Spi::run(r#"SELECT ST_BuildPyramid('heap_source','geom','id','{"name":"heap","sourceSRS":3857,"maxZoom":0}');
+                 CREATE TABLE child_data () INHERITS (_gp_tiles_heap);
+                 INSERT INTO child_data SELECT * FROM ONLY _gp_tiles_heap;
+                 SELECT ST_UpdatePyramid('heap','id=1'); SELECT ST_UpdatePyramid('heap','')"#).unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM child_data").unwrap(),
+            Some(1)
+        );
+        assert_eq!(Spi::get_one::<i64>("SELECT tile_count FROM public.geometry_pyramid_stats WHERE pyramid_name='heap' AND z=0").unwrap(), Some(1));
+    }
+
+    #[pg_test]
+    fn a_deferred_tile_uses_the_same_effective_budget_as_a_stored_tile() {
+        Spi::run(
+            "CREATE TABLE budget_split AS SELECT i id, ST_Translate(ST_Centroid(
+            ST_TileEnvelope(1,CASE WHEN i<=1000 THEN 0 ELSE 1 END,0)),i%100,i/100) geom
+            FROM generate_series(1,1060)i",
+        )
+        .unwrap();
+        let build = |split| {
+            Spi::run(&format!(
+                r#"SELECT ST_BuildPyramid('budget_split','geom','id',
+          '{{"name":"bs","sourceSRS":3857,"minZoom":1,"maxZoom":1,"splitSize":{split},
+            "tileSizeBudgetBytes":1200,"maxTileSizeAttempts":12}}')"#
+            ))
+            .unwrap()
+        };
+        build(0);
+        let expected = decoded_mvt_features(&tile_bytes("SELECT ST_Tile('bs',1,1,0)"));
+        assert!(!expected.is_empty() && expected.len() < 30);
+        build(30);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM _gp_tiles_bs WHERE x=1").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            decoded_mvt_features(&tile_bytes("SELECT ST_Tile('bs',1,1,0)")),
+            expected
+        );
+        // A 0.1.0 row cannot reconstruct a tightened budget. A refresh recovers it.
+        Spi::run("UPDATE public.geometry_pyramid_stats SET effective_knobs=NULL WHERE pyramid_name='bs';
+            DO $$ BEGIN BEGIN PERFORM ST_Tile('bs',1,1,0);
+                EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '%legacy budget settings%' THEN RETURN; END IF; RAISE; END;
+                RAISE EXCEPTION 'legacy LOD silently changed'; END $$;
+            SELECT ST_UpdatePyramid('bs','id=1001')").unwrap();
+        assert_eq!(
+            decoded_mvt_features(&tile_bytes("SELECT ST_Tile('bs',1,1,0)")),
+            expected
+        );
+    }
+
+    #[pg_test]
+    fn budgeted_refresh_and_first_incremental_stats_match_full() {
+        Spi::run("CREATE TABLE budget_src(id int,geom geometry(Point,3857))").unwrap();
+        Spi::run(r#"SELECT ST_BuildPyramid('budget_src','geom','id','{"name":"budget","sourceSRS":3857,"maxZoom":0,"tileSizeBudgetBytes":1200,"maxTileSizeAttempts":12}')"#).unwrap();
+        Spi::run("INSERT INTO budget_src SELECT i,ST_SetSRID(ST_Point(10+i%100,10+i/100),3857) FROM generate_series(1,1000)i; SELECT ST_UpdatePyramid('budget','true')").unwrap();
+        let full_first = decoded_stored_tiles("budget");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT tile_count FROM public.ST_Pyramids() WHERE name='budget'")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT tile_count FROM public.geometry_pyramid_stats WHERE pyramid_name='budget'"
+            )
+            .unwrap(),
+            Some(1)
+        );
+        Spi::run("SELECT ST_UpdatePyramid('budget','')").unwrap();
+        let full = decoded_stored_tiles("budget");
+        assert_eq!(full_first, full);
+        Spi::run("SELECT ST_UpdatePyramid('budget','id=1')").unwrap();
+        assert_eq!(full, decoded_stored_tiles("budget"));
     }
 }
 

@@ -5,6 +5,7 @@
 .vscode/
 Cargo.lock
 sql/geometry_pyramid--*.sql
+!sql/geometry_pyramid--*--*.sql
 results/
 data/local/
 *.swp

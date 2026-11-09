@@ -56,17 +56,13 @@ pub struct CatalogRow {
     pub geom_column: String,
     pub fid_column: String,
     pub config: PyramidConfig,
-    /// Whether the pyramid's `_gp_tiles_<name>` storage table currently exists.
-    /// Computed via `to_regclass` inside the catalog lookup so callers do not
-    /// need a second SPI round-trip to check (a registered-but-unbuilt pyramid
-    /// has a catalog row but no table). Defaults to `false` if absent.
-    #[serde(default)]
-    pub storage_exists: bool,
+    #[serde(flatten)]
+    pub bindings: crate::storage::Bindings,
 }
 
 /// One level-of-detail rule. Within `[minZoom, maxZoom]`, a rule can filter
-/// source features, override output attributes, and/or apply deterministic
-/// sampling. `filter` is raw SQL over source columns, evaluated with the
+/// source features, override output attributes, or thin points. `filter` is
+/// raw SQL over source columns, evaluated with the
 /// **caller's own privileges** (trusted-admin input, like a view definition) and
 /// validated against the source before any build work; it must not contain a
 /// statement separator (`;`). See docs/superpowers/specs/*buildrules* and the
@@ -83,6 +79,8 @@ pub struct BuildRule {
     pub attr_fields: Option<Vec<String>>,
     #[serde(default)]
     pub sample: Option<BuildRuleSample>,
+    #[serde(default, rename = "pointGrid", skip_serializing_if = "Option::is_none")]
+    pub point_grid: Option<BuildRulePointGrid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +90,14 @@ pub struct BuildRuleSample {
     pub key: Vec<String>,
     #[serde(default, rename = "geometryTypes")]
     pub geometry_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildRulePointGrid {
+    #[serde(rename = "cellPixels")]
+    pub cell_pixels: u32,
+    #[serde(default, rename = "keepField", skip_serializing_if = "Option::is_none")]
+    pub keep_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +127,8 @@ pub struct PyramidConfig {
     #[serde(default = "default_min_zoom", rename = "minZoom")]
     pub min_zoom: u8,
 
-    /// Maximum zoom level to materialize.
-    #[serde(default = "default_max_zoom", rename = "maxZoom")]
+    /// Maximum zoom level to materialize. Ganos also calls this `maxLevel`.
+    #[serde(default = "default_max_zoom", rename = "maxZoom", alias = "maxLevel")]
     pub max_zoom: u8,
 
     /// Number of parallel worker slots (coordinator + background workers) used to
@@ -394,9 +400,13 @@ impl PyramidConfig {
                     rule.min_zoom, rule.max_zoom
                 ));
             }
-            if rule.filter.is_none() && rule.attr_fields.is_none() && rule.sample.is_none() {
+            if rule.filter.is_none()
+                && rule.attr_fields.is_none()
+                && rule.sample.is_none()
+                && rule.point_grid.is_none()
+            {
                 return Err(format!(
-                    "buildRules[{k}]: must set at least one of filter, attrFields, or sample"
+                    "buildRules[{k}]: must set at least one of filter, attrFields, sample, or pointGrid"
                 ));
             }
             if let Some(filter) = &rule.filter {
@@ -448,9 +458,26 @@ impl PyramidConfig {
                     }
                 }
             }
+            if let Some(grid) = &rule.point_grid {
+                if !(1..=self.tile_size).contains(&grid.cell_pixels) {
+                    return Err(format!(
+                        "buildRules[{k}].pointGrid.cellPixels must be between 1 and tileSize"
+                    ));
+                }
+                if grid
+                    .keep_field
+                    .as_deref()
+                    .is_some_and(|f| !valid_rule_identifier(f))
+                {
+                    return Err(format!(
+                        "buildRules[{k}].pointGrid.keepField: invalid identifier"
+                    ));
+                }
+            }
         }
         for z in 0..=MAX_ZOOM_LIMIT {
             let mut seen: Option<&[String]> = None;
+            let mut seen_grid = None;
             for rule in &self.build_rules {
                 if z >= rule.min_zoom && z <= rule.max_zoom {
                     if let Some(attrs) = &rule.attr_fields {
@@ -464,22 +491,36 @@ impl PyramidConfig {
                             seen = Some(attrs.as_slice());
                         }
                     }
+                    if let Some(grid) = &rule.point_grid {
+                        if seen_grid.is_some_and(|prev| prev != grid) {
+                            return Err(format!("buildRules: conflicting pointGrid for zoom {z}"));
+                        }
+                        seen_grid = Some(grid);
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    pub(crate) fn point_grid_at(&self, z: u8) -> Option<(usize, &BuildRulePointGrid)> {
+        self.build_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| (rule.min_zoom..=rule.max_zoom).contains(&z))
+            .find_map(|(i, rule)| rule.point_grid.as_ref().map(|grid| (i, grid)))
+    }
+
     /// Effective worker-slot count (coordinator + workers) for the build.
     ///
     /// `parallel = 0` resolves to the host's available parallelism, capped at
-    /// [`PARALLEL_AUTO_CAP`] (Ganos's `0` = maximum-allowed semantics). Any
-    /// explicit value is returned verbatim. The result is always `>= 1`, so the
+    /// [`PARALLEL_AUTO_CAP`] (Ganos's `0` = maximum-allowed semantics).
+    /// Explicit requests use the same cap. The result is always `>= 1`, so the
     /// build's `effective_parallel() - 1` worker count never underflows.
     pub fn effective_parallel(&self) -> u32 {
         match self.parallel {
             0 => auto_parallelism(),
-            n => n,
+            n => n.min(PARALLEL_AUTO_CAP),
         }
     }
 }
@@ -568,7 +609,12 @@ mod tests {
 
     #[test]
     fn effective_parallel_resolves_auto_and_honours_explicit() {
-        // Default (1) and any explicit value pass through verbatim.
+        assert_eq!(
+            PyramidConfig::parse(r#"{"parallel":1000000}"#)
+                .unwrap()
+                .effective_parallel(),
+            PARALLEL_AUTO_CAP
+        );
         assert_eq!(PyramidConfig::parse("").unwrap().effective_parallel(), 1);
         assert_eq!(
             PyramidConfig::parse(r#"{"parallel":4}"#)
@@ -629,6 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn max_level_alias_roundtrips_and_rejects_ambiguous_bounds() {
+        let cfg = PyramidConfig::parse(r#"{"maxLevel":1}"#).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.max_zoom, 1);
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(saved["maxZoom"], 1);
+        assert!(saved.get("maxLevel").is_none());
+        assert_eq!(
+            serde_json::from_value::<PyramidConfig>(saved)
+                .unwrap()
+                .max_zoom,
+            1
+        );
+        assert!(PyramidConfig::parse(r#"{"maxZoom":1,"maxLevel":2}"#).is_err());
+        assert!(PyramidConfig::parse(r#"{"maxLevel":25}"#)
+            .unwrap()
+            .validate()
+            .is_err());
+        assert!(PyramidConfig::parse(r#"{"minZoom":2,"maxLevel":1}"#)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
     fn pixel_size_matches_web_mercator_math() {
         // At z=10 with tileSize=4096 the ground sample distance should be
         // ~9.55 m/px (40075016.685 / (4096 * 1024)).
@@ -686,6 +757,32 @@ mod tests {
         assert!(!PyramidConfig::default().prepared_build);
         let cfg = PyramidConfig::parse(r#"{"preparedBuild":true}"#).unwrap();
         assert!(cfg.prepared_build);
+    }
+
+    #[test]
+    fn point_grid_rejects_invalid_sizes_fields_and_conflicts() {
+        for grid in [
+            r#"{"cellPixels":0}"#,
+            r#"{"cellPixels":4097}"#,
+            r#"{"cellPixels":64,"keepField":"bad.name"}"#,
+        ] {
+            assert!(PyramidConfig::parse(&format!(
+                r#"{{"buildRules":[{{"minZoom":0,"maxZoom":2,"pointGrid":{grid}}}]}}"#
+            ))
+            .unwrap()
+            .validate()
+            .is_err());
+        }
+        let err = PyramidConfig::parse(
+            r#"{"buildRules":[
+                {"minZoom":0,"maxZoom":2,"pointGrid":{"cellPixels":64}},
+                {"minZoom":2,"maxZoom":3,"pointGrid":{"cellPixels":32}}
+            ]}"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("conflicting pointGrid for zoom 2"));
     }
 
     #[test]

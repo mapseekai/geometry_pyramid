@@ -4,14 +4,11 @@
 //!
 //! Hybrid lookup strategy:
 //!   • z < minZoom              → NULL
-//!   • minZoom ≤ z ≤ maxZoom   → read materialized storage table (to_regclass
-//!                                guard keeps an unbuilt pyramid as NULL, not error)
+//!   • minZoom ≤ z ≤ maxZoom   → read the registered materialized table
 //!   • z > maxZoom              → on-demand slice via `crate::dynamic::generate_tile`
 //!                                when `dynamicBeyondMaxZoom = true`, else NULL
 //!   • unknown pyramid          → NULL (catalog-first; never touches storage)
 
-use crate::source::PyramidSource;
-use crate::storage;
 use pgrx::prelude::*;
 use std::error::Error;
 
@@ -45,34 +42,27 @@ fn st_tile(
     let Some(meta) = crate::pyramid::catalog_meta(name)? else {
         return Ok(None);
     };
-    let src = PyramidSource {
-        name,
-        source_table: &meta.source_table,
-        geom_column: &meta.geom_column,
-        fid_column: &meta.fid_column,
-        cfg: &meta.config,
-    };
-    let cfg = src.cfg;
-
+    let cfg = &meta.config;
     let zu = z as u8;
     if zu < cfg.min_zoom {
         return Ok(None);
     }
 
     if zu <= cfg.max_zoom {
-        // Materialized range: read the storage table. catalog_meta already told
-        // us whether it exists (folded into its lookup via to_regclass), so a
-        // registered-but-unbuilt pyramid is a miss, not an error — no extra
-        // round-trip here. The scalar subquery always returns exactly one row
-        // (NULL on miss), dodging pgrx's 0-row InvalidPosition error in a nested
-        // SPI context.
-        let hit: Option<Vec<u8>> = if meta.storage_exists {
-            let table = storage::tile_table_name(name);
+        // The scalar subquery also returns one row on a storage miss.
+        let hit: Option<Vec<u8>> = if let Some(table) = &meta.bindings.storage {
+            table.lock()?;
             Spi::get_one_with_args(
                 &format!(
-                    r#"SELECT (SELECT mvt FROM "{table}" WHERE z = $1 AND x = $2 AND y = $3 LIMIT 1)"#
+                    "SELECT (SELECT mvt FROM ONLY {} WHERE z=$1 AND x=$2 AND y=$3 AND tableoid=$4)",
+                    table.sql()
                 ),
-                &[(z as i16).into(), x.into(), y.into()],
+                &[
+                    (z as i16).into(),
+                    x.into(),
+                    y.into(),
+                    pg_sys::Oid::from(table.oid).into(),
+                ],
             )?
         } else {
             None
@@ -86,13 +76,14 @@ fn st_tile(
         if cfg.split_size == 0 {
             return Ok(None);
         }
-        return crate::dynamic::generate_tile(src, zu, x, y);
-    }
-
-    // z > maxZoom: on-demand slice from the source, if enabled. generate_tile
-    // re-validates the catalog identifiers and guards the source table itself.
-    if !cfg.dynamic_beyond_max_zoom {
+    } else if !cfg.dynamic_beyond_max_zoom {
         return Ok(None);
     }
+    let Some(source) = &meta.bindings.source else {
+        return Ok(None);
+    };
+    source.lock()?;
+    let source_sql = source.sql();
+    let src = meta.for_source(name, &source_sql);
     crate::dynamic::generate_tile(src, zu, x, y)
 }

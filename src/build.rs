@@ -7,6 +7,7 @@
 
 use crate::config::PyramidConfig;
 use crate::source::PyramidSource;
+use crate::storage::{self, DbError, Relation};
 use crate::tile_rect::TileRect;
 use pgrx::prelude::*;
 use std::error::Error;
@@ -24,17 +25,21 @@ pub struct ZoomBuildResult {
     pub max_tile_bytes: i64,
     pub build_ms: i64,
     pub attempts: u32,
+    pub(crate) knobs: ZoomKnobs,
 }
 
 /// (tile_count, total_bytes, max_tile_bytes) for one zoom of a tile table.
-fn zoom_stats(storage_table: &str, z: u8) -> Result<(i64, i64, i64), Box<dyn Error + Send + Sync>> {
+pub(crate) fn zoom_stats(
+    storage_table: &str,
+    z: u8,
+) -> Result<(i64, i64, i64), Box<dyn Error + Send + Sync>> {
     let row: Option<String> = Spi::get_one_with_args(
         &format!(
             r#"SELECT json_build_array(
                    count(*),
                    COALESCE(sum(octet_length(mvt)), 0),
                    COALESCE(max(octet_length(mvt)), 0))::text
-               FROM "{storage_table}" WHERE z = $1"#
+               FROM ONLY {storage_table} WHERE z = $1"#
         ),
         &[(z as i32).into()],
     )?;
@@ -43,106 +48,250 @@ fn zoom_stats(storage_table: &str, z: u8) -> Result<(i64, i64, i64), Box<dyn Err
     Ok((arr[0], arr[1], arr[2]))
 }
 
-/// Total tile count emitted across all zoom levels.
-///
-/// Acquires a per-pyramid advisory transaction lock, writes all tiles into
-/// a shadow table, then atomically swaps the shadow into place as the main
-/// tile table. If anything fails before the swap, the transaction aborts and
-/// the shadow DDL is rolled back — leaving the previous main table untouched.
-pub fn build(src: PyramidSource) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    // Serialize concurrent builds of the same pyramid for this transaction.
-    // The advisory-lock namespace is cluster-global (shared across all
-    // databases); the `geometry_pyramid:` prefix makes a collision with an
-    // unrelated lock astronomically unlikely (~1/2^63), and the lock is only
-    // an optimization against concurrent builders — correctness still rests
-    // on the transactional shadow swap.
-    Spi::run_with_args(
-        "SELECT pg_advisory_xact_lock(hashtextextended('geometry_pyramid:' || $1, 0))",
-        &[src.name.into()],
-    )?;
-
-    let workers = src.cfg.effective_parallel() - 1;
-    if workers > 0 && src.cfg.tile_size_budget_bytes > 0 {
-        // The budget retry loop wipes a zoom and rebuilds it within the
-        // coordinator's uncommitted transaction. Under parallel>1 the workers
-        // have already COMMITTED their strip rows, so a retry's DELETE is
-        // invisible to the next round's workers and they would collide on the
-        // (z,x,y) primary key. Reject the combination rather than corrupt.
-        return Err(
-            "tileSizeBudgetBytes (budget retry) is not supported with parallel > 1; \
-             set one of them back to its default"
-                .into(),
-        );
+/// Independent backends cannot read a caller's own writes, fixed snapshot, or
+/// session identity. Capture this before registering a new output relation.
+pub(crate) fn autonomous_context() -> bool {
+    // Capture before any SPI call: even Spi::get_one assigns an XID in pgrx.
+    unsafe {
+        !pg_sys::IsTransactionBlock()
+            && pg_sys::GetTopTransactionIdIfAny() == pg_sys::InvalidTransactionId
+            && pg_sys::XactIsoLevel == pg_sys::XACT_READ_COMMITTED as i32
+            && pg_sys::GetUserId() == pg_sys::GetSessionUserId()
+            && pg_sys::GetUserId() == pg_sys::GetAuthenticatedUserId()
     }
-    // Every zoom in a small extent already runs inline in run_zoom_strips.
-    // Decide before creating worker-visible tables so such builds also avoid
-    // autonomous preparation, index/WAL overhead and worker startup entirely.
-    let source_bounds = if workers > 0 {
-        source_bbox(src.source_table, src.geom_column, src.cfg.tile_srs)?
-    } else {
-        None
-    };
-    let mut execution_cfg = src.cfg.clone();
-    if workers > 0
-        && source_bounds.is_none_or(|(xmin, ymin, xmax, ymax)| {
-            TileRect::from_bbox_m(src.cfg.max_zoom, xmin, ymin, xmax, ymax).cell_count()
-                <= PARALLEL_MIN_CELLS
-        })
+}
+
+/// Opaque views, inheritance trees, custom types and RLS can depend on
+/// caller-local state. Keep those sources on the coordinator.
+fn plain_worker_source(
+    rel: &Relation,
+    output: &Relation,
+    src: PyramidSource,
+) -> Result<bool, spi::Error> {
+    let attrs: Vec<String> = src
+        .cfg
+        .attributes
+        .iter()
+        .chain(
+            src.cfg
+                .build_rules
+                .iter()
+                .filter_map(|r| r.attr_fields.as_ref())
+                .flatten(),
+        )
+        .chain(
+            src.cfg
+                .build_rules
+                .iter()
+                .filter_map(|r| r.point_grid.as_ref()?.keep_field.as_ref()),
+        )
+        .cloned()
+        .collect();
+    Spi::get_one_with_args::<bool>(
+        "SELECT c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity
+         AND NOT c.relhassubclass AND pg_catalog.has_table_privilege(c.oid,'UPDATE,DELETE,TRUNCATE')
+         AND NOT EXISTS (SELECT FROM pg_catalog.pg_event_trigger WHERE evtenabled<>'D' AND evtevent IN ('ddl_command_start','ddl_command_end'))
+         AND NOT EXISTS (SELECT FROM pg_catalog.pg_trigger WHERE tgrelid=$2 AND tgenabled<>'D')
+         AND NOT EXISTS (SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=$2)
+         AND NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (
+               a.attgenerated='v' OR
+               (a.attname=$3 AND a.atttypid NOT IN ('int2'::regtype,'int4'::regtype,'int8'::regtype)) OR
+               (a.attname=$4 AND NOT EXISTS (
+                  SELECT FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid=d.refobjid
+                  JOIN pg_catalog.pg_type t ON t.oid=d.objid
+                  WHERE d.classid='pg_type'::regclass AND d.objid=a.atttypid AND d.deptype='e'
+                    AND d.refclassid='pg_extension'::regclass AND e.extname='postgis' AND t.typname='geometry')) OR
+               (a.attname=ANY($5) AND a.atttypid NOT IN ('int2'::regtype,'int4'::regtype,'int8'::regtype,
+                 'bool'::regtype,'text'::regtype,'varchar'::regtype,'bpchar'::regtype,'float4'::regtype,'float8'::regtype))))
+         FROM pg_catalog.pg_class c WHERE c.oid=$1",
+        &[pg_sys::Oid::from(rel.oid).into(),pg_sys::Oid::from(output.oid).into(),
+          src.fid_column.into(),src.geom_column.into(),attrs.into()],
+    ).map(|v| v==Some(true))
+}
+
+/// Empty-cell probes, simple point pairs, and geometry vertices have different
+/// costs. See the scheduling measurements in docs/user-data-build-performance.md.
+fn enough_candidate_work(src: PyramidSource, rect: &TileRect) -> Result<bool, spi::Error> {
+    const MIN_PAIRS: u32 = 524288;
+    const MIN_EXTRA_VERTICES: u32 = 8192;
+    const SAMPLE_ROWS: u32 = 256;
+    let cells = rect.cell_count();
+    if cells <= PARALLEL_MIN_CELLS {
+        return Ok(false);
+    }
+    if src.cfg.split_size == 0
+        && !config_allows_feature_driven(src.cfg)
+        && cells >= MIN_GRID_CELLS
+        && (src.cfg.prepared_build || !indexed_sparse_grid(src, rect)?)
     {
-        execution_cfg.parallel = 1;
-        notice!("geometry_pyramid: small extent uses local preparation and inline builds");
+        return Ok(true);
+    }
+    let table = src.source_table;
+    let geom = src.geom_column;
+    let sql = format!(
+        r#"WITH sample AS MATERIALIZED (
+             SELECT ST_Transform("{geom}",3857) AS geom_tile FROM {table}
+             WHERE "{geom}" IS NOT NULL AND NOT ST_IsEmpty("{geom}") LIMIT {SAMPLE_ROWS}
+         ), costs AS (
+             SELECT count(*) AS sampled, avg({CANDIDATE_PAIRS}) AS pairs,
+                    avg(ST_NPoints(geom_tile)-1) AS extra_vertices FROM sample {TILE_GRID}
+         )
+         SELECT COALESCE(GREATEST(pairs/{MIN_PAIRS}::float8,extra_vertices/{MIN_EXTRA_VERTICES}::float8) *
+             CASE WHEN sampled < {SAMPLE_ROWS} THEN sampled
+                  WHEN c.reltuples > 0 THEN GREATEST(sampled,c.reltuples)
+                  ELSE (SELECT count(*) FROM (SELECT 1 FROM {table}
+                        WHERE "{geom}" IS NOT NULL LIMIT {MIN_PAIRS}) counted) END >= 1,false)
+         FROM costs,pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass($7)"#
+    );
+    let mut args = Vec::from(candidate_args(rect, src.cfg));
+    args.push(table.into());
+    Spi::get_one_with_args(&sql, &args).map(|v| v == Some(true))
+}
+
+pub fn build(
+    src: PyramidSource,
+    source: &Relation,
+    output: &Relation,
+    autonomous: bool,
+) -> Result<i64, DbError> {
+    let cfg = src.cfg;
+    if cfg.effective_parallel() > 1 && cfg.tile_size_budget_bytes > 0 {
+        return Err("tileSizeBudgetBytes (budget retry) is not supported with parallel > 1".into());
+    }
+    let mut execution_cfg = cfg.clone();
+    let mut bounds = None;
+    if cfg.effective_parallel() > 1 {
+        // Take the source lock before computing the authoritative parallel extent.
+        let local_rules = cfg.build_rules.iter().any(|r| {
+            r.filter.is_some()
+                || r.sample
+                    .as_ref()
+                    .is_some_and(|sample| sample.key.iter().any(|k| k != "fid"))
+        });
+        let uses_work_name = source.schema == output.schema
+            && [
+                format!("_gp_shadow_{}", src.name),
+                format!("_gp_prep_{}", src.name),
+            ]
+            .contains(&source.name);
+        // SHARE freezes committed input across worker transactions without waiting for a writer.
+        let locked = autonomous
+            && !local_rules
+            && !uses_work_name
+            && plain_worker_source(source, output, src)?
+            && unsafe {
+                pg_sys::ConditionalLockRelationOid(source.oid.into(), pg_sys::ShareLock as i32)
+            };
+        let eligible = locked && plain_worker_source(source, output, src)?;
+        if eligible {
+            bounds = source_bbox(src.source_table, src.geom_column, cfg.tile_srs)?;
+        }
+        let worthwhile = match bounds {
+            Some(bbox) => enough_candidate_work(src, &build_rect(cfg, cfg.max_zoom, bbox))?,
+            None => false,
+        };
+        // Stale scratch DDL belongs to this transaction. A worker could neither
+        // see its uncommitted removal nor replay the caller's DROP hooks.
+        let recovered = worthwhile
+            && crate::shadow::reclaim_for_retry(
+                &output.schema,
+                src.name,
+                uses_prepared_build(cfg),
+            )?;
+        if !worthwhile || recovered {
+            if locked {
+                unsafe { pg_sys::UnlockRelationOid(source.oid.into(), pg_sys::ShareLock as i32) };
+            }
+            bounds = None;
+            execution_cfg.parallel = 1;
+            notice!("geometry_pyramid: using caller-local build");
+        }
     }
     let src = PyramidSource {
         cfg: &execution_cfg,
         ..src
     };
-    let workers = src.cfg.effective_parallel() - 1;
-    if workers == 0 {
-        // parallel=1: shadow lives in this transaction (no external worker needs to see it).
-        crate::shadow::create(src.name)?;
-    } else {
-        // parallel>1: workers are independent backends, so the shadow DDL must be
-        // COMMITTED before they can see it — run it via an autonomous worker.
-        crate::worker::exec_sql_autonomous(&crate::shadow::create_sql(src.name))?;
+    let main = output.sql();
+    // DELETE and replacement rows share one transaction. Readers retain the
+    // previous committed version, table OID, grants and dependencies.
+    Spi::run(&format!("DELETE FROM ONLY {main}"))?;
+    if src.cfg.effective_parallel() == 1 {
+        return build_into(
+            src,
+            &main,
+            &output.schema,
+            bounds.filter(|_| !uses_prepared_build(src.cfg)),
+        );
     }
-    let shadow_table = crate::shadow::shadow_table_name(src.name);
-
-    // A prepared table is authoritative for its own snapshot. Only reuse the
-    // source extent directly on the non-prepared path.
-    let total = build_into(
-        src,
-        &shadow_table,
-        source_bounds.filter(|_| !uses_prepared_build(src.cfg)),
+    let shadow = spi::quote_qualified_identifier(
+        output.schema.as_str(),
+        &format!("_gp_shadow_{}", src.name),
+    );
+    crate::worker::create_stage(
+        &shadow,
+        storage::tile_table_create_sql(&shadow, true),
+        60_000,
     )?;
+    let count = build_into(
+        src,
+        &shadow,
+        &output.schema,
+        bounds.filter(|_| !uses_prepared_build(src.cfg)),
+    )?;
+    Spi::run(&format!(
+        "INSERT INTO {main} (z,x,y,format,srid,mvt) SELECT z,x,y,format,srid,mvt FROM ONLY {shadow}"
+    ))?;
+    crate::shadow::check(&shadow)?.drop_table()?;
+    Ok(count)
+}
 
-    crate::shadow::swap(src.name)?;
-    Ok(total)
+pub(crate) fn rebuild_local(src: PyramidSource, output: &Relation) -> Result<i64, DbError> {
+    let mut cfg = src.cfg.clone();
+    cfg.parallel = 1;
+    let main = output.sql();
+    Spi::run(&format!("DELETE FROM ONLY {main}"))?;
+    build_into(
+        PyramidSource { cfg: &cfg, ..src },
+        &main,
+        &output.schema,
+        None,
+    )
+}
+
+pub(crate) fn build_rect(cfg: &PyramidConfig, z: u8, (xmin, ymin, xmax, ymax): Bbox) -> TileRect {
+    let pad = f64::from(cfg.tile_extend) * cfg.pixel_size_m(z);
+    TileRect::intersecting_bbox_m(z, xmin - pad, ymin - pad, xmax + pad, ymax + pad)
 }
 
 /// The build loop, writing into an arbitrary target table.
 fn build_into(
     src: PyramidSource,
     storage_table: &str,
+    storage_schema: &str,
     source_bounds: Option<Bbox>,
 ) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // A full build replaces the complete zoom set, including an empty source.
     // This shares the publication transaction, so failures restore old stats.
     crate::stats::delete_stats(src.name)?;
-    // Validate each LOD rule's filter against the src up front, so a bad
-    // expr fails cleanly (naming the rule) before any prep/shadow work and
-    // never leaves a partial pyramid. `AND false` makes it a pure parse/column
-    // check that scans nothing.
+    // Check trusted SQL predicates before projecting or slicing any rows.
     for (k, rule) in src.cfg.build_rules.iter().enumerate() {
-        let Some(filter) = &rule.filter else {
-            continue;
-        };
-        let probe = format!(
-            r#"SELECT 1 FROM "{}" WHERE ({}) AND false LIMIT 1"#,
-            src.source_table, filter
-        );
-        Spi::run(&probe).map_err(|e| {
-            Box::<dyn Error + Send + Sync>::from(format!("buildRules[{k}] filter is invalid: {e}"))
-        })?;
+        if let Some(filter) = &rule.filter {
+            let probe = format!(
+                r#"SELECT 1 FROM {} WHERE ({}) AND false LIMIT 1"#,
+                src.source_table, filter
+            );
+            Spi::run(&probe).map_err(|e| format!("buildRules[{k}] filter is invalid: {e}"))?;
+        }
+        if let Some(field) = rule.point_grid.as_ref().and_then(|g| g.keep_field.as_ref()) {
+            let probe = format!(
+                r#"SELECT COALESCE(src."{field}",false) FROM {} src WHERE false"#,
+                src.source_table
+            );
+            Spi::run(&probe).map_err(|e| {
+                format!("buildRules[{k}].pointGrid.keepField must name a boolean column: {e}")
+            })?;
+        }
     }
 
     let parallel = src.cfg.effective_parallel() > 1;
@@ -156,7 +305,12 @@ fn build_into(
             // Committed + worker-visible. The transform/index runs once here as
             // a serial prefix (it borrows the build's own timeout), then every
             // worker reads the result instead of re-transforming the source.
-            crate::prepared::prepare_source_committed(src, options, src.cfg.build_timeout_ms)?
+            crate::prepared::prepare_source_committed(
+                src,
+                storage_schema,
+                options,
+                src.cfg.build_timeout_ms,
+            )?
         } else {
             crate::prepared::prepare_source_for_build(src, options)?
         })
@@ -167,7 +321,7 @@ fn build_into(
     // avoids transforming the complete source a second time just for the bbox.
     let bbox = match prepared.as_ref() {
         Some(p) => bbox_from_query(
-            &format!(r#"SELECT ST_Extent(geom_tile) AS g FROM "{}""#, p.table),
+            &format!(r#"SELECT ST_Extent(geom_tile) AS g FROM {}"#, p.table),
             &[],
         )?
         .map(|[xmin, ymin, xmax, ymax]| (xmin, ymin, xmax, ymax)),
@@ -177,10 +331,8 @@ fn build_into(
         },
     };
     let Some((xmin_m, ymin_m, xmax_m, ymax_m)) = bbox else {
-        if parallel {
-            if let Some(p) = prepared.as_ref() {
-                crate::prepared::drop_prepared_committed(&p.table)?;
-            }
+        if let Some(p) = &prepared {
+            crate::prepared::drop_prepared(&p.table, parallel)?;
         }
         notice!(
             "geometry_pyramid: source table '{}' has no rows; pyramid '{}' is empty",
@@ -209,32 +361,47 @@ fn build_into(
 
     let mut total: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
-        let rect = TileRect::from_bbox_m(z, xmin_m, ymin_m, xmax_m, ymax_m);
-        // Below the R(z) > C·rows crossover the dense tile-major path is as fast,
-        // so feature-driven engages only on the sparse/high-zoom levels.
-        let feature_driven =
-            feature_driven_allowed && feature_driven_zoom_beneficial(&rect, feature_driven_rows);
+        let rect = build_rect(src.cfg, z, (xmin_m, ymin_m, xmax_m, ymax_m));
+        let point_grid = src.cfg.point_grid_at(z).is_some();
+        // Grid thinning works on clipped rows from the tile-major pipeline.
+        if point_grid && rect.cell_count() > 1 {
+            if let Some(prepared) = prepared.as_mut() {
+                crate::prepared::ensure_geom_tile_index(prepared)?;
+            }
+        }
+        let feature_driven = if point_grid {
+            false
+        } else if feature_driven_allowed
+            && feature_driven_zoom_beneficial(&rect, feature_driven_rows)
+        {
+            true
+        } else if let Some(prepared) = prepared.as_ref().filter(|_| !feature_major_points) {
+            let reuse = repeated_simplification_worthwhile(src.cfg, &rect, prepared)?;
+            if reuse {
+                notice!(
+                    "geometry_pyramid: pyramid '{}' z={} reuses simplification across tiles",
+                    src.name,
+                    z
+                );
+            }
+            reuse
+        } else {
+            false
+        };
         let result = build_zoom_level_with_budget(
             src,
             storage_table,
             &rect,
             prepared.as_ref(),
-            feature_major_points && rect.cell_count() > 1,
+            !point_grid && feature_major_points && rect.cell_count() > 1,
             feature_driven,
         )?;
         crate::stats::upsert_zoom_stats(src.name, &result)?;
         total += result.tiles;
     }
 
-    // The committed prepared table outlives the coordinator transaction, so it
-    // must be dropped explicitly once all zooms are built (the temp variant is
-    // reclaimed at commit). Dropped in the coordinator transaction — see
-    // [`crate::prepared::drop_prepared_committed`] for why it must not be
-    // autonomous.
-    if parallel {
-        if let Some(p) = prepared.as_ref() {
-            crate::prepared::drop_prepared_committed(&p.table)?;
-        }
+    if let Some(p) = &prepared {
+        crate::prepared::drop_prepared(&p.table, parallel)?;
     }
     Ok(total)
 }
@@ -324,7 +491,7 @@ fn prepared_table_is_point_only(
 ) -> Result<bool, spi::Error> {
     Spi::get_one::<bool>(&format!(
         r#"SELECT COALESCE(bool_and(geom_type = 'POINT'), false)
-           FROM "{table}"
+           FROM {table}
            WHERE geom_tile IS NOT NULL"#,
         table = prepared.table
     ))
@@ -340,6 +507,77 @@ const FEATURE_DRIVEN_MIN_FILL_RATIO: f64 = 2.0;
 
 fn config_allows_feature_driven(cfg: &PyramidConfig) -> bool {
     uses_prepared_build(cfg) && cfg.feature_driven_enum && cfg.tile_srs == 3857
+}
+
+// Same buffer, safety pad and clipping bounds for scheduling and enumeration.
+const CANDIDATE_PAIRS: &str = "GREATEST(0, LEAST(floor((ST_XMax(geom_tile) + k.mm + 20037508.342789244) / k.tw) + 1, $4::int)
+                           - GREATEST(floor((ST_XMin(geom_tile) - k.mm + 20037508.342789244) / k.tw) - 1, $3::int) + 1)
+               * GREATEST(0, LEAST(floor((20037508.342789244 - ST_YMin(geom_tile) + k.mm) / k.tw) + 1, $6::int)
+                           - GREATEST(floor((20037508.342789244 - ST_YMax(geom_tile) - k.mm) / k.tw) - 1, $5::int) + 1)";
+const TILE_GRID: &str = "CROSS JOIN (
+               SELECT 40075016.685578488 / power(2.0, $1::float8) AS tw,
+                      $2::float8 * (40075016.685578488 / power(2.0, $1::float8)) AS mm
+           ) k";
+
+const MIN_GRID_CELLS: i64 = 8192;
+
+/// The default build only prunes when a bounded scan of an indexed source
+/// shows that even padded candidate pairs cover little of the grid.
+fn indexed_sparse_grid(src: PyramidSource, rect: &TileRect) -> Result<bool, spi::Error> {
+    const MAX_ROWS: i32 = 1024;
+    let cells = rect.cell_count();
+    if cells < MIN_GRID_CELLS
+        || !matches!(src.cfg.source_srs, 3857 | 4326)
+        || src.cfg.build_rules.iter().any(|r| r.filter.is_some())
+    {
+        return Ok(false);
+    }
+    let eligible = Spi::get_one_with_args::<bool>(
+        "SELECT c.relkind='r' AND NOT c.relhassubclass AND NOT c.relrowsecurity
+           AND c.reltuples <= $3 AND EXISTS (
+             SELECT FROM pg_catalog.pg_index i
+             JOIN pg_catalog.pg_opclass op ON op.oid=i.indclass[0]
+             JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=i.indkey[0]
+             WHERE i.indrelid=c.oid AND i.indisvalid AND i.indisready AND i.indislive
+               AND i.indpred IS NULL AND op.opcname='gist_geometry_ops_2d'
+               AND a.attname=$2 AND a.attgenerated<>'v')
+         FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass($1)",
+        &[
+            src.source_table.into(),
+            src.geom_column.into(),
+            MAX_ROWS.into(),
+        ],
+    )? == Some(true);
+    if !eligible {
+        return Ok(false);
+    }
+    let sql = format!(
+        r#"WITH bounded AS MATERIALIZED (
+             SELECT ST_Transform("{geom}",3857) AS geom_tile FROM {table}
+             WHERE "{geom}" IS NOT NULL LIMIT {limit}
+           )
+           SELECT count(*) <= {MAX_ROWS}
+             AND COALESCE(sum({CANDIDATE_PAIRS}) FILTER (WHERE NOT ST_IsEmpty(geom_tile)), 0)
+                 * 8 < $7::float8
+           FROM bounded {TILE_GRID}"#,
+        geom = src.geom_column,
+        table = src.source_table,
+        limit = MAX_ROWS + 1,
+    );
+    let mut args = Vec::from(candidate_args(rect, src.cfg));
+    args.push((cells as f64).into());
+    Spi::get_one_with_args(&sql, &args).map(|v| v == Some(true))
+}
+
+fn candidate_args(rect: &TileRect, cfg: &PyramidConfig) -> [pgrx::datum::DatumWithOid<'static>; 6] {
+    [
+        (rect.z as i32).into(),
+        (cfg.tile_extend as f64 / cfg.tile_size as f64).into(),
+        (rect.xmin as i32).into(),
+        (rect.xmax as i32).into(),
+        (rect.ymin as i32).into(),
+        (rect.ymax as i32).into(),
+    ]
 }
 
 /// Cheap one-pass prep stats: `(row_count, feature_tile_pairs_at_maxZoom)`. The
@@ -358,30 +596,14 @@ pub(crate) fn feature_driven_prep_stats(
         r#"SELECT json_build_array(
                count(*),
                LEAST(COALESCE(sum(
-                 GREATEST(0, LEAST(floor((ST_XMax(geom_tile) + k.mm + 20037508.342789244) / k.tw) + 1, $4::int)
-                           - GREATEST(floor((ST_XMin(geom_tile) - k.mm + 20037508.342789244) / k.tw) - 1, $3::int) + 1)
-               * GREATEST(0, LEAST(floor((20037508.342789244 - ST_YMin(geom_tile) + k.mm) / k.tw) + 1, $6::int)
-                           - GREATEST(floor((20037508.342789244 - ST_YMax(geom_tile) - k.mm) / k.tw) - 1, $5::int) + 1)
+                 {CANDIDATE_PAIRS}
                ), 0)::numeric, 9223372036854775807::numeric)::bigint)::text
-           FROM "{table}"
-           CROSS JOIN (
-               SELECT 40075016.685578488 / power(2.0, $1::float8) AS tw,
-                      $2::float8 * (40075016.685578488 / power(2.0, $1::float8)) AS mm
-           ) k
+           FROM {table}
+           {TILE_GRID}
            WHERE geom_tile IS NOT NULL AND NOT ST_IsEmpty(geom_tile)"#,
         table = prepared.table
     );
-    let row: Option<String> = Spi::get_one_with_args(
-        &sql,
-        &[
-            (rect.z as i32).into(),
-            (cfg.tile_extend as f64 / cfg.tile_size as f64).into(),
-            (rect.xmin as i32).into(),
-            (rect.xmax as i32).into(),
-            (rect.ymin as i32).into(),
-            (rect.ymax as i32).into(),
-        ],
-    )?;
+    let row: Option<String> = Spi::get_one_with_args(&sql, &candidate_args(rect, cfg))?;
     let s = row.ok_or("feature_driven_prep_stats returned no row")?;
     let arr: [i64; 2] = serde_json::from_str(&s)?;
     Ok((arr[0], arr[1]))
@@ -412,13 +634,13 @@ fn should_use_feature_driven(
     }
 
     let (xmin_m, ymin_m, xmax_m, ymax_m) = bbox_m;
-    let rect = TileRect::from_bbox_m(src.cfg.max_zoom, xmin_m, ymin_m, xmax_m, ymax_m);
+    let rect = build_rect(src.cfg, src.cfg.max_zoom, (xmin_m, ymin_m, xmax_m, ymax_m));
     let (rows, pairs_at_maxzoom) = feature_driven_prep_stats(prepared, &rect, src.cfg)?;
     let r_maxzoom = rect.cell_count();
 
     if rows <= 0 || pairs_at_maxzoom >= r_maxzoom {
         notice!(
-            "geometry_pyramid: featureDrivenEnum=true skipped — envelope explode ({} feature-tile pairs at maxZoom) is not below the full lattice R({})={}; using prepared tile-major path",
+            "geometry_pyramid: featureDrivenEnum sparse check skipped — envelope explode ({} feature-tile pairs at maxZoom) is not below the full lattice R({})={}",
             pairs_at_maxzoom,
             src.cfg.max_zoom,
             r_maxzoom
@@ -439,6 +661,42 @@ fn should_use_feature_driven(
 /// Per-zoom gate: `R(z) > C·rows`. See [`FEATURE_DRIVEN_MIN_FILL_RATIO`].
 fn feature_driven_zoom_beneficial(rect: &TileRect, rows: i64) -> bool {
     rows > 0 && (rect.cell_count() as f64) > FEATURE_DRIVEN_MIN_FILL_RATIO * (rows as f64)
+}
+
+/// A few tiles can still be expensive when they simplify the same large geometry.
+fn repeated_simplification_worthwhile(
+    cfg: &PyramidConfig,
+    rect: &TileRect,
+    prepared: &crate::prepared::PreparedBuildSource,
+) -> Result<bool, spi::Error> {
+    // shortcut: calibrate larger rectangles and other build modes before widening the gate.
+    if !config_allows_feature_driven(cfg)
+        || !(2..=4).contains(&rect.cell_count())
+        || cfg.simplify_pixels <= 0.0
+        || cfg.effective_parallel() > 1
+        || cfg.split_size > 0
+        || cfg.tile_size_budget_bytes > 0
+    {
+        return Ok(false);
+    }
+    let rules = rules_clause_for_zoom(cfg, rect.z, RuleTarget::Prepared);
+    let sql = format!(
+        r#"WITH tiles AS MATERIALIZED (
+             SELECT ST_TileEnvelope($1,x,y,margin => $2) AS geom
+             FROM generate_series($3::int,$4::int) x
+             CROSS JOIN generate_series($5::int,$6::int) y
+           ), candidate_costs AS MATERIALIZED (
+             SELECT ST_NPoints(prep_src.geom_tile) AS vertices,
+                    (SELECT count(*) FROM tiles WHERE prep_src.geom_tile && tiles.geom) AS copies
+             FROM {table} prep_src
+             WHERE prep_src.geom_type IN ('LINESTRING','MULTILINESTRING','POLYGON','MULTIPOLYGON')
+               {rules}
+           )
+           SELECT COALESCE(sum(vertices * (copies-1)) >= GREATEST(262144, sum(vertices)/8),false)
+           FROM candidate_costs WHERE copies > 0"#,
+        table = prepared.table,
+    );
+    Spi::get_one_with_args(&sql, &candidate_args(rect, cfg)).map(|v| v == Some(true))
 }
 
 /// Tippecanoe-style `--drop-densest-as-needed` loop. Build the zoom once,
@@ -465,16 +723,11 @@ fn build_zoom_level_with_budget(
             // Re-build cleanly: wipe this zoom's tiles before re-inserting,
             // otherwise the (z,x,y) PK collides.
             Spi::run_with_args(
-                &format!(r#"DELETE FROM "{storage_table}" WHERE z = $1"#),
+                &format!(r#"DELETE FROM ONLY {storage_table} WHERE z = $1"#),
                 &[(z as i32).into()],
             )?;
         }
 
-        // NOTE: budget-retry with parallel>1 may not fully reset committed worker
-        // rows across attempts (the DELETE runs in the coordinator txn and is
-        // visible to subsequent worker txns only after coordinator commit). For
-        // the default tile_size_budget_bytes=0 there are no retries, so this is
-        // a non-issue in the common path.
         run_zoom_strips(
             src,
             storage_table,
@@ -493,10 +746,15 @@ fn build_zoom_level_with_budget(
             attempt,
             tiles
         );
-        if cfg.tile_size_budget_bytes <= 0
-            || attempt >= cfg.max_tile_size_attempts
-            || max_tile_bytes <= cfg.tile_size_budget_bytes
-        {
+        let over_budget =
+            cfg.tile_size_budget_bytes > 0 && max_tile_bytes > cfg.tile_size_budget_bytes;
+        if !over_budget || attempt >= cfg.max_tile_size_attempts {
+            if over_budget {
+                warning!(
+                    "geometry_pyramid: pyramid '{}' z={} still has a {}-byte tile after {} attempts (target {} bytes)",
+                    src.name, z, max_tile_bytes, attempt + 1, cfg.tile_size_budget_bytes
+                );
+            }
             return Ok(ZoomBuildResult {
                 z: rect.z,
                 tiles,
@@ -504,6 +762,7 @@ fn build_zoom_level_with_budget(
                 max_tile_bytes,
                 build_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
                 attempts: attempt + 1,
+                knobs,
             });
         }
 
@@ -528,12 +787,12 @@ fn build_zoom_level_with_budget(
 
 /// Per-zoom tunable thresholds. Decoupled from `PyramidConfig` so the
 /// budget retry loop can ratchet them per attempt without mutating cfg.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ZoomKnobs {
-    simplify_tol_m: f64,
-    min_area_m2: f64,
-    min_len_m: f64,
-    drop_threshold: f64,
+    pub(crate) simplify_tol_m: f64,
+    pub(crate) min_area_m2: f64,
+    pub(crate) min_len_m: f64,
+    pub(crate) drop_threshold: f64,
 }
 
 impl ZoomKnobs {
@@ -555,24 +814,6 @@ impl ZoomKnobs {
         self.min_len_m = self.min_len_m.max(pixel_m) * factor;
         self.min_area_m2 = self.min_len_m * self.min_len_m;
         self.drop_threshold = (self.drop_threshold / factor).clamp(0.0, 1.0);
-    }
-
-    pub(crate) fn to_values(self) -> crate::worker::KnobValues {
-        crate::worker::KnobValues {
-            simplify_tol_m: self.simplify_tol_m,
-            min_area_m2: self.min_area_m2,
-            min_len_m: self.min_len_m,
-            drop_threshold: self.drop_threshold,
-        }
-    }
-
-    pub(crate) fn from_values(v: crate::worker::KnobValues) -> Self {
-        Self {
-            simplify_tol_m: v.simplify_tol_m,
-            min_area_m2: v.min_area_m2,
-            min_len_m: v.min_len_m,
-            drop_threshold: v.drop_threshold,
-        }
     }
 }
 
@@ -605,7 +846,7 @@ fn source_bbox(
     // Identifiers are validated by callers.
     let inner = format!(
         r#"SELECT ST_Extent(ST_Transform("{geom_column}", $1)) AS g
-           FROM "{table}" WHERE "{geom_column}" IS NOT NULL"#
+           FROM {table} WHERE "{geom_column}" IS NOT NULL"#
     );
     Ok(bbox_from_query(&inner, &[tile_srs.into()])?.map(|a| (a[0], a[1], a[2], a[3])))
 }
@@ -727,7 +968,7 @@ fn run_zoom_strips(
             geom_column: src.geom_column.to_string(),
             fid_column: src.fid_column.to_string(),
             config: Box::new(src.cfg.clone()),
-            knobs: knobs.to_values(),
+            knobs: *knobs,
             strips: chunk.clone(),
             prepared_table: prepared_table.clone(),
             feature_driven,
@@ -873,14 +1114,19 @@ pub(crate) fn sample_key_projections_for(cfg: &PyramidConfig, src_alias: &str) -
     s
 }
 
-/// LOD rule predicate columns for the prepared-table CTAS: one boolean column
-/// `_gp_rule_k` per rule, evaluated once from the src row. Empty when there
-/// are no rules. Mirrors the inner fragment shape of `attribute_projections_for`.
+/// LOD predicates and point-grid keep flags evaluated once in the prepared table.
 pub(crate) fn rule_projections_for(cfg: &PyramidConfig) -> String {
     let mut s = String::new();
     for (k, rule) in cfg.build_rules.iter().enumerate() {
         if let Some(filter) = &rule.filter {
             write!(&mut s, r#", ({filter}) AS _gp_rule_{k}"#).expect("write to String");
+        }
+        if let Some(field) = rule.point_grid.as_ref().and_then(|g| g.keep_field.as_ref()) {
+            write!(
+                &mut s,
+                r#", COALESCE(src."{field}",false) AS "grid keep {k}""#
+            )
+            .expect("write to String");
         }
     }
     s
@@ -983,35 +1229,105 @@ pub(crate) fn rules_clause_for_zoom(cfg: &PyramidConfig, z: u8, target: RuleTarg
     s
 }
 
-/// The shared `FROM … features` block of the MVT pipeline: a 2-D tile grid
-/// (`generate_series`, params $4..$7) joined to the per-tile feature pipeline
-/// (projection, per-zoom simplification, min-size + point-drop filters,
-/// `ST_AsMVTGeom`). References params $1,$3,$8,$9,$10,$11..$14 and tile coords
-/// t.x/t.y — never $2 (layer name) and no GROUP BY. Both the multi-tile build
-/// INSERT and the single-tile dynamic SELECT wrap this with
-/// `ST_AsMVT(features.*, $2, $3, 'geom','fid')` + `GROUP BY t.x, t.y`.
-/// A single tile is just the degenerate range xmin=xmax / ymin=ymax.
-pub(crate) fn tile_pipeline_from_sql(
-    table: &str,
-    geom_column: &str,
-    fid_column: &str,
-    attrs_inner: &str,
-    attrs_outer: &str,
-    rule_where: &str,
-) -> String {
+fn source_candidate_sql(geom: &str, source_srs: i32, envelope: &str) -> String {
+    match source_srs {
+        3857 => format!("{geom} && {envelope}"),
+        // Mercator is monotone over canonical WGS84 coordinates. Pad the
+        // inverse window beyond the metre-scale float GiST box roundoff and
+        // include wrapped longitudes. The exact tile-space test decides membership.
+        4326 => format!(
+            "({geom} && ST_Expand(ST_Transform({envelope},4326),0.0001)
+            OR {geom} && ST_MakeEnvelope(180,-90,'Infinity'::float8,90,4326)
+            OR {geom} && ST_MakeEnvelope('-Infinity'::float8,-90,-180,90,4326))
+            AND ST_Transform({geom},3857) && {envelope}"
+        ),
+        // Four inverse-projected corners are not conservative for UTM or polar CRSs.
+        _ => format!("ST_Transform({geom},3857) && {envelope}"),
+    }
+}
+
+/// A region's candidate count bounds every child's final feature count.
+/// Stop once the probe has found enough candidates to keep the region.
+fn tile_candidates_sql(table: &str, geom: &str, srid: i32, min_candidates: u32) -> String {
+    if min_candidates == 0 {
+        return "generate_series($4::int,$5::int) xs(x)
+                CROSS JOIN generate_series($6::int,$7::int) ys(y)
+                CROSS JOIN LATERAL (SELECT xs.x,ys.y) t"
+            .into();
+    }
+    let envelope = "ST_MakeEnvelope(
+        ST_XMin(ST_TileEnvelope($1,r.xmin,r.ymax,margin => ($9::float8/$3::float8))),
+        ST_YMin(ST_TileEnvelope($1,r.xmin,r.ymax,margin => ($9::float8/$3::float8))),
+        ST_XMax(ST_TileEnvelope($1,r.xmax,r.ymin,margin => ($9::float8/$3::float8))),
+        ST_YMax(ST_TileEnvelope($1,r.xmax,r.ymin,margin => ($9::float8/$3::float8))),3857)";
+    let candidate = source_candidate_sql(geom, srid, envelope);
+    let enough = if min_candidates == 1 {
+        format!("EXISTS (SELECT FROM {table} src WHERE {candidate})")
+    } else {
+        format!(
+            "(SELECT count(*) FROM (
+        SELECT 1 FROM {table} src WHERE {candidate} LIMIT {min_candidates}
+    ) bounded) >= {min_candidates}"
+        )
+    };
     format!(
-        r#"FROM generate_series($4::int, $5::int) AS xs(x)
-           CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
-           CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
-           CROSS JOIN LATERAL (
-              SELECT
-                 ST_AsMVTGeom(prep.gtile,
-                              ST_TileEnvelope($1, t.x, t.y),
-                              $3, $9, true) AS geom,
-                 prep.fid
-                 {attrs_outer}
-              FROM (
-                 SELECT
+        "(WITH RECURSIVE regions AS (
+            SELECT r.* FROM (VALUES ($4::int,$5::int,$6::int,$7::int))
+                r(xmin,xmax,ymin,ymax) WHERE {enough}
+            UNION ALL
+            SELECT r.* FROM regions n
+            CROSS JOIN LATERAL (
+                SELECT GREATEST(1,(n.xmax-n.xmin+2)/2) AS w,
+                       GREATEST(1,(n.ymax-n.ymin+2)/2) AS h
+            ) step
+            CROSS JOIN LATERAL (VALUES (n.xmin),(n.xmin+step.w)) xs(x)
+            CROSS JOIN LATERAL (VALUES (n.ymin),(n.ymin+step.h)) ys(y)
+            CROSS JOIN LATERAL (
+                SELECT x AS xmin,LEAST(x+step.w-1,n.xmax) AS xmax,
+                       y AS ymin,LEAST(y+step.h-1,n.ymax) AS ymax
+                WHERE x<=n.xmax AND y<=n.ymax AND (n.xmin<n.xmax OR n.ymin<n.ymax)
+                OFFSET 0
+            ) r
+            WHERE {enough}
+        ) SELECT xmin AS x,ymin AS y FROM regions WHERE xmin=xmax AND ymin=ymax) t"
+    )
+}
+
+/// Shared by materialization and dynamic reads. The latter pass zero to skip
+/// candidate pruning, including when the tile was deliberately deferred.
+pub(crate) fn tile_pipeline_from_sql(
+    src: PyramidSource,
+    z: u8,
+    min_candidates: u32,
+    grid_points_only: bool,
+) -> String {
+    let cfg = src.cfg;
+    let table = src.source_table;
+    let geom_column = src.geom_column;
+    let fid_column = src.fid_column;
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "src", "prep");
+    let rule_where = rules_clause_for_zoom(
+        cfg,
+        z,
+        RuleTarget::Source {
+            geom_column,
+            fid_column,
+        },
+    );
+    let keep = cfg
+        .point_grid_at(z)
+        .and_then(|(_, grid)| grid.keep_field.as_ref())
+        .map(|field| format!(r#", COALESCE(src."{field}",false) AS "grid keep""#))
+        .unwrap_or_default();
+    let geom = format!(r#"src."{geom_column}""#);
+    let candidate = source_candidate_sql(
+        &geom,
+        cfg.source_srs,
+        "ST_TileEnvelope($1,t.x,t.y,margin => ($9::float8 / $3::float8))",
+    );
+    let tiles = tile_candidates_sql(table, &geom, cfg.source_srs, min_candidates);
+    let projected = format!(
+        r#"SELECT
                     CASE
                        WHEN $11::float8 > 0
                             AND GeometryType(src."{geom_column}") NOT IN ('POINT','MULTIPOINT')
@@ -1022,57 +1338,43 @@ pub(crate) fn tile_pipeline_from_sql(
                     END AS gtile,
                     src."{fid_column}"::bigint AS fid
                     {attrs_inner}
-                 FROM "{table}" src
+                    {keep}
+                 FROM {table} src
                  WHERE src."{geom_column}" IS NOT NULL
-                   AND src."{geom_column}" && ST_Transform(
-                          ST_TileEnvelope($1, t.x, t.y, margin => ($9::float8 / $3::float8)),
-                          $10
-                       ){rule_where}
-                 -- Keep the projected/simplified geometry in a tuple slot:
-                 -- area/length checks and clipping must not re-evaluate it.
-                 OFFSET 0
-              ) prep
-              WHERE
-                 ($12::float8 <= 0
-                  OR GeometryType(prep.gtile) NOT IN ('POLYGON','MULTIPOLYGON')
-                  OR ST_Area(prep.gtile) >= $12::float8)
-                 AND ($13::float8 <= 0
-                      OR GeometryType(prep.gtile) NOT IN ('LINESTRING','MULTILINESTRING')
-                      OR ST_Length(prep.gtile) >= $13::float8)
-                 AND ($14::float8 >= 1.0
-                      OR GeometryType(prep.gtile) NOT IN ('POINT','MULTIPOINT')
-                      OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
-                         / 1000000.0 < $14::float8)
-              -- A per-tile evaluation barrier, not a materialized whole zoom.
-              -- The outer null check and aggregate share the clipped geometry.
-              OFFSET 0
-           ) features
-           WHERE features.geom IS NOT NULL"#
+                   AND {candidate}{rule_where}
+                 OFFSET 0"#
+    );
+    tile_major_pipeline(
+        cfg,
+        z,
+        &tiles,
+        &projected,
+        "GeometryType(prep.gtile)",
+        &attrs_outer,
+        grid_points_only,
     )
 }
 
 /// Prepared-build variant of the shared `FROM ... features` block. The source
 /// rows have already been transformed into tile SRS and indexed on `geom_tile`,
 /// so per-tile work can use a direct Web-Mercator envelope filter.
-pub(crate) fn tile_pipeline_from_prepared_sql(
+fn tile_pipeline_from_prepared_sql(
+    cfg: &PyramidConfig,
+    z: u8,
     prepared_table: &str,
-    attrs_inner: &str,
-    attrs_outer: &str,
-    rule_where: &str,
+    min_candidates: u32,
+    grid_points_only: bool,
 ) -> String {
-    format!(
-        r#"FROM generate_series($4::int, $5::int) AS xs(x)
-           CROSS JOIN generate_series($6::int, $7::int) AS ys(y)
-           CROSS JOIN LATERAL (SELECT xs.x AS x, ys.y AS y) t
-           CROSS JOIN LATERAL (
-              SELECT
-                 ST_AsMVTGeom(prep.gtile,
-                              ST_TileEnvelope($1, t.x, t.y),
-                              $3, $9, true) AS geom,
-                 prep.fid
-                 {attrs_outer}
-              FROM (
-                 SELECT
+    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "prep");
+    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
+    let keep = cfg
+        .point_grid_at(z)
+        .filter(|(_, grid)| grid.keep_field.is_some())
+        .map(|(i, _)| format!(r#", prep_src."grid keep {i}" AS "grid keep""#))
+        .unwrap_or_default();
+    let tiles = tile_candidates_sql(prepared_table, "src.geom_tile", 3857, min_candidates);
+    let projected = format!(
+        r#"SELECT
                     CASE
                        WHEN $11::float8 > 0
                             AND prep_src.geom_type NOT IN ('POINT','MULTIPOINT')
@@ -1082,27 +1384,104 @@ pub(crate) fn tile_pipeline_from_prepared_sql(
                     prep_src.geom_type,
                     prep_src.fid
                     {attrs_inner}
-                 FROM "{prepared_table}" prep_src
+                    {keep}
+                 FROM {prepared_table} prep_src
                  WHERE prep_src.geom_tile && ST_TileEnvelope(
                     $1, t.x, t.y, margin => ($9::float8 / $3::float8)
                  ){rule_where}
-                 OFFSET 0
-              ) prep
+                 OFFSET 0"#
+    );
+    tile_major_pipeline(
+        cfg,
+        z,
+        &tiles,
+        &projected,
+        "prep.geom_type",
+        &attrs_outer,
+        grid_points_only,
+    )
+}
+
+fn tile_major_pipeline(
+    cfg: &PyramidConfig,
+    z: u8,
+    tiles: &str,
+    projected: &str,
+    geom_type: &str,
+    attrs_outer: &str,
+    grid_points_only: bool,
+) -> String {
+    let grid = cfg.point_grid_at(z).map(|(_, grid)| grid);
+    let metadata = grid
+        .map(|g| {
+            let keep = if g.keep_field.is_some() {
+                "prep.\"grid keep\""
+            } else {
+                "false"
+            };
+            if grid_points_only {
+                format!(r#", {keep} AS "grid keep""#)
+            } else {
+                format!(
+                    r#", {geom_type} IN ('POINT','POINTM') AS "grid point", {keep} AS "grid keep""#
+                )
+            }
+        })
+        .unwrap_or_default();
+    // Keep the projected and clipped geometry in tuple slots so size tests,
+    // membership checks and MVT aggregation cannot re-evaluate them.
+    let clipped = format!(
+        r#"SELECT ST_AsMVTGeom(prep.gtile, ST_TileEnvelope($1, t.x, t.y), $3, $9, true) AS geom,
+                 prep.fid {attrs_outer} {metadata}
+              FROM ({projected}) prep
               WHERE
                  ($12::float8 <= 0
-                  OR prep.geom_type NOT IN ('POLYGON','MULTIPOLYGON')
+                  OR {geom_type} NOT IN ('POLYGON','MULTIPOLYGON')
                   OR ST_Area(prep.gtile) >= $12::float8)
                  AND ($13::float8 <= 0
-                      OR prep.geom_type NOT IN ('LINESTRING','MULTILINESTRING')
+                      OR {geom_type} NOT IN ('LINESTRING','MULTILINESTRING')
                       OR ST_Length(prep.gtile) >= $13::float8)
                  AND ($14::float8 >= 1.0
-                      OR prep.geom_type NOT IN ('POINT','MULTIPOINT')
+                      OR {geom_type} NOT IN ('POINT','MULTIPOINT')
                       OR (abs(hashtextextended(prep.fid::text, 0::bigint)) % 1000000)::float8
                          / 1000000.0 < $14::float8)
-              OFFSET 0
-           ) features
-           WHERE features.geom IS NOT NULL"#
-    )
+              OFFSET 0"#
+    );
+    let rows = if let Some(grid) = grid {
+        let (_, attrs) = attribute_projections_for_zoom(cfg, z, "c", "c");
+        let pixels = grid.cell_pixels;
+        let clipped_points = if grid_points_only {
+            format!("({clipped}) c WHERE c.geom IS NOT NULL")
+        } else {
+            r#"clipped c WHERE c.geom IS NOT NULL AND c."grid point""#.into()
+        };
+        // Rank only encodable points so a clipped-out candidate cannot win a cell.
+        let ranked = format!(
+            r#"SELECT c.geom, c.fid {attrs}
+               FROM (
+                   SELECT c.*, rank() OVER (
+                       PARTITION BY floor(ST_X(c.geom) / {pixels}), floor(ST_Y(c.geom) / {pixels})
+                       ORDER BY c."grid keep" DESC, c.fid, ST_X(c.geom), ST_Y(c.geom)
+                   ) AS "grid rank"
+                   FROM {clipped_points}
+               ) c
+               WHERE c."grid keep" OR c."grid rank" = 1"#
+        );
+        if grid_points_only {
+            ranked
+        } else {
+            format!(
+                r#"WITH clipped AS MATERIALIZED ({clipped})
+                   SELECT c.geom, c.fid {attrs}
+                   FROM clipped c WHERE c.geom IS NOT NULL AND NOT c."grid point"
+                   UNION ALL
+                   {ranked}"#
+            )
+        }
+    } else {
+        clipped
+    };
+    format!("FROM {tiles} CROSS JOIN LATERAL ({rows}) features WHERE features.geom IS NOT NULL")
 }
 
 pub(crate) fn point_feature_major_pipeline_sql(
@@ -1122,7 +1501,7 @@ pub(crate) fn point_feature_major_pipeline_sql(
                 prep_src.geom_tile,
                 prep_src.fid
                 {attrs_inner}
-             FROM "{prepared_table}" prep_src
+             FROM {prepared_table} prep_src
              WHERE prep_src.geom_type = 'POINT'
                AND NOT ST_IsEmpty(prep_src.geom_tile)
                AND ($14::float8 >= 1.0
@@ -1203,6 +1582,7 @@ pub(crate) fn feature_driven_pipeline_sql(
                       THEN ST_SimplifyPreserveTopology(prep_src.geom_tile, $11::float8)
                    ELSE prep_src.geom_tile
                 END AS gtile,
+                prep_src.geom_tile AS original,
                 prep_src.geom_type,
                 prep_src.fid
                 {attrs_inner},
@@ -1210,7 +1590,7 @@ pub(crate) fn feature_driven_pipeline_sql(
                 floor((ST_XMax(prep_src.geom_tile) + k.mm + 20037508.342789244) / k.tw)::int + 1 AS tx1,
                 floor((20037508.342789244 - ST_YMax(prep_src.geom_tile) - k.mm) / k.tw)::int - 1 AS ty0,
                 floor((20037508.342789244 - ST_YMin(prep_src.geom_tile) + k.mm) / k.tw)::int + 1 AS ty1
-             FROM "{prepared_table}" prep_src
+             FROM {prepared_table} prep_src
              CROSS JOIN (
                 SELECT 40075016.685578488 / power(2.0, $1::float8) AS tw,
                        ($9::float8 / $3::float8)
@@ -1242,7 +1622,7 @@ pub(crate) fn feature_driven_pipeline_sql(
            ),
            kept AS (
              SELECT
-                prepped.gtile,
+                prepped.gtile, prepped.original,
                 prepped.geom_type,
                 prepped.fid
                 {attrs_from_prepped},
@@ -1270,6 +1650,7 @@ pub(crate) fn feature_driven_pipeline_sql(
                 generate_series(GREATEST(kept.ty0, $6::int), LEAST(kept.ty1, $7::int)) AS gy
              WHERE gx >= 0 AND gx < power(2.0, $1::float8)::int
                AND gy >= 0 AND gy < power(2.0, $1::float8)::int
+               AND kept.original && ST_TileEnvelope($1,gx,gy,margin => ($9::float8/$3::float8))
              -- Sort and encode clipped tuples, never the original geometry.
              OFFSET 0
            ),
@@ -1288,6 +1669,23 @@ pub(crate) fn feature_driven_pipeline_sql(
     )
 }
 
+/// Trust the geometry type modifier on ordinary tables to skip the mixed-row spool.
+fn point_grid_source_is_point(src: PyramidSource, z: u8) -> Result<bool, spi::Error> {
+    if src.cfg.point_grid_at(z).is_none() {
+        return Ok(false);
+    }
+    Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (
+           SELECT FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+           WHERE c.oid=pg_catalog.to_regclass($1) AND c.relkind='r' AND NOT c.relhassubclass
+             AND a.attname=$2 AND a.attnum>0 AND NOT a.attisdropped
+             AND a.atttypid='geometry'::regtype AND a.atttypmod>=0
+             AND postgis_typmod_type(a.atttypmod) IN ('Point','PointM','PointZ','PointZM'))",
+        &[src.source_table.into(), src.geom_column.into()],
+    )
+    .map(|v| v == Some(true))
+}
+
 pub(crate) fn build_zoom_level(
     src: PyramidSource,
     storage_table: &str,
@@ -1295,72 +1693,22 @@ pub(crate) fn build_zoom_level(
     knobs: &ZoomKnobs,
 ) -> Result<i64, spi::Error> {
     let cfg = src.cfg;
-    let z = rect.z;
-    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
-
-    // The four tippecanoe-style thresholds for this attempt. `cfg` is no
-    // longer the source of truth — the budget retry loop owns them.
-    let simplify_tol_m = knobs.simplify_tol_m;
-    let min_area_m2 = knobs.min_area_m2;
-    let min_len_m = knobs.min_len_m;
-    let drop_threshold = knobs.drop_threshold;
-
-    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "src", "prep");
-
-    let rule_where = rules_clause_for_zoom(
-        cfg,
-        z,
-        RuleTarget::Source {
-            geom_column: src.geom_column,
-            fid_column: src.fid_column,
-        },
-    );
-    let pipeline = tile_pipeline_from_sql(
-        src.source_table,
-        src.geom_column,
-        src.fid_column,
-        &attrs_inner,
-        &attrs_outer,
-        &rule_where,
-    );
-    let split_size = cfg.split_size;
-    // Aggregate each tile's MVT exactly once. The previous form computed
-    // ST_AsMVT in both the SELECT and the HAVING, so the (expensive) tile
-    // encode ran twice per group. Group once in a CTE, then filter the already
-    // computed columns — same output, same splitSize semantics, half the encode.
-    let sql = format!(
-        r#"WITH grouped AS (
-             SELECT t.x AS x, t.y AS y,
-                    count(*) AS feature_count,
-                    ST_AsMVT(features.*, $2, $3, 'geom', 'fid') AS mvt
-             {pipeline}
-             GROUP BY t.x, t.y
-           )
-           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
-           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
-           FROM grouped
-           WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
-    );
-
-    insert_tiles(
-        &sql,
-        &[
-            (z as i32).into(),
-            src.name.into(),
-            (cfg.tile_size as i32).into(),
-            (xmin_t as i32).into(),
-            (xmax_t as i32).into(),
-            (ymin_t as i32).into(),
-            (ymax_t as i32).into(),
-            cfg.tile_srs.into(),
-            (cfg.tile_extend as i32).into(),
-            cfg.source_srs.into(),
-            simplify_tol_m.into(),
-            min_area_m2.into(),
-            min_len_m.into(),
-            drop_threshold.into(),
-        ],
-    )
+    // A view, foreign table or row policy can change between the probe and clip.
+    let min_candidates = if cfg.split_size == 0 {
+        u32::from(indexed_sparse_grid(src, rect)?)
+    } else if Spi::get_one_with_args::<bool>(
+        "SELECT c.relkind='r' AND NOT c.relhassubclass AND NOT c.relrowsecurity
+             FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass($1)",
+        &[src.source_table.into()],
+    )? == Some(true)
+    {
+        cfg.split_size
+    } else {
+        0
+    };
+    let grid_points_only = point_grid_source_is_point(src, rect.z)?;
+    let pipeline = tile_pipeline_from_sql(src, rect.z, min_candidates, grid_points_only);
+    insert_groups(src, storage_table, rect, knobs, tile_groups(&pipeline))
 }
 
 fn build_zoom_level_prepared(
@@ -1371,51 +1719,15 @@ fn build_zoom_level_prepared(
     prepared: &crate::prepared::PreparedBuildSource,
 ) -> Result<i64, spi::Error> {
     let cfg = src.cfg;
-    let z = rect.z;
-    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
-    let simplify_tol_m = knobs.simplify_tol_m;
-    let min_area_m2 = knobs.min_area_m2;
-    let min_len_m = knobs.min_len_m;
-    let drop_threshold = knobs.drop_threshold;
-    let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "prep");
-
-    let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
-    let pipeline =
-        tile_pipeline_from_prepared_sql(&prepared.table, &attrs_inner, &attrs_outer, &rule_where);
-    let split_size = cfg.split_size;
-    let sql = format!(
-        r#"WITH grouped AS (
-             SELECT t.x AS x, t.y AS y,
-                    count(*) AS feature_count,
-                    ST_AsMVT(features.*, $2, $3, 'geom', 'fid') AS mvt
-             {pipeline}
-             GROUP BY t.x, t.y
-           )
-           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
-           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
-           FROM grouped
-           WHERE feature_count >= {split_size} AND mvt IS NOT NULL"#
+    let grid_points_only = point_grid_source_is_point(src, rect.z)?;
+    let pipeline = tile_pipeline_from_prepared_sql(
+        cfg,
+        rect.z,
+        &prepared.table,
+        cfg.split_size,
+        grid_points_only,
     );
-
-    insert_tiles(
-        &sql,
-        &[
-            (z as i32).into(),
-            src.name.into(),
-            (cfg.tile_size as i32).into(),
-            (xmin_t as i32).into(),
-            (xmax_t as i32).into(),
-            (ymin_t as i32).into(),
-            (ymax_t as i32).into(),
-            cfg.tile_srs.into(),
-            (cfg.tile_extend as i32).into(),
-            cfg.source_srs.into(),
-            simplify_tol_m.into(),
-            min_area_m2.into(),
-            min_len_m.into(),
-            drop_threshold.into(),
-        ],
-    )
+    insert_groups(src, storage_table, rect, knobs, tile_groups(&pipeline))
 }
 
 fn build_zoom_level_prepared_points_feature_major(
@@ -1427,8 +1739,6 @@ fn build_zoom_level_prepared_points_feature_major(
 ) -> Result<i64, spi::Error> {
     let cfg = src.cfg;
     let z = rect.z;
-    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
-    let drop_threshold = knobs.drop_threshold;
     let (attrs_inner, attrs_outer) = attribute_projections_for_zoom(cfg, z, "prep_src", "raw");
     let (_, attrs_mvt) = attribute_projections_for_zoom(cfg, z, "prep_src", "f");
     let rule_where = rules_clause_for_zoom(cfg, z, RuleTarget::Prepared);
@@ -1439,35 +1749,7 @@ fn build_zoom_level_prepared_points_feature_major(
         &attrs_mvt,
         &rule_where,
     );
-    let split_size = cfg.split_size;
-    let sql = format!(
-        r#"{pipeline}
-           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
-           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
-           FROM grouped
-           WHERE feature_count >= {split_size}
-             AND mvt IS NOT NULL"#
-    );
-
-    insert_tiles(
-        &sql,
-        &[
-            (z as i32).into(),
-            src.name.into(),
-            (cfg.tile_size as i32).into(),
-            (xmin_t as i32).into(),
-            (xmax_t as i32).into(),
-            (ymin_t as i32).into(),
-            (ymax_t as i32).into(),
-            cfg.tile_srs.into(),
-            (cfg.tile_extend as i32).into(),
-            cfg.source_srs.into(),
-            knobs.simplify_tol_m.into(),
-            knobs.min_area_m2.into(),
-            knobs.min_len_m.into(),
-            drop_threshold.into(),
-        ],
-    )
+    insert_groups(src, storage_table, rect, knobs, pipeline)
 }
 
 fn build_zoom_level_prepared_feature_driven(
@@ -1479,7 +1761,6 @@ fn build_zoom_level_prepared_feature_driven(
 ) -> Result<i64, spi::Error> {
     let cfg = src.cfg;
     let z = rect.z;
-    let (xmin_t, ymin_t, xmax_t, ymax_t) = (rect.xmin, rect.ymin, rect.xmax, rect.ymax);
     let (attrs_inner, attrs_from_prepped) =
         attribute_projections_for_zoom(cfg, z, "prep_src", "prepped");
     let (_, attrs_from_kept) = attribute_projections_for_zoom(cfg, z, "x", "kept");
@@ -1493,35 +1774,50 @@ fn build_zoom_level_prepared_feature_driven(
         &attrs_mvt,
         &rule_where,
     );
-    let split_size = cfg.split_size;
-    let sql = format!(
-        r#"{pipeline}
-           INSERT INTO "{storage_table}" (z, x, y, format, srid, mvt)
-           SELECT $1::smallint, x, y, 'pbf'::text, $8::integer, mvt
-           FROM grouped
-           WHERE feature_count >= {split_size}
-             AND mvt IS NOT NULL"#
-    );
+    insert_groups(src, storage_table, rect, knobs, pipeline)
+}
 
-    insert_tiles(
-        &sql,
-        &[
-            (z as i32).into(),
-            src.name.into(),
-            (cfg.tile_size as i32).into(),
-            (xmin_t as i32).into(),
-            (xmax_t as i32).into(),
-            (ymin_t as i32).into(),
-            (ymax_t as i32).into(),
-            cfg.tile_srs.into(),
-            (cfg.tile_extend as i32).into(),
-            cfg.source_srs.into(),
-            knobs.simplify_tol_m.into(),
-            knobs.min_area_m2.into(),
-            knobs.min_len_m.into(),
-            knobs.drop_threshold.into(),
-        ],
+pub(crate) fn tile_args<'a>(
+    src: PyramidSource<'a>,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+) -> [pgrx::datum::DatumWithOid<'a>; 14] {
+    [
+        (rect.z as i32).into(),
+        src.name.into(),
+        (src.cfg.tile_size as i32).into(),
+        (rect.xmin as i32).into(),
+        (rect.xmax as i32).into(),
+        (rect.ymin as i32).into(),
+        (rect.ymax as i32).into(),
+        src.cfg.tile_srs.into(),
+        (src.cfg.tile_extend as i32).into(),
+        src.cfg.source_srs.into(),
+        knobs.simplify_tol_m.into(),
+        knobs.min_area_m2.into(),
+        knobs.min_len_m.into(),
+        knobs.drop_threshold.into(),
+    ]
+}
+
+fn tile_groups(pipeline: &str) -> String {
+    format!(
+        "WITH grouped AS (SELECT t.x,t.y,count(*) AS feature_count,
+             ST_AsMVT(features.*, $2, $3, 'geom', 'fid') AS mvt {pipeline} GROUP BY t.x,t.y)"
     )
+}
+
+fn insert_groups(
+    src: PyramidSource,
+    table: &str,
+    rect: &TileRect,
+    knobs: &ZoomKnobs,
+    groups: String,
+) -> Result<i64, spi::Error> {
+    let sql = format!("{groups} INSERT INTO {table} (z,x,y,format,srid,mvt)
+        SELECT $1::smallint,x,y,'pbf',$8,mvt FROM grouped WHERE feature_count >= {} AND mvt IS NOT NULL",
+        src.cfg.split_size);
+    insert_tiles(&sql, &tile_args(src, rect, knobs))
 }
 
 /// SPI reports the rows this INSERT processed even without a RETURNING clause.
@@ -1573,14 +1869,13 @@ mod tests {
 
     #[test]
     fn prepared_pipeline_reads_preprojected_geometry() {
-        let sql = tile_pipeline_from_prepared_sql(
-            "_gp_prep_42",
-            r#", prep_src."kind" AS "kind""#,
-            r#", prep."kind""#,
-            "",
-        );
+        let cfg = PyramidConfig {
+            attributes: vec!["kind".into()],
+            ..Default::default()
+        };
+        let sql = tile_pipeline_from_prepared_sql(&cfg, 0, "_gp_prep_42", 0, false);
 
-        assert!(sql.contains(r#"FROM "_gp_prep_42" prep_src"#));
+        assert!(sql.contains(r#"FROM _gp_prep_42 prep_src"#));
         assert!(sql.contains("prep_src.geom_tile && ST_TileEnvelope"));
         assert!(sql.contains("ST_SimplifyPreserveTopology(prep_src.geom_tile"));
         assert!(!sql.contains("ST_Transform"));

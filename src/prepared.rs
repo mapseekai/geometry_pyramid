@@ -9,7 +9,7 @@
 //!   autonomous worker ([`prepare_source_committed`]). Background workers run
 //!   in separate backends and can only see committed data, so a temp table
 //!   would be invisible to them. It uses a deterministic per-pyramid name and
-//!   `DROP TABLE IF EXISTS` at creation (self-healing, exactly like the shadow
+//!   an OID-bound marker at creation (like the shadow
 //!   table); the caller drops it after the build.
 
 use crate::source::PyramidSource;
@@ -58,6 +58,7 @@ pub(crate) fn prepare_source_for_build(
         unsafe { pg_sys::MyProcPid } as u32,
         crate::worker::next_job_idx(),
     );
+    let table = format!("pg_temp.{table}");
     let attrs_inner = format!(
         "{}{}",
         crate::build::prepared_attribute_projections(src.cfg, "src"),
@@ -89,22 +90,17 @@ pub(crate) fn prepare_source_for_build(
 
 /// Build the *committed*, worker-visible prepared table for a parallel build.
 ///
-/// Runs `DROP IF EXISTS` + `CREATE TABLE … AS` (+ optional GiST index) +
-/// `ANALYZE` as one autonomous (separately committed) script so background
-/// worker backends can see it under MVCC. The `DROP IF EXISTS` makes a
-/// leftover table from a crashed prior run self-heal — the per-pyramid name is
-/// deterministic, and concurrent same-pyramid builds are already serialized by
-/// the per-pyramid advisory transaction lock in [`crate::build::build`].
-///
+/// The worker verifies the identity of any leftover stage before replacing it.
 /// Waits up to `timeout_ms` (0 = unbounded) for the transform to finish — this
 /// is the serial transform/index prefix the parallel tile build runs on top of,
 /// so it borrows the build's own timeout rather than the short DDL default.
 pub(crate) fn prepare_source_committed(
     src: PyramidSource<'_>,
+    schema: &str,
     options: PreparedBuildOptions,
     timeout_ms: i64,
 ) -> Result<PreparedBuildSource, Box<dyn Error + Send + Sync>> {
-    let table = prepared_table_name_for(src.name);
+    let table = spi::quote_qualified_identifier(schema, &prepared_table_name_for(src.name));
     let attrs_inner = format!(
         "{}{}",
         crate::build::prepared_attribute_projections(src.cfg, "src"),
@@ -114,17 +110,14 @@ pub(crate) fn prepare_source_committed(
 
     // One autonomous script: tile_srs is inlined (a validated i32, injection-safe)
     // because the autonomous executor runs raw SQL without bind parameters.
-    let mut script = format!(
-        r#"DROP TABLE IF EXISTS "{table}"; {}"#,
-        create_table_committed_sql(
-            &table,
-            src.source_table,
-            src.geom_column,
-            src.fid_column,
-            &attrs_inner,
-            &rules_inner,
-            src.cfg.tile_srs,
-        )
+    let mut script = create_table_committed_sql(
+        &table,
+        src.source_table,
+        src.geom_column,
+        src.fid_column,
+        &attrs_inner,
+        &rules_inner,
+        src.cfg.tile_srs,
     );
     if options.create_geom_tile_index {
         script.push(';');
@@ -133,27 +126,21 @@ pub(crate) fn prepare_source_committed(
     script.push(';');
     script.push_str(&analyze_sql(&table));
 
-    crate::worker::exec_sql_autonomous_timeout(&script, timeout_ms)?;
+    crate::worker::create_stage(&table, script, timeout_ms)?;
     Ok(PreparedBuildSource::new(
         table,
         options.create_geom_tile_index,
     ))
 }
 
-/// Drop a committed prepared table once the build no longer needs it, in the
-/// **coordinator's own transaction**.
-///
-/// It must NOT be an autonomous worker: the coordinator has held `ACCESS SHARE`
-/// on this table since the prep-gate read it (and keeps it for the inline
-/// strips), so an autonomous `DROP`'s `ACCESS EXCLUSIVE` would block on the
-/// coordinator while the coordinator blocks waiting for that worker — a deadlock
-/// Postgres can't see (the coordinator waits on a status file, not a lock), so
-/// it would burn the full worker timeout every build. A same-transaction lock
-/// upgrade has no such conflict. The drop commits with the build; if a later
-/// failure rolls the build back the table simply self-heals via the next
-/// build's `DROP IF EXISTS`.
-pub(crate) fn drop_prepared_committed(table: &str) -> Result<(), spi::Error> {
-    Spi::run(&format!(r#"DROP TABLE IF EXISTS "{table}""#))
+/// Drop with the coordinator's existing relation lock. A worker issuing DROP
+/// here would wait for the coordinator while the coordinator waits for its IPC.
+pub(crate) fn drop_prepared(table: &str, shared: bool) -> Result<(), crate::storage::DbError> {
+    if shared {
+        return crate::shadow::check(table)?.drop_table();
+    }
+    Spi::run(&format!("DROP TABLE {table}"))?;
+    Ok(())
 }
 
 pub(crate) fn ensure_geom_tile_index(prepared: &mut PreparedBuildSource) -> Result<(), spi::Error> {
@@ -172,7 +159,7 @@ fn prepared_table_name(pid: u32, idx: u32) -> String {
 }
 
 /// Deterministic per-pyramid name for the committed prepared table. Stable
-/// across runs so a leaked table self-heals via `DROP IF EXISTS`. `_gp_prep_`
+/// across runs so a retry can reclaim a marked stage. `_gp_prep_`
 /// (9) + a ≤45-char validated pyramid name stays within the 63-char limit.
 fn prepared_table_name_for(pyramid_name: &str) -> String {
     format!("_gp_prep_{pyramid_name}")
@@ -191,13 +178,13 @@ fn create_table_committed_sql(
     tile_srs: i32,
 ) -> String {
     format!(
-        r#"CREATE TABLE "{prepared_table}" AS
+        r#"CREATE UNLOGGED TABLE {prepared_table} AS
            SELECT
               src."{fid_column}"::bigint AS fid,
               ST_Transform(src."{geom_column}", {tile_srs}) AS geom_tile,
               GeometryType(src."{geom_column}") AS geom_type
               {attrs_inner}{rules_inner}
-           FROM "{source_table}" src
+           FROM {source_table} src
            WHERE src."{geom_column}" IS NOT NULL"#
     )
 }
@@ -211,25 +198,23 @@ fn create_table_sql(
     rules_inner: &str,
 ) -> String {
     format!(
-        r#"CREATE TEMP TABLE "{prepared_table}" ON COMMIT DROP AS
+        r#"CREATE TEMP TABLE {prepared_table} ON COMMIT DROP AS
            SELECT
               src."{fid_column}"::bigint AS fid,
               ST_Transform(src."{geom_column}", $1) AS geom_tile,
               GeometryType(src."{geom_column}") AS geom_type
               {attrs_inner}{rules_inner}
-           FROM "{source_table}" src
+           FROM {source_table} src
            WHERE src."{geom_column}" IS NOT NULL"#
     )
 }
 
 fn create_index_sql(prepared_table: &str) -> String {
-    format!(
-        r#"CREATE INDEX "{prepared_table}_geom_tile_idx" ON "{prepared_table}" USING GIST (geom_tile)"#
-    )
+    format!("CREATE INDEX ON {prepared_table} USING GIST (geom_tile)")
 }
 
 fn analyze_sql(prepared_table: &str) -> String {
-    format!(r#"ANALYZE "{prepared_table}""#)
+    format!(r#"ANALYZE {prepared_table}"#)
 }
 
 #[cfg(test)]
@@ -247,12 +232,12 @@ mod tests {
             "",
         );
 
-        assert!(sql.contains(r#"CREATE TEMP TABLE "_gp_prep_7" ON COMMIT DROP AS"#));
+        assert!(sql.contains(r#"CREATE TEMP TABLE _gp_prep_7 ON COMMIT DROP AS"#));
         assert!(sql.contains(r#"src."gid"::bigint AS fid"#));
         assert!(sql.contains(r#"ST_Transform(src."geom", $1) AS geom_tile"#));
         assert!(sql.contains(r#"GeometryType(src."geom") AS geom_type"#));
         assert!(sql.contains(r#", src."kind" AS "kind""#));
-        assert!(sql.contains(r#"FROM "roads" src"#));
+        assert!(sql.contains(r#"FROM roads src"#));
         assert!(sql.contains(r#"WHERE src."geom" IS NOT NULL"#));
     }
 
@@ -276,7 +261,7 @@ mod tests {
             3857,
         );
         // Persistent: no TEMP / ON COMMIT DROP so workers can see it.
-        assert!(sql.contains(r#"CREATE TABLE "_gp_prep_roads" AS"#));
+        assert!(sql.contains(r#"CREATE UNLOGGED TABLE _gp_prep_roads AS"#));
         assert!(!sql.contains("TEMP"));
         assert!(!sql.contains("ON COMMIT DROP"));
         // tile_srs inlined (autonomous executor takes no bind params).
@@ -314,7 +299,7 @@ mod tests {
     fn index_sql_targets_geom_tile() {
         assert_eq!(
             create_index_sql("_gp_prep_7"),
-            r#"CREATE INDEX "_gp_prep_7_geom_tile_idx" ON "_gp_prep_7" USING GIST (geom_tile)"#
+            r#"CREATE INDEX ON _gp_prep_7 USING GIST (geom_tile)"#
         );
     }
 

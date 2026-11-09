@@ -11,8 +11,7 @@ tables, exposing a SQL surface compatible with Alibaba Cloud
 
 Working build path: `ST_BuildPyramid` materializes MVT tiles via PostGIS
 (`ST_TileEnvelope` + `ST_AsMVTGeom` + `ST_AsMVT`) into per-pyramid storage
-tables with **atomic rebuild** — tiles are written into a shadow table and
-swapped in a single transaction so readers never see a half-built pyramid.
+tables. A full rebuild replaces the rows in one transaction. The published table keeps its OID, grants and dependent views.
 **Optional parallel build** honours the `parallel` config key by fanning out
 zoom-level work across PostgreSQL background workers. `ST_Pyramid()` returns
 **per-zoom build statistics** (row count, tile count, byte size, build
@@ -55,29 +54,31 @@ keys mirror Ganos:
 | `tileSRS` | `3857` | Tile coordinate system. Only Web Mercator (`3857`) is supported; other values are rejected. |
 | `tileSize` | `4096` | MVT extent (must be > 0). |
 | `tileExtend` | `8` | Tile-edge buffer to avoid clipping artefacts. |
-| `minZoom` / `maxZoom` | `0` / `18` | Zoom range to materialize. |
+| `minZoom` / `maxZoom` | `0` / `18` | Inclusive zoom range to materialize. Ganos configs can use `maxLevel` in place of `maxZoom`. Supplying both keys is an error. |
 | `dynamicBeyondMaxZoom` | `true` | When a tile request has z > maxZoom, slice it live from the source table instead of returning NULL (mirrors Ganos maxLevel). Set false for a strict pyramid that returns NULL beyond maxZoom. |
-| `parallel` | `1` | Worker count for the build; values > 1 fan out zoom-level work across PostgreSQL background workers. |
-| `preparedBuild` | `false` | Slice pre-projected source geometries. Serial builds derive their extent from the prepared table, avoiding a second projection pass. Uses an indexed session-local temp table with `parallel=1`, or a committed prepared table shared by background workers with `parallel>1`. If the maximum-zoom rectangle has at most 64 cells, execution uses local preparation regardless of the requested parallelism. Simplification still follows each zoom's configured tolerance. |
+| `parallel` | `1` | Maximum build slots including the coordinator, capped at 32. Eligible builds use workers when the expected work justifies them. |
+| `preparedBuild` | `false` | Slice pre-projected source geometries. Local builds use a session-local temp table and derive their extent from it. Builds that start workers use a committed prepared table shared by those workers. Simplification follows each zoom's configured tolerance. |
 | `featureMajorPoints` | `false` | Experimental sparse path for pure `POINT` sources. Requires `preparedBuild=true`, `parallel=1`, and `tileSRS=3857`; computes each point's candidate tiles, including buffer neighbours and exact boundaries, instead of probing every bbox tile. Single-cell zooms scan the prepared points directly. Mixed, line, or polygon builds fall back to prepared tile-major. |
 | `featureMajorMinZoom` | `13` | Minimum `maxZoom` at which `featureMajorPoints` engages — it only wins once the high zoom levels (where tile-major's empty-cell probing explodes) dominate the build, and slightly regresses shallow pyramids. Below this, eligible point builds fall back to prepared tile-major (with a `NOTICE`). Set `0` to always use feature-major when eligible. |
-| `featureDrivenEnum` | `false` | Derive candidate tiles from each feature's envelope instead of probing every bbox cell. Requires `preparedBuild=true` and `tileSRS=3857`; supports background workers. A preparation check counts buffer-expanded, padded candidates clamped to the build rectangle, ignoring empty geometries; per zoom it also requires `R(z) > 2·rows`. This is a cost heuristic, not a guarantee of speedup. |
+| `featureDrivenEnum` | `false` | Derive candidate tiles from each feature's envelope. Requires `preparedBuild=true` and `tileSRS=3857`. The builder estimates the cost for sparse grids and can also reuse simplification for complex geometries overlapping a few tiles in a serial build. |
 | `attributes` | `[]` | Columns to include in MVT features. |
 | `simplifyPixels` | `1.0` | DP tolerance in MVT extent units; 0 disables. With extent 4096 and a tile displayed at 256 px, 1 unit is 1/16 screen pixel. |
 | `minFeatureSizePixels` | `0.0` | Drop polygons whose area `<` and lines `<` this many tile pixels. 0 disables. |
 | `dropRate` | `1.0` | Tippecanoe-style point retention: keep `dropRate^(maxZoom − z)`. 1.0 disables; 0.4 mimics `tippecanoe -r2.5`. |
-| `tileSizeBudgetBytes` | `0` | Per-tile MVT byte cap (`--drop-densest-as-needed` analogue). When breached, the zoom is wiped and rebuilt with tighter knobs. 0 disables; `512000` mimics tippecanoe. |
+| `tileSizeBudgetBytes` | `0` | Target for uncompressed MVT bytes. The builder retries an oversized zoom with tighter thresholds, then warns if it still exceeds the target. 0 disables retries. |
 | `maxTileSizeAttempts` | `5` | Cap on retry rounds per zoom when chasing the byte budget. |
 | `buildTimeoutMs` | `0` | Wait budget (ms) for each parallel zoom and committed source preparation; 0 = unbounded. Timeout or query cancellation stops workers before returning. |
 | `splitSize` | `0` | `0` (default) materializes every non-empty tile. A value > 0 is a density boundary: tiles with fewer than this many features are not materialized at build time; `ST_Tile` slices them on-demand from the source on every request. |
-| `buildRules` | `[]` | Per-zoom LOD rules. Each rule uses the project-native shape `{minZoom, maxZoom, filter?, attrFields?, sample?}`: `filter` restricts features, `attrFields` overrides emitted MVT properties for that zoom band, and `sample` applies deterministic row sampling. Zooms not covered by any rule include all features and the global `attributes`; multiple rules covering a zoom are ANDed. Empty (default) = no LOD override. |
+| `buildRules` | `[]` | Per-zoom LOD rules: `{minZoom, maxZoom, filter?, attrFields?, sample?, pointGrid?}`. Filters and sampling rules combine with AND; `attrFields` controls properties and `pointGrid` thins points spatially. Empty means no LOD override. |
 
 ## Creating a pyramid
 
-Parallel workers inherit the caller's effective role, `search_path`, and
-`row_security` setting. Source data must be committed for workers to read it.
-Incremental refresh includes neighbouring tiles reached by `tileExtend`;
-full rebuilds replace all zoom statistics, including when the source is empty.
+Explicit transactions, previous transaction writes, changed session identity, RLS, views,
+temporary or inherited sources, SQL filters, output triggers, DDL command start/end hooks and session-dependent output types use the caller's
+backend. Workers require an ordinary committed source and permission to take a SHARE lock.
+An active writer or a small estimated job keeps the build local. Worker builds hold this
+source lock until publication. Each published pyramid contains the rows visible to its builder;
+use separate pyramid names and tile-table grants for separately served tenants.
 
 A pyramid is built from an existing PostGIS table with a geometry column and a
 stable feature-id column. The full lifecycle is build → fetch → inspect →
@@ -124,9 +125,7 @@ SELECT ST_BuildPyramid(
 
 `name` lets several pyramids share one source table; it defaults to the table
 name. `sourceSRS` must match the `geom` column's SRID. `attributes` are the
-non-geometry columns carried into each MVT feature. Building is transactional —
-tiles are written into a shadow table and swapped in atomically, so readers
-never see a half-built pyramid (re-running `ST_BuildPyramid` rebuilds in place).
+non-geometry columns carried into each MVT feature. The first build records the source and output relation identities. Later reads, updates and drops use those bindings across changes to `search_path`. Rebuilding the same name and source preserves the output table and its grants.
 
 **3. Fetch a tile** as MVT bytes with `ST_Tile(name, z, x, y)`:
 
@@ -166,11 +165,39 @@ SELECT ST_UpdatePyramidByExtent('buildings', 116.30, 39.90, 116.42, 39.99, 4326)
 SELECT ST_DropPyramid('buildings');
 ```
 
+## Upgrade an existing 0.1.0 installation
+
+After installing the 0.1.1 package, bind **each existing pyramid** to its verified source
+and tile table. Version 0.1.0 stored bare names, so the owner supplies the schema-qualified
+relations. Keep the upgrade and all bindings in one transaction. For example:
+
+```sql
+BEGIN;
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.1';
+UPDATE public.geometry_pyramid_catalog
+SET source_rel = 'data.buildings'::regclass,
+    storage_rel = 'tiles._gp_tiles_buildings'::regclass
+WHERE pyramid_name = 'buildings';
+-- Repeat the UPDATE for each verified registration.
+DO $$ BEGIN
+    IF EXISTS (SELECT FROM public.geometry_pyramid_catalog
+               WHERE source_rel IS NULL OR storage_rel IS NULL) THEN
+        RAISE EXCEPTION 'unbound pyramids remain';
+    END IF;
+END $$;
+COMMIT;
+```
+
+A full refresh recalibrates older byte-budgeted pyramids and records the effective settings
+for each zoom. Dynamic reads of deferred tiles on a legacy level that used retries require this
+refresh. Local updates reuse those settings and update the zoom statistics. A missing budget
+record or an oversized refreshed level triggers a full local rebuild. An extent in a nonlinear
+CRS or across the date line also triggers a full rebuild to cover its projected edges.
+
 ## Notes
 
 Pyramid, table, and column identifiers are capped at **45 characters** so
-that derived names (e.g. the `_gp_tiles_<name>__shadow` shadow table used
-during atomic rebuild) stay within PostgreSQL's 63-byte identifier limit.
+that generated table, index and sequence names fit within PostgreSQL's 63-byte identifier limit.
 
 Each pyramid's tiles live in a table `_gp_tiles_<name>` with columns
 `id bigserial, z smallint, x integer, y integer, format text, srid integer,
@@ -178,11 +205,13 @@ mvt bytea` and `PRIMARY KEY (z, x, y)`. `format` is currently always `'pbf'`;
 `srid` is the tile coordinate system (`tileSRS`). Consumers may read this table
 directly; `ST_Tile` returns only the `mvt` column.
 
-> **Note on `splitSize`:** the default `0` materializes every non-empty tile within `maxZoom`, so reads are pure storage lookups. If you set `splitSize` > 0, any tile request within `maxZoom` that misses the materialized store — including empty regions — is sliced live from the source table on *every* request. That trades a faster, smaller build for slower repeated reads, so size it to your density and read load (and keep a spatial index on the source) before raising it above 0.
+The default `splitSize=0` stores every nonempty tile through `maxZoom`. On sparse ordinary EPSG:3857 or EPSG:4326 tables with a geometry GiST index and no row policies, the builder can skip regions with no candidates. With `splitSize > 0`, tile-major builds over ordinary tables without row policies or over prepared rows can skip regions below the threshold before clipping. The actual count after clipping and LOD determines which tiles are stored. A storage miss within `maxZoom` is then sliced live on every request.
 
 > **Note on `buildRules`:** rules implement level-of-detail in one format: e.g. `[{"minZoom":0,"maxZoom":4,"filter":"scalerank < 5","attrFields":["name","kind"],"sample":{"rate":25,"key":["fid"]}}]` keeps only major features at coarse zooms, emits only `name` and `kind` there, and keeps a deterministic 25% sample. `filter` is a raw SQL boolean expression evaluated with the privileges of the `ST_BuildPyramid` caller (trusted-admin input, like a view definition); it is checked against the source before any build work and must not contain a statement separator (`;`). The `;` rule is a defense-in-depth check, not single-expression enforcement — under this posture an arbitrary predicate is already as privileged as a view definition. This is a deliberate, documented exception to parameterized-query guidance — an arbitrary predicate cannot be parameterized.
 >
 > `sample.rate` is a percentage from `0` to `100`; `sample.key` defaults to `["fid"]` and may name additional source columns for stable hash keys. `sample.geometryTypes` can limit sampling to specific geometry families. This intentionally folds the useful Ganos LOD ideas into the existing `buildRules` object only: the extension does not accept a second Ganos-native `level` / `value` rule shape.
+>
+> For dense points at coarse zooms, try `{"minZoom":0,"maxZoom":5,"pointGrid":{"cellPixels":64,"keepField":"important"}}`. The cell size is in MVT extent units (1 through `tileSize`). After filtering and clipping, each occupied cell keeps its lowest-ID point unless it has points marked by the optional boolean `keepField`, in which case it keeps all marked points. Use stable, unique feature IDs. Multipoints, lines and polygons are unchanged by the grid. Grid zooms use tile-major slicing for builds, updates and live reads; other zooms can still use feature-driven enumeration.
 
 > A graduated `buildRules` is also the lever for **coarse-zoom build speed**: when
 > low zooms would otherwise pack every feature into a handful of tiles, keep only
@@ -220,7 +249,7 @@ directly; `ST_Tile` returns only the `mvt` column.
     ├── tile.rs                  # ST_Tile
     ├── tile_rect.rs             # tile-index rectangle math (bbox→tiles, strip split)
     ├── stats.rs                 # per-zoom build statistics persistence
-    ├── shadow.rs                # shadow-table lifecycle for atomic rebuild
+    ├── shadow.rs                # ownership checks for shared worker tables
     ├── worker.rs                # background-worker control plane (spec files + entry)
     ├── incremental.rs           # where_clause-scoped incremental refresh
     └── dynamic.rs               # on-demand single-tile slicing (z > maxZoom)
@@ -245,6 +274,8 @@ cargo pgrx run pg17         # build, install, open psql
 cargo pgrx test             # run #[test] + #[pg_test]
 cargo pgrx package          # produce installable artefact
 ```
+
+The **Verify and release** workflow builds the Ubuntu 24.04 PG17 package on pull requests and manual runs. It tests a fresh install and an upgrade from the `v0.1.0` source tag, then attaches the verified archive. A release tag publishes that archive after verification succeeds.
 
 Inside psql:
 
@@ -297,7 +328,7 @@ back to the prepared tile-major path.
 
 For each zoom `z ∈ [minZoom, maxZoom]` the build pipeline does, in order:
 
-1. **Bbox prefilter** in source SRS — `src.geom && ST_Transform(ST_TileEnvelope(z,x,y, margin => tileExtend/tileSize), sourceSRS)` — an index-only `&&` against the buffer-expanded tile envelope, so the source's GiST index drives the scan and buffer-band edge geometry is included (seamless tile borders).
+1. **Candidate selection** compares the geometry with the buffered tile in EPSG:3857. EPSG:3857 and canonical EPSG:4326 inputs can use their source geometry GiST index. For other projections, a functional GiST index on `ST_Transform(geom,3857)` supports source-table and dynamic queries. Prepared builds use projected geometry directly.
 2. **Project to tile SRS** — `ST_Transform(geom, tileSRS)` (Web Mercator, EPSG:3857).
 3. **Per-zoom simplification** *(tippecanoe-style)* — `ST_SimplifyPreserveTopology(g, tol_m)` where `tol_m = simplifyPixels × (40 075 016.685 / (tileSize × 2^z))`. Points are skipped.
 4. **Min-feature-size filter** — drop polygons with `ST_Area < (minFeatureSizePixels × pixel_m)²`, lines with `ST_Length < minFeatureSizePixels × pixel_m`.

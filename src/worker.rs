@@ -3,6 +3,7 @@
 //! transaction is uncommitted — its catalog rows and job rows would be
 //! invisible to workers under MVCC; files are not.
 
+use crate::build::ZoomKnobs;
 use crate::config::PyramidConfig;
 use crate::tile_rect::TileRect;
 use pgrx::bgworkers::{
@@ -69,7 +70,13 @@ impl Job {
 pub(crate) enum WorkerMode {
     /// Execute one SQL script in an autonomous (separately committed)
     /// transaction. Used to create the shadow table for parallel builds.
-    ExecSql { sql: String },
+    ExecSql {
+        sql: String,
+    },
+    CreateStage {
+        table: String,
+        ddl: String,
+    },
     /// Build tile strips into `storage_table`, one transaction per strip.
     /// When `prepared_table` is set the worker drives the fast prepared
     /// pipeline (prepared tile-major, or feature-driven when `feature_driven`)
@@ -82,23 +89,13 @@ pub(crate) enum WorkerMode {
         geom_column: String,
         fid_column: String,
         config: Box<PyramidConfig>,
-        knobs: KnobValues,
+        knobs: ZoomKnobs,
         strips: Vec<TileRect>,
         /// Committed prepared table the workers read (None = baseline path).
         prepared_table: Option<String>,
         /// Drive the feature-driven enumeration pipeline for these strips.
         feature_driven: bool,
     },
-}
-
-/// Serializable snapshot of build.rs's ZoomKnobs (the budget-retry loop
-/// tightens these per attempt, so they ride along with each round's job).
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub(crate) struct KnobValues {
-    pub simplify_tol_m: f64,
-    pub min_area_m2: f64,
-    pub min_len_m: f64,
-    pub drop_threshold: f64,
 }
 
 pub(crate) fn job_filename(backend_pid: u32, idx: u32) -> String {
@@ -141,8 +138,16 @@ pub(crate) fn write_job(
 
 pub(crate) fn cleanup_job(path: &Path) {
     let _ = fs::remove_file(path);
-    let _ = fs::remove_file(path.with_extension("done"));
-    let _ = fs::remove_file(path.with_extension("err"));
+    for extension in ["done", "err", "status"] {
+        let _ = fs::remove_file(path.with_extension(extension));
+    }
+}
+
+fn publish_status(path: &Path, extension: &str, message: &[u8]) -> std::io::Result<()> {
+    // The coordinator polls the final path as soon as it exists.
+    let pending = path.with_extension("status");
+    fs::write(&pending, message)?;
+    fs::rename(pending, path.with_extension(extension))
 }
 
 #[cfg(test)]
@@ -166,7 +171,7 @@ mod tests {
                 geom_column: "geom".into(),
                 fid_column: "gid".into(),
                 config: Box::default(),
-                knobs: KnobValues {
+                knobs: ZoomKnobs {
                     simplify_tol_m: 1.0,
                     min_area_m2: 2.0,
                     min_len_m: 3.0,
@@ -254,7 +259,7 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
     {
         Ok(s) => s,
         Err(e) => {
-            let _ = fs::write(path.with_extension("err"), format!("bad job: {e}"));
+            let _ = publish_status(&path, "err", format!("bad job: {e}").as_bytes());
             return;
         }
     };
@@ -311,16 +316,20 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
 
     match result {
         Ok(()) => {
-            let _ = fs::write(path.with_extension("done"), b"ok");
+            let _ = publish_status(&path, "done", b"ok");
         }
         Err(e) => {
-            let _ = fs::write(path.with_extension("err"), e.to_string());
+            let _ = publish_status(&path, "err", e.to_string().as_bytes());
         }
     }
 }
 
 fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
     match &job.mode {
+        WorkerMode::CreateStage { table, ddl } => BackgroundWorker::transaction(|| {
+            job.apply_settings()?;
+            crate::shadow::create(table, ddl)
+        }),
         WorkerMode::ExecSql { sql } => {
             let result: Result<(), pgrx::spi::Error> = BackgroundWorker::transaction(|| {
                 job.apply_settings()?;
@@ -341,7 +350,6 @@ fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
             prepared_table,
             feature_driven,
         } => {
-            let k = crate::build::ZoomKnobs::from_values(*knobs);
             let src = crate::source::PyramidSource {
                 name: pyramid_name,
                 source_table,
@@ -362,7 +370,7 @@ fn run_job(job: &Job) -> Result<(), Box<dyn Error + Send + Sync>> {
                         src,
                         storage_table,
                         rect,
-                        &k,
+                        knobs,
                         prepared.as_ref(),
                         false, // feature_major_points: never farmed to workers
                         *feature_driven,
@@ -421,22 +429,37 @@ pub(crate) fn spawn(
         .map_err(|e| format!("failed to register background worker: {e:?}").into())
 }
 
-/// Run an SQL script in an autonomous transaction via a one-shot worker,
-/// waiting up to `timeout_ms` (0 = unbounded) for completion. Used for
-/// committed shadow-table DDL and the committed prepared-table transform.
-pub(crate) fn exec_sql_autonomous_timeout(
-    sql: &str,
-    timeout_ms: i64,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn run_autonomous(mode: WorkerMode, timeout_ms: i64) -> Result<(), Box<dyn Error + Send + Sync>> {
     let filename = job_filename(unsafe { pg_sys::MyProcPid } as u32, next_job_idx());
-    let job = Job::new(WorkerMode::ExecSql {
-        sql: sql.to_string(),
-    })?;
+    let job = Job::new(mode)?;
     let worker = WorkerJob::start(&filename, &job)?;
     wait_for(slice::from_ref(&worker), timeout_ms)
 }
 
-/// Run committed DDL with the default 60s budget (fast schema-only work).
+pub(crate) fn create_stage(
+    table: &str,
+    ddl: String,
+    timeout_ms: i64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_autonomous(
+        WorkerMode::CreateStage {
+            table: table.into(),
+            ddl,
+        },
+        timeout_ms,
+    )?;
+    crate::shadow::check(table).map(|_| ())
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn exec_sql_autonomous_timeout(
+    sql: &str,
+    timeout_ms: i64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_autonomous(WorkerMode::ExecSql { sql: sql.into() }, timeout_ms)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
 pub(crate) fn exec_sql_autonomous(sql: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     exec_sql_autonomous_timeout(sql, 60_000)
 }
@@ -450,13 +473,14 @@ pub(crate) fn wait_for(
     timeout_ms: i64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let started = Instant::now();
+    let mut poll = Duration::from_millis(2);
     loop {
         let mut pending = 0usize;
         for worker in workers {
             let p = &worker.path;
             let err_path = p.with_extension("err");
             if err_path.exists() {
-                let msg = fs::read_to_string(&err_path).unwrap_or_default();
+                let msg = fs::read_to_string(&err_path)?;
                 return Err(format!("worker failed: {msg}").into());
             }
             if p.with_extension("done").exists() {
@@ -484,6 +508,7 @@ pub(crate) fn wait_for(
             return Err(format!("timed out waiting for {pending} worker(s)").into());
         }
         pgrx::check_for_interrupts!();
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(poll);
+        poll = (poll * 2).min(Duration::from_millis(50));
     }
 }

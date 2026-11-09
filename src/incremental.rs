@@ -4,8 +4,7 @@
 
 use crate::build;
 use crate::source::PyramidSource;
-use crate::storage;
-use crate::tile_rect::TileRect;
+use crate::storage::Relation;
 use pgrx::prelude::*;
 use std::error::Error;
 use std::time::Instant;
@@ -13,11 +12,15 @@ use std::time::Instant;
 /// Rebuild the tiles intersecting the extent of rows matched by
 /// `where_clause`. Returns the number of tiles rebuilt. Runs entirely in the
 /// caller's transaction: a failure rolls back to the intact pyramid.
-pub fn update(src: PyramidSource, where_clause: &str) -> Result<i64, Box<dyn Error + Send + Sync>> {
+pub fn update(
+    src: PyramidSource,
+    output: &Relation,
+    where_clause: &str,
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
     // Defensive pre-flight: surface a syntax / unknown-column error cleanly
     // before it is embedded in the larger extent query.
     Spi::run(&format!(
-        r#"SELECT 1 FROM "{}" WHERE ({where_clause}) LIMIT 0"#,
+        r#"SELECT 1 FROM {} WHERE ({where_clause}) LIMIT 0"#,
         src.source_table
     ))?;
 
@@ -25,7 +28,7 @@ pub fn update(src: PyramidSource, where_clause: &str) -> Result<i64, Box<dyn Err
     // the CASE→NULL guard, so an empty match is Ok(None) here, not a 0-row error.
     let inner = format!(
         r#"SELECT ST_Extent(ST_Transform("{geom}", $1)) AS g
-           FROM "{source}"
+           FROM {source}
            WHERE "{geom}" IS NOT NULL AND ({where_clause})"#,
         geom = src.geom_column,
         source = src.source_table,
@@ -38,7 +41,7 @@ pub fn update(src: PyramidSource, where_clause: &str) -> Result<i64, Box<dyn Err
         return Ok(0);
     };
 
-    rebuild_extent(src, arr[0], arr[1], arr[2], arr[3])
+    rebuild_extent(src, output, arr[0], arr[1], arr[2], arr[3])
 }
 
 /// Rebuild every tile intersecting the given tile-SRS bbox, across
@@ -46,31 +49,25 @@ pub fn update(src: PyramidSource, where_clause: &str) -> Result<i64, Box<dyn Err
 /// refreshing per-zoom stats. Runs in the caller's transaction; rollback-safe.
 pub(crate) fn rebuild_extent(
     src: PyramidSource,
+    output: &Relation,
     xmin_m: f64,
     ymin_m: f64,
     xmax_m: f64,
     ymax_m: f64,
 ) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    let storage_table = storage::tile_table_name(src.name);
+    let storage_table = output.sql();
     let mut rebuilt: i64 = 0;
     for z in src.cfg.min_zoom..=src.cfg.max_zoom {
         let started = Instant::now();
-        // A changed feature contributes to neighbours whose buffer reaches it.
-        // Include closed grid boundaries even with tileExtend=0.
-        let buffer_m = src.cfg.tile_extend as f64 * src.cfg.pixel_size_m(z);
-        let rect = TileRect::intersecting_bbox_m(
-            z,
-            xmin_m - buffer_m,
-            ymin_m - buffer_m,
-            xmax_m + buffer_m,
-            ymax_m + buffer_m,
-        );
-        // Wipe the dirty rectangle, then rebuild it in place. Budget retry is
-        // intentionally NOT applied here: a partial MAX(octet_length) check
-        // would be skewed by untouched tiles; reuse the knobs from config.
+        let rect = build::build_rect(src.cfg, z, (xmin_m, ymin_m, xmax_m, ymax_m));
+        let (saved, _) = crate::stats::effective_knobs(src, z)?;
+        if src.cfg.tile_size_budget_bytes > 0 && saved.is_none() {
+            return build::rebuild_local(src, output);
+        }
+        let knobs = saved.unwrap_or_else(|| build::ZoomKnobs::from_config(src.cfg, z));
         Spi::run_with_args(
             &format!(
-                r#"DELETE FROM "{storage_table}"
+                r#"DELETE FROM ONLY {storage_table}
                    WHERE z = $1 AND x BETWEEN $2 AND $3 AND y BETWEEN $4 AND $5"#
             ),
             &[
@@ -81,35 +78,24 @@ pub(crate) fn rebuild_extent(
                 (rect.ymax as i32).into(),
             ],
         )?;
-        let knobs = build::ZoomKnobs::from_config(src.cfg, z);
         let inserted = build::build_zoom_level(src, &storage_table, &rect, &knobs)?;
         rebuilt += inserted;
 
-        // Refresh this zoom's stats from the (partially rebuilt) table. The
-        // three aggregates come from a single FROM-subquery scan rather than
-        // three correlated subqueries, so the zoom's rows are read once (the
-        // same shape build.rs::zoom_stats already uses).
-        Spi::run_with_args(
-            &format!(
-                r#"UPDATE geometry_pyramid_stats s SET
-                     tile_count     = agg.cnt,
-                     total_bytes    = agg.total_bytes,
-                     max_tile_bytes = agg.max_tile_bytes,
-                     build_ms       = $2,
-                     built_at       = now()
-                   FROM (
-                     SELECT count(*)                              AS cnt,
-                            COALESCE(sum(octet_length(mvt)), 0)   AS total_bytes,
-                            COALESCE(max(octet_length(mvt)), 0)   AS max_tile_bytes
-                     FROM "{storage_table}" WHERE z = $1
-                   ) agg
-                   WHERE s.pyramid_name = $3 AND s.z = $1"#
-            ),
-            &[
-                (z as i32).into(),
-                (i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)).into(),
-                src.name.into(),
-            ],
+        let (tiles, total_bytes, max_tile_bytes) = build::zoom_stats(&storage_table, z)?;
+        if src.cfg.tile_size_budget_bytes > 0 && max_tile_bytes > src.cfg.tile_size_budget_bytes {
+            return build::rebuild_local(src, output);
+        }
+        crate::stats::upsert_zoom_stats(
+            src.name,
+            &build::ZoomBuildResult {
+                z,
+                tiles,
+                total_bytes,
+                max_tile_bytes,
+                knobs,
+                attempts: 1,
+                build_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            },
         )?;
     }
     Ok(rebuilt)
@@ -122,6 +108,7 @@ pub(crate) fn rebuild_extent(
 /// moves there. Returns the number of tiles rebuilt.
 pub fn update_extent(
     src: PyramidSource,
+    output: &Relation,
     xmin: f64,
     ymin: f64,
     xmax: f64,
@@ -146,5 +133,11 @@ pub fn update_extent(
     else {
         return Ok(0);
     };
-    rebuild_extent(src, arr[0], arr[1], arr[2], arr[3])
+    // Nonlinear projections and geographic intervals wrapping the dateline
+    // can extend outside the box of the four transformed corners.
+    let canonical_geographic = srid == 4326 && xmin >= -180.0 && xmax <= 180.0 && xmin <= xmax;
+    if srid != 3857 && !canonical_geographic {
+        return build::rebuild_local(src, output);
+    }
+    rebuild_extent(src, output, arr[0], arr[1], arr[2], arr[3])
 }

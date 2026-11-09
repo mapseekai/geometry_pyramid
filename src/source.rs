@@ -15,7 +15,7 @@ use crate::config::PyramidConfig;
 pub(crate) struct PyramidSource<'a> {
     /// Pyramid name; also the stem of the `_gp_tiles_<name>` storage table.
     pub name: &'a str,
-    /// Source relation the geometry is read from.
+    /// SQL-qualified, quoted relation resolved from the registered source OID.
     pub source_table: &'a str,
     /// Geometry column in `source_table`.
     pub geom_column: &'a str,
@@ -23,4 +23,20 @@ pub(crate) struct PyramidSource<'a> {
     pub fid_column: &'a str,
     /// Parsed pyramid configuration.
     pub cfg: &'a PyramidConfig,
+}
+
+impl crate::config::CatalogRow {
+    pub(crate) fn for_source<'a>(
+        &'a self,
+        name: &'a str,
+        source_table: &'a str,
+    ) -> PyramidSource<'a> {
+        PyramidSource {
+            name,
+            source_table,
+            geom_column: &self.geom_column,
+            fid_column: &self.fid_column,
+            cfg: &self.config,
+        }
+    }
 }

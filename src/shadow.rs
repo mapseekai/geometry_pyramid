@@ -1,104 +1,74 @@
-//! Shadow-table lifecycle: full builds write into a shadow table that is
-//! atomically swapped into place, so readers never observe a half-built
-//! pyramid. With parallel > 1 the shadow is created by an autonomous
-//! worker (committed DDL) so background workers can see it.
-//!
-//! # Safety contract
-//! Every `pyramid_name` argument **must** have been validated by
-//! [`crate::pyramid::validate_identifier`] before being passed to any
-//! function in this module. The DDL strings are built with double-quoted
-//! identifiers, which is injection-safe only because `validate_identifier`
-//! excludes the double-quote character (it allows `[A-Za-z0-9_]` only).
-
-use crate::storage;
+//! Only parallel builds need committed scratch tables. An OID-bound ownership
+//! marker distinguishes a crashed build's scratch from a user's same-named table.
+use crate::storage::{DbError, Relation};
 use pgrx::prelude::*;
 
-pub fn shadow_table_name(pyramid_name: &str) -> String {
-    // A disjoint prefix is essential: appending __shadow to a main name
-    // collides with the main table of a valid pyramid named foo__shadow.
-    format!("_gp_shadow_{pyramid_name}")
+fn marker(rel: &Relation) -> String {
+    format!("geometry_pyramid:work:{}:{}", rel.oid, rel.sql())
 }
 
-/// SQL that (re)creates the shadow table. Factored out so the parallel
-/// path can hand the same DDL to an autonomous ExecSql worker. The CREATE
-/// body comes from [`storage::tile_table_create_sql`] so the shadow schema
-/// can never drift from the main tile table.
-pub fn create_sql(pyramid_name: &str) -> String {
-    let table = shadow_table_name(pyramid_name);
-    format!(
-        r#"DROP TABLE IF EXISTS "{table}"; {}"#,
-        storage::tile_table_create_sql(&table)
-    )
-}
-
-/// Create the shadow table inside the current transaction (parallel = 1).
-pub fn create(pyramid_name: &str) -> Result<(), spi::Error> {
-    Spi::run(&create_sql(pyramid_name))
-}
-
-/// Replace the main tile table with the shadow. Runs in the caller's
-/// transaction, so it is all-or-nothing: a crash or error before commit
-/// rolls the whole swap back and the previous main table survives.
-///
-/// Both statements take `ACCESS EXCLUSIVE` on the named tables, so a
-/// concurrent reader that has not yet acquired its `ACCESS SHARE` lock
-/// blocks until this transaction commits and then sees the new table. The
-/// one residual gap is OID-level: a reader that resolved the old main
-/// table's OID *before* the swap committed can observe a transient
-/// "relation does not exist" on its next access, because DROP+RENAME gives
-/// the replacement table a fresh OID. This is a transient error, never data
-/// corruption, and is the accepted trade-off of the shadow-swap design
-/// (a fully reader-transparent swap would require a view indirection layer).
-pub fn swap(pyramid_name: &str) -> Result<(), spi::Error> {
-    let main = storage::tile_table_name(pyramid_name);
-    let shadow = shadow_table_name(pyramid_name);
-    Spi::run(&format!(r#"DROP TABLE IF EXISTS "{main}""#))?;
-    Spi::run(&format!(r#"ALTER TABLE "{shadow}" RENAME TO "{main}""#))?;
-    // ALTER TABLE ... RENAME does not rename the `id` column's owned
-    // bigserial sequence, so realign it to the main table name (DROP main
-    // above also dropped any prior "{main}_id_seq", freeing the name). Keeps
-    // \d / pg_dump output consistent; IF EXISTS guards the no-id-column case.
-    Spi::run(&format!(
-        r#"ALTER SEQUENCE IF EXISTS "{shadow}_id_seq" RENAME TO "{main}_id_seq""#
-    ))
-}
-
-/// Best-effort cleanup of a leftover shadow table.
-pub fn abandon(pyramid_name: &str) -> Result<(), spi::Error> {
-    let shadow = shadow_table_name(pyramid_name);
-    // Only attempt the DROP when the shadow actually exists. A normal drop has
-    // no leftover shadow (a successful build renamed it to the main table), so
-    // a bare `DROP TABLE IF EXISTS` would emit a chatty "does not exist,
-    // skipping" NOTICE every time. to_regclass returns NULL (no error) when the
-    // relation is missing; IF EXISTS is retained so a concurrent drop between
-    // the check and the DROP is still a no-op rather than an error.
-    let exists: Option<String> = Spi::get_one_with_args(
-        "SELECT to_regclass($1)::text",
-        &[format!("\"{shadow}\"").into()],
+fn owned(rel: &Relation) -> Result<bool, DbError> {
+    let actual = Spi::get_one_with_args::<String>(
+        "SELECT pg_catalog.obj_description($1, 'pg_class')",
+        &[pg_sys::Oid::from(rel.oid).into()],
     )?;
-    if exists.is_some() {
-        Spi::run(&format!(r#"DROP TABLE IF EXISTS "{shadow}""#))?;
+    Ok(actual.as_deref() == Some(&marker(rel)))
+}
+
+pub(crate) fn check(table: &str) -> Result<Relation, DbError> {
+    let rel = Relation::lookup(table)?.ok_or("worker stage is missing")?;
+    rel.lock()?;
+    if !owned(&rel)? {
+        return Err(format!("refusing to use unmanaged worker table {table}").into());
+    }
+    Ok(rel)
+}
+
+pub(crate) fn discard_if_owned(table: &str) -> Result<(), DbError> {
+    if let Some(rel) = Relation::lookup(table)? {
+        if owned(&rel)? {
+            check(table)?.drop_table()?;
+        }
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shadow_name_is_derived_from_main() {
-        assert_eq!(shadow_table_name("foo"), "_gp_shadow_foo");
-        assert_ne!(
-            shadow_table_name("foo"),
-            storage::tile_table_name("foo__shadow")
-        );
+/// Recover a failed worker publication on the coordinator. Finish this build
+/// locally so both the removal and its replacement commit together.
+pub(crate) fn reclaim_for_retry(schema: &str, name: &str, prepared: bool) -> Result<bool, DbError> {
+    let mut reclaimed = false;
+    let names = [
+        Some(format!("_gp_shadow_{name}")),
+        prepared.then(|| format!("_gp_prep_{name}")),
+    ];
+    for name in names.into_iter().flatten() {
+        let table = spi::quote_qualified_identifier(schema, &name);
+        if Relation::lookup(&table)?.is_some() {
+            check(&table)?.drop_table()?;
+            reclaimed = true;
+        }
     }
+    Ok(reclaimed)
+}
 
-    #[test]
-    fn longest_derived_name_fits_pg_limit() {
-        // Include the bigserial sequence suffix in the identifier budget.
-        let longest = "a".repeat(45);
-        assert!(format!("{}_id_seq", shadow_table_name(&longest)).len() <= 63);
+pub(crate) fn create(table: &str, ddl: &str) -> Result<(), DbError> {
+    // CREATE fails atomically if a same-named object appeared after preflight.
+    Spi::run(ddl)?;
+    let rel = Relation::lookup(table)?.ok_or("worker stage creation failed")?;
+    // Default privileges in the output schema can grant readers access to new
+    // tables. Scratch can contain unfiltered source attributes.
+    let grantees = Spi::get_one_with_args::<String>(
+        "SELECT string_agg(CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(a.grantee)) END, ', ')
+         FROM (SELECT DISTINCT c.relowner,(pg_catalog.aclexplode(c.relacl)).grantee
+               FROM pg_catalog.pg_class c WHERE c.oid=$1) a WHERE a.grantee<>a.relowner",
+        &[pg_sys::Oid::from(rel.oid).into()],
+    )?;
+    if let Some(grantees) = grantees {
+        Spi::run(&format!("REVOKE ALL ON TABLE {table} FROM {grantees}"))?;
     }
+    Spi::run(&format!(
+        "COMMENT ON TABLE {table} IS {}",
+        spi::quote_literal(marker(&rel))
+    ))?;
+    Ok(())
 }

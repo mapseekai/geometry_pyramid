@@ -37,8 +37,12 @@ impl TileRect {
         let mut rect = Self::from_bbox_m(z, xmin, ymin, xmax, ymax);
         let n = 1i64 << z;
         let span = 2.0 * WEBMERC_HALF_EXTENT / n as f64;
-        rect.xmin = (((xmin + WEBMERC_HALF_EXTENT) / span).ceil() as i64 - 1).clamp(0, n - 1);
-        rect.ymin = (((WEBMERC_HALF_EXTENT - ymax) / span).ceil() as i64 - 1).clamp(0, n - 1);
+        rect.xmin = (((xmin + WEBMERC_HALF_EXTENT) / span).ceil() as i64)
+            .saturating_sub(1)
+            .clamp(0, n - 1);
+        rect.ymin = (((WEBMERC_HALF_EXTENT - ymax) / span).ceil() as i64)
+            .saturating_sub(1)
+            .clamp(0, n - 1);
         rect
     }
 
@@ -199,6 +203,12 @@ mod tests {
 
     #[test]
     fn out_of_range_is_clamped() {
+        let outside = TileRect::intersecting_bbox_m(24, -1e30, 1e30, -1e30, 1e30);
+        assert_eq!(
+            (outside.xmin, outside.ymin, outside.cell_count()),
+            (0, 0, 1)
+        );
+
         let r = TileRect::from_bbox_m(5, -1e9, -1e9, -9e8, -9e8);
         let n: i64 = 1 << 5;
         assert!(r.xmin >= 0 && r.xmax < n);
