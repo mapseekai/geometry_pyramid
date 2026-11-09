@@ -4,8 +4,8 @@
 
 ## 根目录元数据和文档
 
-- `README.md` — 主要面向用户的 SQL 表面、配置表、生命周期示例、生成规则、构建命令和 roadmap。
-- `README.zh-CN.md` — 与英文 README 并列的中文 README。
+- `README.md` 和 `README.zh-CN.md` — 面向用户的用途、首张瓦片示例、能力与文档入口。
+- `openwiki/usage.md` 和 `openwiki/usage.zh-CN.md` — 运维步骤与配置参考。
 - `Cargo.toml` — crate 元数据、pgrx 版本、PostgreSQL feature flags、release profile。
 - `geometry_pyramid.control` — PostgreSQL 扩展 control 元数据和 PostGIS 需求。
 - `sql/bootstrap.sql` — 扩展自有 catalog/stats DDL 和 `ST_Pyramids()`。
@@ -26,7 +26,7 @@
 - `src/dynamic.rs` — 面向 `splitSize` miss 和 beyond-`maxZoom` 读取的非缓存按需单瓦片切片。
 - `src/incremental.rs` — 谓词和 bbox dirty-region refresh。
 - `src/storage.rs` — 每个金字塔 `_gp_tiles_<name>` 存储表生命周期。
-- `src/shadow.rs` — 用于原子完整重建的 shadow table create/swap/drop。
+- `src/shadow.rs` — worker 暂存表的所有权检查与清理。
 - `src/stats.rs` — 逐 zoom 统计的持久化和读取。
 - `src/tile_rect.rs` — tile rectangle 数学和分区辅助函数。
 
@@ -35,12 +35,12 @@
 - `demo/server.py` — 围绕 `ST_Tile` 的本地 HTTP wrapper；不是生产服务代码。
 - `demo/index.html` — MapLibre viewer，包含本地 vector tile layer 和可选择的在线底图。
 - `demo/test_server.py` — parser、handler、static viewer 期望和连接保护行为的 Python 单元测试。
-- `demo/seed.sql` 和 `demo/README.md` — 本地 demo 数据库设置。
+- `demo/seed.sql`、`demo/README.md` 和 `demo/README.zh-CN.md` — 本地 demo 数据库设置。
 - `bench/*.sql` — 手工性能脚本。合成基线从 `bench/build_speed.sql` 开始，当前用户数据矩阵从 `bench/user_data_perf.sql` 开始。
 
 ## 常见变更从哪里开始
 
-- 新增或修改配置键：`src/config.rs` → `src/build.rs` / `src/prepared.rs` / `src/dynamic.rs` → README 配置表 → `src/lib.rs` 测试。
+- 新增或修改配置键：`src/config.rs` → `src/build.rs` / `src/prepared.rs` / `src/dynamic.rs` → 使用说明的配置表 → `src/lib.rs` 测试。
 - 修改瓦片构建输出：先看 `src/build.rs`，然后确认 prepared、feature-major、feature-driven、dynamic 和 parallel 路径仍然一致。
 - 修改瓦片读取：`src/tile.rs` 和 `src/dynamic.rs`；检查 split-size 和 beyond-maxZoom 行为。
 - 修改更新语义：`src/pyramid.rs` 和 `src/incremental.rs`；检查 stale-delete/move caveats。

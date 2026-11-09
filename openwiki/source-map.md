@@ -4,8 +4,8 @@ Use this page for quick navigation before opening source files. For behavior det
 
 ## Root metadata and docs
 
-- `README.md` — primary user-facing SQL surface, config table, lifecycle examples, generation rules, build commands, and roadmap.
-- `README.zh-CN.md` — Chinese README added alongside the English README.
+- `README.md` and `README.zh-CN.md` — user entry points with purpose, a runnable first tile, capabilities, and guide links.
+- `openwiki/usage.md` and `openwiki/usage.zh-CN.md` — operator procedures and configuration reference.
 - `Cargo.toml` — crate metadata, pgrx version, PostgreSQL feature flags, release profile.
 - `geometry_pyramid.control` — PostgreSQL extension control metadata and PostGIS requirement.
 - `sql/bootstrap.sql` — extension-owned catalog/stats DDL and `ST_Pyramids()`.
@@ -26,7 +26,7 @@ Use this page for quick navigation before opening source files. For behavior det
 - `src/dynamic.rs` — uncached on-demand single-tile slicing for `splitSize` misses and beyond-`maxZoom` reads.
 - `src/incremental.rs` — predicate and bbox dirty-region refresh.
 - `src/storage.rs` — per-pyramid `_gp_tiles_<name>` storage table lifecycle.
-- `src/shadow.rs` — shadow table create/swap/drop for atomic full rebuilds.
+- `src/shadow.rs` — ownership checks and cleanup for worker staging tables.
 - `src/stats.rs` — per-zoom statistics persistence and retrieval.
 - `src/tile_rect.rs` — tile rectangle math and partition helpers.
 
@@ -35,12 +35,12 @@ Use this page for quick navigation before opening source files. For behavior det
 - `demo/server.py` — local HTTP wrapper around `ST_Tile`; not production serving code.
 - `demo/index.html` — MapLibre viewer with local vector tile layer and opt-in online basemap.
 - `demo/test_server.py` — Python unit tests for parser, handler, static viewer expectations, and connection guard behavior.
-- `demo/seed.sql` and `demo/README.md` — local demo database setup.
+- `demo/seed.sql`, `demo/README.md`, and `demo/README.zh-CN.md` — local demo database setup.
 - `bench/*.sql` — manual performance scripts. Start with `bench/build_speed.sql` for synthetic baseline or `bench/user_data_perf.sql` for the current user-data matrix.
 
 ## Where to start for common changes
 
-- Add or change config keys: `src/config.rs` → `src/build.rs` / `src/prepared.rs` / `src/dynamic.rs` → README config table → tests in `src/lib.rs`.
+- Add or change config keys: `src/config.rs` → `src/build.rs` / `src/prepared.rs` / `src/dynamic.rs` → usage guide config table → tests in `src/lib.rs`.
 - Change tile build output: `src/build.rs` first, then verify prepared, feature-major, feature-driven, dynamic, and parallel paths still match.
 - Change tile reads: `src/tile.rs` and `src/dynamic.rs`; check split-size and beyond-maxZoom behavior.
 - Change update semantics: `src/pyramid.rs` and `src/incremental.rs`; check stale-delete/move caveats.

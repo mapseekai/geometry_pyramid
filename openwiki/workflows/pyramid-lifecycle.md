@@ -22,7 +22,7 @@ SELECT ST_BuildPyramid(
 
 Operational notes:
 
-- Re-running `ST_BuildPyramid` for the same `name` rebuilds in place using shadow storage and an atomic swap (`src/build.rs`, `src/shadow.rs`).
+- Re-running `ST_BuildPyramid` for the same `name` replaces published tile rows in one transaction and preserves the tile table's OID and grants. Parallel builds use a staging table (`src/build.rs`).
 - Empty or all-NULL geometry sources build a valid empty pyramid; tests cover this (`src/build.rs`, `src/lib.rs`).
 - Identifier length is capped so generated names fit PostgreSQL's 63-byte identifier limit (`README.md`, `src/config.rs`, `src/pyramid.rs`).
 - `tileSizeBudgetBytes` cannot be combined with `parallel > 1`; the code rejects it explicitly (`src/build.rs`).
@@ -87,20 +87,10 @@ SELECT ST_DropPyramid('buildings');
 
 ## 6. Run the local demo
 
-The `demo/` directory is an offline acceptance tool: a Python HTTP server serves `ST_Tile` bytes and static MapLibre assets.
-
-From `demo/README.md`:
-
-```bash
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx install --release \
-  --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx start pg17
-
-createdb -h localhost -p 28817 geometry_pyramid
-psql -h localhost -p 28817 -d geometry_pyramid -f demo/seed.sql
-
-DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid" python3 demo/server.py
-```
+The `demo/` directory is a local acceptance tool: a Python HTTP server serves
+`ST_Tile` bytes and local MapLibre assets. Follow the current
+[demo runbook](../../demo/README.md) for database setup, seeding, port
+selection, and verification. Its optional online OSM basemap is off by default.
 
 Current `demo/server.py` serves `GET /tiles/{name}/{z}/{x}/{y}.pbf`, validates the path with a simple identifier regex, calls `SELECT ST_Tile(%s, %s, %s, %s)`, and maps SQL NULL/empty bytes to HTTP 204. It is single-connection and synchronous; treat it as local acceptance/demo code, not production serving infrastructure.
 

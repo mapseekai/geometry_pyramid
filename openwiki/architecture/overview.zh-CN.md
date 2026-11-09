@@ -27,9 +27,9 @@
 - `geometry_pyramid_catalog(pyramid_name, source_table, geom_column, fid_column, config, built_at)` 记录已注册金字塔。
 - `geometry_pyramid_stats(pyramid_name, z, tile_count, total_bytes, max_tile_bytes, build_ms, attempts, built_at)` 保存逐 zoom 构建统计。
 
-`src/storage.rs` 创建和删除按金字塔命名的瓦片表 `_gp_tiles_<name>`。README 记录的列包括 `id bigserial, z smallint, x integer, y integer, format text, srid integer, mvt bytea`，主键为 `(z, x, y)`。`ST_Tile` 只返回 `mvt` 列。
+`src/storage.rs` 创建和删除按金字塔命名的瓦片表 `_gp_tiles_<name>`。表包含 `id bigserial, z smallint, x integer, y integer, format text, srid integer, mvt bytea` 列，主键为 `(z, x, y)`。`ST_Tile` 只返回 `mvt` 列。
 
-完整重建通过 `src/shadow.rs` 使用 `_gp_tiles_<name>__shadow`。构建先写入 shadow 存储，再切换为正式表；构建失败时应保留旧主表不变。
+完整重建在一个事务中删除并替换正式瓦片表的行，保留表的 OID、授权和依赖视图。并行构建使用 `_gp_shadow_<name>` 作为 worker 可见的暂存表，随后将瓦片行复制进正式表。事务失败时，先前已提交的瓦片行仍对读者可见（`src/build.rs`）。
 
 ## 公共 SQL 表面
 
@@ -54,15 +54,15 @@
 
 1. 获取每个金字塔的 advisory transaction lock，串行化并发构建者。
 2. 拒绝不支持的 `tileSizeBudgetBytes` + `parallel > 1` 组合，因为 budget retry 会擦除/重建 zoom，与 worker 已提交 strip 不安全。
-3. 创建 shadow 表。串行构建中 shadow 可存在于 coordinator 事务内；并行构建中必须由 autonomous worker 创建，使 background worker 能看到已提交 DDL。
+3. 在调用者事务中删除正式瓦片行。并行构建由 autonomous worker 创建 worker 可见的暂存表。
 4. 在大量工作前校验 `buildRules` filters。
 5. 在 tile SRS 中计算源 bbox。
 6. 可选通过 `src/prepared.rs` 准备预转换源表（`preparedBuild`）。
 7. 判断本次构建是否可启用 `featureMajorPoints` 或 `featureDrivenEnum`。
 8. 对每个 zoom 推导瓦片矩形并调用 zoom 构建路径，可选进行 budget retry。
-9. upsert 逐 zoom 统计，并将 shadow 表切换到正式表。
+9. upsert 逐 zoom 统计。并行构建将暂存行复制到正式表，并在提交前清理暂存表。
 
-瓦片 SQL 管线遵循 README 中的生成规则：源 SRS 中 bbox 预过滤、转换到 tile SRS、按 zoom 简化、min-feature 过滤、确定性点丢弃/采样、`ST_AsMVTGeom`、`ST_AsMVT`，并基于 `splitSize` 进行稀疏存储。
+瓦片 SQL 管线先在源 SRS 中按 bbox 预过滤，再转换到 tile SRS、按 zoom 简化和过滤要素、确定性抽稀/采样，调用 `ST_AsMVTGeom` 与 `ST_AsMVT`，最后根据 `splitSize` 存储非空瓦片（`src/build.rs`）。
 
 ## 构建路径变体
 
@@ -94,11 +94,11 @@
 
 重要设计选择：
 
-- 完整串行构建依赖单个事务和 shadow-table swap。
+- 完整串行构建在一个事务中替换正式表的瓦片行。
 - 并行 worker 是独立 backend，因此 job spec 和完成信号通过 `$PGDATA/gp_tmp/` 文件传递，而不是未提交 catalog 行（`src/worker.rs`）。
-- 并行 shadow 创建和已提交 prepared 表使用 autonomous worker 执行，因为 worker 看不到 coordinator 未提交的对象（`src/build.rs`、`src/prepared.rs`）。
+- 并行暂存表和已提交 prepared 表由 autonomous worker 创建，因为 worker 看不到 coordinator 未提交的对象（`src/build.rs`、`src/prepared.rs`）。
 - 已提交 prepared 表由 coordinator 事务删除，而不是 autonomous 删除，以避免 `src/prepared.rs` 中描述的 coordinator/worker 锁等待死锁。
-- 增量刷新在调用者事务中运行，并就地重建 dirty rectangle，不通过 shadow swap（`src/incremental.rs`）。
+- 增量刷新在调用者事务中运行，替换受影响的瓦片行（`src/incremental.rs`）。
 
 ## 架构上的有意限制
 

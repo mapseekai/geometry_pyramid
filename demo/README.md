@@ -1,70 +1,131 @@
-# geometry_pyramid demo — HTTP tile server + MapLibre viewer
+# Local Tile Server & Map Viewer Operations Guide
 
-Minimal, offline, end-to-end acceptance tool. Serves `ST_Tile` output as MVT and
-renders it in the browser on a plain background — no internet, no basemap.
+<p align="center">
+  <a href="README.md">English</a> •
+  <a href="README.zh-CN.md">简体中文</a> •
+  <a href="../README.md">Back to Project Root</a>
+</p>
 
-> This machine's pgrx pg17 instance listens on port **28817** (host `localhost`,
-> database `geometry_pyramid`). Yours may differ — check
-> `~/.pgrx/17.log` for the `listening on ... .s.PGSQL.<port>` line, or
-> `lsof -nP -iTCP -sTCP:LISTEN | grep postgres`.
+This guide provides end-to-end operational instructions for launching a local vector tile HTTP server and interacting with the MapLibre GL web map viewer. It serves as an acceptance and verification harness for `ST_BuildPyramid` materialized tiles, `splitSize` sparse tile fallback, and live dynamic slicing beyond `maxZoom`.
 
-## Prerequisites
-- The `geometry_pyramid` extension installed into a running PostgreSQL with PostGIS.
-- Python 3 with `psycopg`: `pip install 'psycopg[binary]'`
-  (on PEP 668 systems: `python3 -m pip install 'psycopg[binary]' --break-system-packages`).
+---
 
-## Run (3 steps)
+## 📋 Architecture Overview
 
-1. **Start PostgreSQL with the extension.** Using the pgrx-managed instance:
-   ```bash
-   CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx install --release \
-     --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config
-   CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx start pg17
-   ```
-   Find its port (this machine: 28817): `grep listening ~/.pgrx/17.log | tail -1`.
+- **Backend**: Lightweight Python 3 HTTP server powered by `psycopg` (synchronous single-connection design intended exclusively for local inspection and acceptance testing).
+- **Frontend**: MapLibre GL JS & CSS bundled locally for fully offline capability; includes an optional OpenStreetMap basemap toggle.
+- **Data Generator**: `demo/seed.sql` populates random spatial point data into `demo_src` (centered around Beijing) and builds a pyramid named `demo`.
 
-2. **Seed data + build the demo pyramid:**
-   ```bash
-   createdb -h localhost -p 28817 geometry_pyramid    # first time only
-   psql -h localhost -p 28817 -d geometry_pyramid -f demo/seed.sql
-   ```
-   The final line prints `z0 bytes = <non-zero>`, confirming the pyramid built.
+---
 
-3. **Start the tile server:**
-   ```bash
-   DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid" python3 demo/server.py
-   ```
-   Open <http://127.0.0.1:8080> .
+## 🚀 Step-by-Step Operations
 
-## What to verify
-- The dense cluster renders as red points on the dark background.
-- Zoom in past **z=8** (the pyramid's `maxZoom`): the HUD shows `DYNAMIC` and
-  points still render — tiles are sliced on demand beyond the materialized range.
-- Pan to the sparse outliers (far from the cluster): they render too —
-  `splitSize` deferred them at build time; `ST_Tile` slices them on demand.
-- The server terminal logs `.pbf` requests with `200` (has data) / `204` (empty).
+### Step 1: Launch PostgreSQL Instance
 
-## Verified end-to-end (curl)
-With the demo pyramid built (`maxZoom=8`, `splitSize=500`):
+From the repository root, start the pgrx-managed PostgreSQL instance (PostgreSQL 17 by default):
 
-| Request | Result |
-|---|---|
-| `GET /` | `200 text/html` |
-| `GET /tiles/demo/0/0/0.pbf` (materialized) | `200`, ~56 KB MVT |
-| `GET /tiles/demo/12/3373/1550.pbf` (z>maxZoom) | `200`, ~8.7 KB MVT — **0 rows in storage, sliced on demand** |
-| `GET /tiles/demo/3/0/0.pbf` (empty region) | `204` |
-| `GET /tiles/foo;bar/0/0/0.pbf` (bad name) | `404` |
-| `GET /maplibre-gl.js` | `200 application/javascript` |
+```bash
+cargo pgrx run pg17
+```
 
-Only 9 tiles were materialized for the whole dataset (the dense cluster at
-z ≤ 8 meeting `splitSize`); everything else is served dynamically.
+In the opened `psql` interactive terminal, create a dedicated disposable database:
 
-## Endpoint
-`GET /tiles/{name}/{z}/{x}/{y}.pbf` → MVT (`200`), empty tile (`204`),
-bad/unknown path (`404`), DB error (`500`).
+```sql
+CREATE DATABASE gp_demo;
+\connect gp_demo
+\conninfo
+\q
+```
 
-## Notes
-- Single-connection, synchronous — acceptance/demo only, not production.
-- Offline: MapLibre assets are vendored locally (`maplibre-gl.js` / `maplibre-gl.css`).
-- The page requests tiles up to z=22 so zooming past `maxZoom` exercises the
-  on-demand path; `source-layer` is the pyramid name (`demo`).
+Note the port printed by `\conninfo` (e.g., `28817` or your system's active port).
+
+---
+
+### Step 2: Seed Test Data & Build Pyramid
+
+In a new shell terminal, set `DATABASE_URL` and run `demo/seed.sql`:
+
+```bash
+# Replace 28817 with your actual PostgreSQL port from step 1
+export DATABASE_URL="host=localhost port=28817 dbname=gp_demo"
+
+# Execute seed script
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f demo/seed.sql
+```
+
+**Expected Output**:
+The final query prints a non-zero byte size for the root tile (zoom 0):
+```text
+ z0 bytes 
+----------
+      142
+(1 row)
+```
+
+> **Note**: `demo/seed.sql` is idempotent. Re-running it safely drops and recreates both the `demo` pyramid and `demo_src` source table.
+
+---
+
+### Step 3: Install Dependencies & Start Server
+
+Set up an isolated virtual environment and run the HTTP server:
+
+```bash
+# 1. Create and activate virtual environment
+python3 -m venv /tmp/gp-demo-venv
+source /tmp/gp-demo-venv/bin/activate
+
+# 2. Install psycopg driver
+pip install 'psycopg[binary]'
+
+# 3. Launch the server (default port 8989)
+python demo/server.py
+```
+
+To bind to a different port, set the `PORT` environment variable (e.g., `export PORT=9000`).
+
+---
+
+### Step 4: Verification & Acceptance via Browser
+
+Open [http://127.0.0.1:8989](http://127.0.0.1:8989) in your web browser.
+
+#### Verification Checklist:
+1. **Initial Rendering**: Map centers around 116.49°E, 40°N displaying a dense cluster of red points.
+2. **Materialized Tiles (Zooms 0 - 8)**: Navigating zooms 0 to 8 fetches pre-materialized MVT bytes from the database in milliseconds.
+3. **Live Dynamic Slicing (> Zoom 8)**: Zooming in past zoom level 8 exercises on-the-fly slicing from the source table.
+4. **Sparse Tile Slicing (`splitSize`)**: Panning toward distant isolated points tests sparse live slicing fallback.
+
+---
+
+### Step 5: Automated Testing via CLI
+
+In another shell, test endpoints with `curl` or run the integration test suite:
+
+```bash
+# Check HTML page status
+curl -sS -o /dev/null -w "Status: %{http_code}\n" http://127.0.0.1:8989/
+
+# Check tile endpoint (z=0, x=0, y=0)
+curl -sS -o /dev/null -w "Status: %{http_code}\n" http://127.0.0.1:8989/tiles/demo/0/0/0.pbf
+
+# Run integration test harness
+python demo/test_server.py
+```
+
+**HTTP Status Codes**:
+- `200 OK`: Valid MVT byte stream returned.
+- `204 No Content`: Empty tile (no geometry features in bounds).
+- `404 Not Found`: Invalid URL path or malformed parameters.
+- `500 Internal Server Error`: Database query error or connection failure.
+
+---
+
+## 🧹 Cleaning Up Demo Resources
+
+To remove the demo pyramid and source table while preserving the database:
+
+```sql
+SELECT ST_DropPyramid('demo');
+DROP TABLE demo_src;
+```

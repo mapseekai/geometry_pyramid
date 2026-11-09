@@ -22,7 +22,7 @@ SELECT ST_BuildPyramid(
 
 运维注意事项：
 
-- 对同一 `name` 重新运行 `ST_BuildPyramid` 会使用 shadow 存储并通过原子 swap 就地重建（`src/build.rs`、`src/shadow.rs`）。
+- 对同一 `name` 重新运行 `ST_BuildPyramid` 会在一个事务中替换正式表的瓦片行，并保留表的 OID 和授权。并行构建使用暂存表（`src/build.rs`）。
 - 空源或 geometry 全为 NULL 的源会构建出合法的空金字塔；测试已覆盖该行为（`src/build.rs`、`src/lib.rs`）。
 - 标识符长度被限制，以确保生成名称适配 PostgreSQL 63 字节标识符限制（`README.md`、`src/config.rs`、`src/pyramid.rs`）。
 - `tileSizeBudgetBytes` 不能与 `parallel > 1` 组合；代码会明确拒绝（`src/build.rs`）。
@@ -87,20 +87,9 @@ SELECT ST_DropPyramid('buildings');
 
 ## 6. 运行本地 demo
 
-`demo/` 目录是离线验收工具：一个 Python HTTP server 提供 `ST_Tile` 字节和静态 MapLibre 资源。
-
-来自 `demo/README.md`：
-
-```bash
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx install --release \
-  --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx start pg17
-
-createdb -h localhost -p 28817 geometry_pyramid
-psql -h localhost -p 28817 -d geometry_pyramid -f demo/seed.sql
-
-DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid" python3 demo/server.py
-```
+`demo/` 目录是本地验收工具：Python HTTP 服务提供 `ST_Tile` 字节和本地
+MapLibre 资源。数据库准备、导入样例、选择端口及验证步骤请参阅
+[演示操作说明](../../demo/README.zh-CN.md)。可选在线 OSM 底图默认关闭。
 
 当前 `demo/server.py` 提供 `GET /tiles/{name}/{z}/{x}/{y}.pbf`，用简单 identifier regex 校验路径，调用 `SELECT ST_Tile(%s, %s, %s, %s)`，并把 SQL NULL/空字节映射为 HTTP 204。它是单连接、同步的；应把它视为本地验收/demo 代码，而不是生产服务基础设施。
 

@@ -1,82 +1,75 @@
-# 运维、测试与 Benchmark
+# 开发、测试与基准
 
-## 本地构建和 pgrx 检查
+[English](testing-and-benchmarks.md) · [使用说明](../usage.zh-CN.md)
 
-该 crate 目标是 pgrx `0.18.0`，并通过 Cargo features 默认使用 PostgreSQL 17（`Cargo.toml`）。README 安装说明覆盖 PostgreSQL 13-18 feature flags 和 `cargo-pgrx` 初始化。
+在仓库根目录执行以下命令。Cargo 默认启用 PostgreSQL 17 feature，pgrx 版本为
+0.18.0。请指定 PostgreSQL 17 的 `pg_config`；`PATH` 上其他 PostgreSQL
+版本的 `pg_config` 不能替代。
 
-常用命令：
+## 检查源码变更
 
 ```bash
+cargo install --locked cargo-pgrx --version 0.18.0
+cargo pgrx init --pg17 /path/to/postgresql-17/bin/pg_config
 cargo check
-cargo pgrx run pg17
-cargo pgrx test
-cargo pgrx package
+cargo pgrx test pg17
+python3 demo/test_server.py
 ```
 
-在实际使用 SQL API 前需要 PostGIS：
+`cargo pgrx test pg17` 运行 Rust 和 PostgreSQL 集成测试，包括使用 PostGIS 的
+`#[pg_test]`。Python 测试不需要运行中的数据库，覆盖演示服务的路径解析和
+HTTP 行为；运行前需安装 `psycopg`。
 
-```sql
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
-```
+交互式 SQL 检查可运行 `cargo pgrx run pg17`：它会编译、安装扩展，启动受 pgrx
+管理的 PostgreSQL，并打开 `psql`。目标数据库应先启用 PostGIS，再启用
+`geometry_pyramid`。[README 示例](../../README.zh-CN.md#生成第一张瓦片)
+可构建并检查一张瓦片。
 
-使用 `cargo pgrx test` 运行普通 Rust 测试和 `src/lib.rs` 中的 `#[pg_test]` 覆盖。近期测试覆盖了 buildRules 在动态读取、prepared 多规则输出、feature-major points、feature-driven builds、串行/并行等价性和非法 filter 清理中的行为。
-
-## Demo server 和 viewer
-
-`demo/` 是本地验收工具，不是生产基础设施。`demo/server.py` 提供：
-
-- `/` 和来自 `demo/` 的静态 MapLibre 资源。
-- `/tiles/{name}/{z}/{x}/{y}.pbf`，它调用 `SELECT ST_Tile(%s, %s, %s, %s)`，并对 SQL NULL 或空字节返回 HTTP 204。
-
-该 server 是同步的，并维护一个模块级 psycopg 连接。当前代码会在 psycopg 错误后重连一次，在 URL parser 中拒绝非 identifier 瓦片名，捕获常见客户端断开写入错误，并要求 `_fetch_tile` 运行前连接已初始化（`demo/server.py`）。这些行为的测试位于 `demo/test_server.py`。
-
-来自 `demo/README.md` 和 `workflows/pyramid-lifecycle.md` 的典型本地流程：
+## 构建安装包
 
 ```bash
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx install --release \
-  --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx start pg17
-
-createdb -h localhost -p 28817 geometry_pyramid
-psql -h localhost -p 28817 -d geometry_pyramid -f demo/seed.sql
-
-DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid" python3 demo/server.py
+cargo pgrx package --pg-config /path/to/postgresql-17/bin/pg_config --out-dir package
 ```
 
-静态 viewer 现在在 `demo/index.html` 中包含一个可选择/可切换的在线 OpenStreetMap 底图；测试断言它默认不启用（`demo/test_server.py`）。
+仓库的 [Verify and release 工作流](../../.github/workflows/release.yml) 在
+Ubuntu 24.04 上测试 PostgreSQL 17、构建安装包，并验证全新安装和从 0.1.0
+升级。Cargo 提供 PostgreSQL 13 至 18 的 feature；该工作流验证的是 PG17 安装包。
 
-## Benchmark 脚本
+## 运行查看器
 
-手工 SQL benchmark 位于 `bench/`。它们用于对 pgrx/PostGIS 数据库运行 psql，并经常创建/删除 benchmark schema 或金字塔。
+按照[演示操作说明](../../demo/README.zh-CN.md)在专用数据库中导入样例，启动 HTTP
+服务，检查瓦片响应，再打开 MapLibre 查看器。本地服务使用单个同步数据库连接。
+默认端口为 8989，可通过 `PORT` 修改。OSM 底图可选，默认关闭。
 
-关键文件：
+## 测量构建速度
 
-- `bench/build_speed.sql` — README 中描述的确定性混合点/线/面构建速度基线。
-- `bench/user_data_perf.sql` 和 `bench/user_data_perf_followup.sql` — 面向点、建筑面、派生线、LUCC 和混合数据的用户数据导入/性能矩阵。
-- `bench/user_data_lucc_optimization.sql`、`bench/user_data_lucc_sampling.sql`、`bench/user_data_mixed_optimization.sql`、`bench/user_data_next_optimization.sql`、`bench/user_data_point_sampling.sql`、`bench/user_data_split_z8.sql`、`bench/user_data_budget_followup.sql` 和 `bench/user_data_tile_profile_parallel.sql` — 后续优化和 profiling 场景。
+`bench/build_speed.sql` 会创建和删除 `_gp_bench_mixed` 以及指定的金字塔，
+因此只应在**可丢弃的基准数据库**中运行。把 `DATABASE_URL` 指向该数据库。
+先用小规模检查环境，再在目标硬件上选择有代表性的工作量并重复测量：
 
-`docs/user-data-build-performance.md` 汇总了已检查的用户数据运行结果。高信号结论：
+```bash
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_baseline \
+  -v max_zoom=8 \
+  -v scale=1000 \
+  -v prepared_build=false \
+  -f bench/build_speed.sql
+```
 
-- 看起来密集的源行数不是唯一驱动因素；即使输出瓦片很少，复杂 polygon 裁剪/MVT 编码也可能主导成本。
-- `preparedBuild` 在测量过的集中数据集上表现为中性到略有帮助。
-- `featureMajorPoints` 对浅层/集中 z0-10 点数据没有帮助，因为生成的瓦片集合很小。
-- `buildRules.sample` 是测量集中最强的 LUCC 粗 zoom 优化手段。
-- `tileSizeBudgetBytes` 更适合作为输出保护，而不是首选构建加速手段。
-- `parallel=4` 没有改善已检查的少量重瓦片 workload；mixed LOD 在该 benchmark 中回退。
+脚本输出源几何分布、逐 zoom 瓦片格数量、总耗时和已保存的逐层统计。比较
+prepared 路径时，换一个金字塔名并设置 `-v prepared_build=true`，其余输入
+和环境保持一致。`bench/user_data_*.sql` 和[实测报告](../../docs/user-data-build-performance.md)
+涵盖更多真实数据形态。某种数据的加速结果不能未经复测就推广到其他数据。
 
-把这些结论作为起始假设，而不是通用性能保证。在推荐默认值前，应在目标数据和硬件上重新运行相关脚本。
+## 运维检查
 
-## 运维关注点
+- 全量重建在事务内替换正式瓦片表的行。读者不会看到部分结果；表的授权和依赖
+  视图保持不变。
+- 谓词刷新只看到当前匹配行。删除或移动时，应刷新覆盖旧、新位置的区域，或
+  执行全量重建。
+- 延迟生成或超过 `maxZoom` 的瓦片会实时切片，扩展内部没有缓存。按需监控
+  源表查询负载并在服务层加入缓存。
+- 并行构建使用 PostgreSQL background worker 和 `$PGDATA/gp_tmp/` 下的文件。
+  `tileSizeBudgetBytes` 与 `parallel > 1` 的组合会被拒绝。
 
-- 完整重建通过 shadow table swap 保证原子性，但增量刷新会就地编辑 dirty region（`src/build.rs`、`src/shadow.rs`、`src/incremental.rs`）。
-- `ST_UpdatePyramid(where_clause)` 无法清理 delete 或 move-out 的旧位置，除非该 clause 仍覆盖它们。此类场景优先使用 `ST_UpdatePyramidByExtent` 或完整重建。
-- 动态切片不缓存；重复的 `splitSize` 或 beyond-`maxZoom` 读取可能变成实时 PostGIS workload（`src/dynamic.rs`）。
-- 并行构建使用 background worker 和 `$PGDATA/gp_tmp/` 下的 job/status 文件，因为 worker 看不到 coordinator 未提交状态（`src/worker.rs`）。
-- `tileSizeBudgetBytes` 与 `parallel > 1` 的组合会被设计性拒绝（`src/build.rs`）。
-
-## 变更指导
-
-- 对 SQL API 或构建管线变更，尽可能运行 `cargo pgrx test`，并在 `src/lib.rs` 中为用户可见行为添加 `#[pg_test]` 覆盖。
-- 对 demo 变更，运行 `python3 demo/test_server.py`；这些测试不需要 live database 即可检查 parser/static/handler 行为。
-- 对性能变更，优先新增聚焦的 `bench/*.sql` 脚本或扩展现有脚本，然后把结果汇总到 `docs/user-data-build-performance.md`，而不是写进 wiki。
+SQL 行为、配置、升级及按症状排障，请参阅[使用说明](../usage.zh-CN.md)。

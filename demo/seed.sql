@@ -3,6 +3,7 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
 
+SELECT ST_DropPyramid('demo');
 DROP TABLE IF EXISTS demo_src CASCADE;
 CREATE TABLE demo_src (gid serial PRIMARY KEY, geom geometry(Point, 4326));
 
@@ -18,7 +19,6 @@ FROM (VALUES (-120, 50), (80, -45), (10, 10), (150, -30), (-60, -20), (30, 60)) 
 
 -- Idempotent rebuild. maxZoom=8 (zoom past it -> dynamic), splitSize=500
 -- (dense cluster materializes, sparse outliers do not but are served on-demand).
-SELECT ST_DropPyramid('demo');
 SELECT ST_BuildPyramid('demo_src', 'geom', 'gid',
     '{"name": "demo", "maxZoom": 8, "splitSize": 500}');
 

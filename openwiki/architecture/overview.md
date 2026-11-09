@@ -27,9 +27,9 @@ Core source anchors:
 - `geometry_pyramid_catalog(pyramid_name, source_table, geom_column, fid_column, config, built_at)` tracks registered pyramids.
 - `geometry_pyramid_stats(pyramid_name, z, tile_count, total_bytes, max_tile_bytes, build_ms, attempts, built_at)` stores per-zoom build statistics.
 
-`src/storage.rs` creates and drops per-pyramid tile tables named `_gp_tiles_<name>`. README documents columns as `id bigserial, z smallint, x integer, y integer, format text, srid integer, mvt bytea` with primary key `(z, x, y)`. `ST_Tile` returns only the `mvt` column.
+`src/storage.rs` creates and drops per-pyramid tile tables named `_gp_tiles_<name>`. They have `id bigserial, z smallint, x integer, y integer, format text, srid integer, mvt bytea` columns and primary key `(z, x, y)`. `ST_Tile` returns only the `mvt` column.
 
-A full rebuild uses `_gp_tiles_<name>__shadow` through `src/shadow.rs`. The build writes into shadow storage first, then swaps it into place; failed builds should leave the previous main table intact.
+A full rebuild deletes and replaces rows in the published tile table in one transaction, preserving its OID, grants, and dependent views. Parallel builds use `_gp_shadow_<name>` as a worker-visible staging table, then copy rows into the published table. A failed transaction leaves the previous committed rows visible (`src/build.rs`).
 
 ## Public SQL surface
 
@@ -54,15 +54,15 @@ Unknown pyramids intentionally return `false` or `NULL` for several operations i
 
 1. Take a per-pyramid advisory transaction lock to serialize concurrent builders.
 2. Reject unsupported `tileSizeBudgetBytes` + `parallel > 1` because budget retries wipe/rebuild zooms in ways that conflict with worker-committed strips.
-3. Create a shadow table. In serial builds the shadow can live in the coordinator transaction; in parallel builds it must be created by an autonomous worker so background workers can see committed DDL.
+3. Delete published tile rows in the caller transaction. Parallel builds create a worker-visible staging table through an autonomous worker.
 4. Validate `buildRules` filters before substantial work.
 5. Compute source bbox in tile SRS.
 6. Optionally prepare a pre-transformed source table (`preparedBuild`) through `src/prepared.rs`.
 7. Decide per build whether `featureMajorPoints` or `featureDrivenEnum` can engage.
 8. For each zoom, derive a tile rectangle and call the zoom build path, optionally with budget retry.
-9. Upsert per-zoom stats and swap the shadow table into place.
+9. Upsert per-zoom stats. Parallel builds copy staged rows into the published table and discard the stage before commit.
 
-The tile SQL pipeline follows the README generation rules: bbox prefilter in source SRS, transform to tile SRS, per-zoom simplification, min-feature filtering, deterministic point dropping/sampling, `ST_AsMVTGeom`, `ST_AsMVT`, and sparse-store based on `splitSize`.
+The tile SQL pipeline applies a bbox prefilter in source SRS, transforms to tile SRS, simplifies and filters features by zoom, applies deterministic point dropping/sampling, calls `ST_AsMVTGeom` and `ST_AsMVT`, then stores nonempty tiles according to `splitSize` (`src/build.rs`).
 
 ## Build path variants
 
@@ -94,11 +94,11 @@ The build system has several behavior-preserving paths selected by config and da
 
 Important design choices:
 
-- Full serial builds rely on one transaction and shadow-table swap.
+- Full serial builds replace published rows in one transaction.
 - Parallel workers are separate backends, so job specs and completion signals go through files in `$PGDATA/gp_tmp/`, not uncommitted catalog rows (`src/worker.rs`).
-- Parallel shadow creation and committed prepared tables use autonomous worker execution because workers cannot see coordinator-uncommitted objects (`src/build.rs`, `src/prepared.rs`).
+- Parallel stage creation and committed prepared tables use autonomous worker execution because workers cannot see coordinator-uncommitted objects (`src/build.rs`, `src/prepared.rs`).
 - Prepared committed tables are dropped in the coordinator transaction, not autonomously, to avoid a coordinator/worker lock wait deadlock described in `src/prepared.rs`.
-- Incremental refresh runs in the caller transaction and rebuilds dirty rectangles in place, not through shadow swap (`src/incremental.rs`).
+- Incremental refresh runs in the caller transaction and replaces dirty tile rows (`src/incremental.rs`).
 
 ## Where the architecture is deliberately limited
 

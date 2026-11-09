@@ -10,7 +10,7 @@
 
 - SQL 生命周期：`ST_BuildPyramid`、`ST_UpdatePyramid`、`ST_UpdatePyramidByExtent`、`ST_DropPyramid`、`ST_Pyramid`、`ST_Tile`、`ST_Pyramids`、`geometry_pyramid_version`（`README.md`、`README.zh-CN.md`、`src/pyramid.rs`、`src/tile.rs`、`sql/bootstrap.sql`）。
 - 存储模型：每个金字塔写入 `_gp_tiles_<name>` 瓦片表，同时维护 `geometry_pyramid_catalog` 和逐 zoom 的 `geometry_pyramid_stats`（`sql/bootstrap.sql`、`src/storage.rs`、`src/stats.rs`）。
-- 原子完整重建：完整构建先写入 shadow 表，再切换到正式表；读者不应看到半成品（`src/build.rs`、`src/shadow.rs`）。
+- 原子完整重建：在一个事务中替换正式表的瓦片行，保留表的 OID 和授权；并行构建使用暂存表（`src/build.rs`）。
 - 混合读路径：`ST_Tile` 在 `maxZoom` 内优先读物化瓦片；`splitSize` 导致的稀疏 miss 和超过 `maxZoom` 且 `dynamicBeyondMaxZoom=true` 的请求会动态切片（`src/tile.rs`、`src/dynamic.rs`）。
 - 性能路径：基线 tile-major、`preparedBuild`、纯点 `featureMajorPoints`、全几何 `featureDrivenEnum`、以及 PostgreSQL background worker 并行构建（`src/build.rs`、`src/prepared.rs`、`src/worker.rs`、`docs/build-speed-deep-dive.md`）。
 - LOD/build rules：项目原生 `buildRules` 支持按 zoom 的 `filter`、`attrFields` 和确定性 `sample`；重叠规则按 AND 组合（`src/config.rs`、`src/build.rs`、`README.md`、`README.zh-CN.md`）。
@@ -22,29 +22,16 @@
 ```bash
 cargo check
 cargo pgrx run pg17
-cargo pgrx test
-cargo pgrx package
+cargo pgrx test pg17
+cargo pgrx package --pg-config /path/to/postgresql-17/bin/pg_config --out-dir package
 ```
 
-`Cargo.toml` 默认使用 PostgreSQL 17 feature，并依赖 pgrx `0.18.0`。扩展运行需要 PostGIS；README 中的安装说明还覆盖 PostgreSQL 13-18 feature 与 `cargo-pgrx` 初始化。
+`Cargo.toml` 默认使用 PostgreSQL 17 feature，并依赖 pgrx `0.18.0`。请使用 PostgreSQL 17 的 `pg_config` 初始化 `cargo-pgrx`，并先安装 PostGIS；参见 [README](../README.zh-CN.md#生成第一张瓦片)。
 
 ### 最小 SQL 生命周期
 
-```sql
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
-
-SELECT ST_BuildPyramid(
-  'buildings', 'geom', 'gid',
-  '{"name":"buildings","minZoom":0,"maxZoom":14,"attributes":["name"]}'
-);
-
-SELECT ST_Tile('buildings', 14, 13488, 6210);
-SELECT ST_Pyramid('buildings');
-SELECT * FROM ST_Pyramids();
-SELECT ST_UpdatePyramidByExtent('buildings', 116.30, 39.90, 116.42, 39.99, 4326);
-SELECT ST_DropPyramid('buildings');
-```
+首次构建和读取可运行 [README 中完整的 SQL 示例](../README.zh-CN.md#生成第一张瓦片)；
+刷新和删除请参阅[使用说明](usage.zh-CN.md)。
 
 标识符输入被限制为短的裸标识符，因为多条路径会把验证后的标识符插入动态 SQL（`src/pyramid.rs`、`src/config.rs`）。当前不支持 schema-qualified 源表名。
 
@@ -57,10 +44,6 @@ SELECT ST_DropPyramid('buildings');
 - [配置与 LOD 领域概念](domain/config-and-lod.zh-CN.md) / [English](domain/config-and-lod.md) — `PyramidConfig`、`buildRules`、采样、动态瓦片和性能旋钮。
 - [运维、测试与 Benchmark](operations/testing-and-benchmarks.zh-CN.md) / [English](operations/testing-and-benchmarks.md) — pgrx 命令、demo server、benchmark SQL、用户数据结果和变更检查。
 - [源码地图](source-map.zh-CN.md) / [English](source-map.md) — 给未来 agent/工程师使用的文件导航。
-
-## 最近仓库方向
-
-当前记录的上次成功更新 git head 与 `HEAD` 相同；本次检查到的是未提交工作树内容。重点变化包括：新增 `README.zh-CN.md`，demo viewer 增加默认关闭的在线 OSM 底图开关，demo server 增加连接初始化与客户端断开保护，`docs/user-data-build-performance.md` 汇总用户数据 benchmark，以及 worker 代码把 background-worker 文件从“spec”命名整理为“job”命名。现有英文 wiki 已覆盖这些行为；本页补齐中文入口。
 
 ## 安全与运维要点
 

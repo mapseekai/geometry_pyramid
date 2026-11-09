@@ -28,7 +28,7 @@
 }
 ```
 
-来自 `README.md`、`src/config.rs` 和 `src/build.rs` 的语义：
+来自 `../usage.zh-CN.md`、`src/config.rs` 和 `src/build.rs` 的语义：
 
 - 规则覆盖闭区间 zoom band `[minZoom, maxZoom]`。
 - `filter` 是针对源列求值的原始 SQL boolean 表达式。
@@ -37,7 +37,7 @@
 - 多条规则覆盖同一 zoom 时，过滤/采样按 AND 组合。如果多条覆盖规则都设置了 `attrFields`，它们在该 zoom 必须一致。
 - 未被任何规则覆盖的 zoom 使用全部源要素和全局 `attributes` 列表。
 
-扩展有意**不**实现第二套 Ganos 原生 `level` / `value` 规则形态。历史 Ganos 对比文档可能提到缺失的 LOD 功能；当它们与当前行为冲突时，优先相信当前 `README.md` 和 `src/config.rs`。
+扩展有意**不**实现第二套 Ganos 原生 `level` / `value` 规则形态。历史 Ganos 对比文档可能提到缺失的 LOD 功能；当它们与当前行为冲突时，优先参考当前[使用说明](../usage.zh-CN.md)和 `src/config.rs`。
 
 ## LOD 规则应用位置
 

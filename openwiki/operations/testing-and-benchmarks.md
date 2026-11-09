@@ -1,82 +1,82 @@
-# Operations, Testing, and Benchmarks
+# Develop, test, and benchmark
 
-## Local build and pgrx checks
+[简体中文](testing-and-benchmarks.zh-CN.md) · [Usage guide](../usage.md)
 
-The crate targets pgrx `0.18.0` and defaults to PostgreSQL 17 via Cargo features (`Cargo.toml`). README setup notes cover PostgreSQL 13-18 feature flags and `cargo-pgrx` initialization.
+Run these commands from the repository root. The default Cargo feature is
+PostgreSQL 17 and the pgrx version is 0.18.0. Use a PostgreSQL 17 `pg_config`;
+another PostgreSQL version on `PATH` is not a substitute.
 
-Common commands:
+## Check a source change
 
 ```bash
+cargo install --locked cargo-pgrx --version 0.18.0
+cargo pgrx init --pg17 /path/to/postgresql-17/bin/pg_config
 cargo check
-cargo pgrx run pg17
-cargo pgrx test
-cargo pgrx package
+cargo pgrx test pg17
+python3 demo/test_server.py
 ```
 
-PostGIS is required before exercising the SQL API:
+`cargo pgrx test pg17` runs Rust and PostgreSQL integration tests, including
+PostGIS-backed `#[pg_test]` cases. The Python tests exercise demo parsing and
+HTTP behavior without a live database; install `psycopg` to run them.
 
-```sql
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
-```
+For an interactive SQL check, `cargo pgrx run pg17` builds and installs the
+extension, starts managed PostgreSQL, and opens `psql`. Enable PostGIS before
+`geometry_pyramid` in the target database. The [README example](../../README.md#try-one-tile)
+builds and checks one tile.
 
-Use `cargo pgrx test` for both regular Rust tests and `#[pg_test]` coverage in `src/lib.rs`. Recent tests cover buildRules across dynamic reads, prepared multi-rule output, feature-major points, feature-driven builds, serial/parallel equivalence, and invalid-filter cleanup.
-
-## Demo server and viewer
-
-`demo/` is a local acceptance harness, not production infrastructure. `demo/server.py` serves:
-
-- `/` and static MapLibre assets from `demo/`.
-- `/tiles/{name}/{z}/{x}/{y}.pbf`, which calls `SELECT ST_Tile(%s, %s, %s, %s)` and returns HTTP 204 for SQL NULL or empty bytes.
-
-The server is synchronous and keeps one module-level psycopg connection. Current code reconnects once after a psycopg error, rejects non-identifier tile names in the URL parser, catches common client-disconnect write errors, and requires the connection to be initialized before `_fetch_tile` runs (`demo/server.py`). Tests for these behaviors live in `demo/test_server.py`.
-
-Typical local flow from `demo/README.md` and `workflows/pyramid-lifecycle.md`:
+## Build a package
 
 ```bash
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx install --release \
-  --pg-config /opt/homebrew/opt/postgresql@17/bin/pg_config
-CARGO_TARGET_DIR=/tmp/gp_target cargo pgrx start pg17
-
-createdb -h localhost -p 28817 geometry_pyramid
-psql -h localhost -p 28817 -d geometry_pyramid -f demo/seed.sql
-
-DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid" python3 demo/server.py
+cargo pgrx package --pg-config /path/to/postgresql-17/bin/pg_config --out-dir package
 ```
 
-The static viewer now includes an opt-in/toggleable online OpenStreetMap basemap in `demo/index.html`; tests assert it is not enabled by default (`demo/test_server.py`).
+The repository's [Verify and release workflow](../../.github/workflows/release.yml)
+tests PostgreSQL 17 on Ubuntu 24.04, builds this package, and checks fresh
+installation and upgrade from 0.1.0. Cargo has features for PostgreSQL
+13 through 18; this workflow verifies the PostgreSQL 17 package.
 
-## Benchmark scripts
+## Run the viewer
 
-Manual SQL benchmarks live under `bench/`. They are intended for psql against a pgrx/PostGIS database and often create/drop benchmark schemas or pyramids.
+Follow the [demo runbook](../../demo/README.md) to seed a dedicated database,
+start the HTTP server, inspect tile responses, and open the MapLibre viewer.
+The local server uses one synchronous database connection. Its default port
+is 8989; `PORT` changes it. The OSM basemap is optional and off by default.
 
-Key files:
+## Measure build speed
 
-- `bench/build_speed.sql` — deterministic mixed point/line/polygon build-speed baseline described in README.
-- `bench/user_data_perf.sql` and `bench/user_data_perf_followup.sql` — user-data import/performance matrix for points, building polygons, derived lines, LUCC, and mixed data.
-- `bench/user_data_lucc_optimization.sql`, `bench/user_data_lucc_sampling.sql`, `bench/user_data_mixed_optimization.sql`, `bench/user_data_next_optimization.sql`, `bench/user_data_point_sampling.sql`, `bench/user_data_split_z8.sql`, `bench/user_data_budget_followup.sql`, and `bench/user_data_tile_profile_parallel.sql` — follow-up optimization and profiling scenarios.
+`bench/build_speed.sql` creates and drops `_gp_bench_mixed` and the selected
+pyramid, so use a **disposable benchmark database**. Set `DATABASE_URL` to
+that database. Start with a small scale to check setup, then choose a
+representative workload and repeat measurements on the target hardware:
 
-`docs/user-data-build-performance.md` summarizes the inspected user-data runs. High-signal takeaways:
+```bash
+psql "$DATABASE_URL" \
+  -v pyramid_name=gp_bench_baseline \
+  -v max_zoom=8 \
+  -v scale=1000 \
+  -v prepared_build=false \
+  -f bench/build_speed.sql
+```
 
-- Dense-looking source row counts are not the only driver; complex polygon clipping/MVT encoding can dominate even with few output tiles.
-- `preparedBuild` was neutral to mildly helpful on the measured concentrated datasets.
-- `featureMajorPoints` did not help shallow/concentrated z0-10 point data because only a small tile set was generated.
-- `buildRules.sample` was the strongest LUCC coarse-zoom optimization in the measured set.
-- `tileSizeBudgetBytes` is best viewed as output protection, not first-choice build acceleration.
-- `parallel=4` did not help the inspected few-heavy-tile workload; mixed LOD regressed in that benchmark.
+The script reports source geometry distribution, tile-cell counts by zoom,
+wall time, and persisted per-zoom statistics. For a comparable prepared run,
+change the pyramid name and set `-v prepared_build=true`; keep the other
+inputs and environment fixed. The larger `bench/user_data_*.sql` scripts
+and [measured results](../../docs/user-data-build-performance.md) cover real
+source shapes. Do not transfer a speedup from one dataset to another without
+rerunning the relevant case.
 
-Use these findings as starting hypotheses, not universal performance guarantees. Re-run the relevant script on target data and hardware before recommending defaults.
+## Operational checks
 
-## Operational watchpoints
+- Full rebuilds replace rows in the published tile table transactionally.
+  Readers do not see partial results; the table keeps its grants and views.
+- Predicate refresh uses currently matched rows. For deletes or moves,
+  refresh an extent covering the old and new locations, or rebuild fully.
+- Deferred or above-`maxZoom` tiles are sliced live without an extension
+  cache. Monitor source query load and add a serving cache when needed.
+- Parallel builds use PostgreSQL background workers and files under
+  `$PGDATA/gp_tmp/`. `tileSizeBudgetBytes` with `parallel > 1` is rejected.
 
-- Full rebuilds are atomic through shadow table swap, but incremental refresh edits dirty regions in place (`src/build.rs`, `src/shadow.rs`, `src/incremental.rs`).
-- `ST_UpdatePyramid(where_clause)` cannot clean stale old locations for deletes or move-outs unless the clause still covers them. Prefer `ST_UpdatePyramidByExtent` or full rebuild for those cases.
-- Dynamic slicing is uncached; repeated `splitSize` or beyond-`maxZoom` reads can become live PostGIS workload (`src/dynamic.rs`).
-- Parallel builds use background workers and files under `$PGDATA/gp_tmp/` for jobs/status because workers cannot see coordinator-uncommitted state (`src/worker.rs`).
-- `tileSizeBudgetBytes` with `parallel > 1` is rejected by design (`src/build.rs`).
-
-## Change guidance
-
-- For SQL API or build-pipeline changes, run `cargo pgrx test` when possible and add `#[pg_test]` coverage in `src/lib.rs` for user-visible behavior.
-- For demo changes, run `python3 demo/test_server.py`; these tests avoid requiring a live database for parser/static/handler checks.
-- For performance changes, prefer adding a focused `bench/*.sql` script or extending an existing one, then summarize results in `docs/user-data-build-performance.md` rather than in the wiki.
+For API behavior, configuration, upgrade, and symptom-based troubleshooting,
+see the [usage guide](../usage.md).

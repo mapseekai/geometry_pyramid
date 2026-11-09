@@ -1,253 +1,488 @@
-# geometry_pyramid 中文说明
+# geometry_pyramid
 
-[English README](README.md)
+<p align="center">
+  <strong>基于 PostgreSQL / PostGIS 的高性能矢量瓦片金字塔扩展</strong>
+</p>
 
-`geometry_pyramid` 是一个 PostgreSQL 扩展，用于在 PostGIS geometry 表上构建
-**矢量瓦片金字塔**。它提供与阿里云
-[GanosBase `ganos_geometry_pyramid`][ganos] 接近的 SQL 使用界面，并基于
-[pgrx](https://github.com/pgcentralfoundation/pgrx) 构建。
+<p align="center">
+  <a href="README.md">English</a> •
+  <a href="README.zh-CN.md">简体中文</a> •
+  <a href="#-操作说明与最佳实践">操作说明</a> •
+  <a href="#-配置参数完全参考">配置参考</a> •
+  <a href="demo/README.zh-CN.md">本地演示</a>
+</p>
 
-## 当前状态
+<p align="center">
+  <img src="https://img.shields.io/badge/PostgreSQL-13%20|%2014%20|%2015%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
+  <img src="https://img.shields.io/badge/PostGIS-3.0+-green.svg" alt="PostGIS Support" />
+  <img src="https://img.shields.io/badge/Rust-pgrx%200.18.0-orange.svg" alt="pgrx Version" />
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License" />
+</p>
 
-`ST_BuildPyramid` 会通过 PostGIS 的 `ST_TileEnvelope`、`ST_AsMVTGeom` 和
-`ST_AsMVT` 生成 MVT 瓦片，并写入每个金字塔独立的存储表。全量重建在同一事务内替换瓦片行，保留正式表的 OID、读取授权和依赖视图。
+---
 
-已支持的主要能力：
+## 📖 目录
 
-- `parallel` 配置：使用 PostgreSQL background worker 并行构建 zoom。
-- `ST_Pyramid()`：返回配置、瓦片数量和逐 zoom 构建统计。
-- `ST_UpdatePyramid`：按 `where_clause` 做增量刷新；空条件表示完整重建。
-- `ST_UpdatePyramidByExtent`：按 bbox 重新切片，适合删除、移动、跨瓦片更新。
-- `ST_Tile`：`maxZoom` 内读取物化瓦片；超过 `maxZoom` 时可按需实时切片。
-- `splitSize`：低密度瓦片可延迟到请求时实时切片。
-- `buildRules`：按 zoom 配置 LOD 过滤、属性字段覆盖、确定性采样和点网格抽稀。
+- [💡 简介与核心价值](#-简介与核心价值)
+- [🏗️ 架构与切片机制](#️-架构与切片机制)
+- [⚡ 快速上手（5分钟）](#-快速上手5分钟)
+- [🛠️ 安装与构建](#️-安装与构建)
+- [📚 操作说明与最佳实践](#-操作说明与最佳实践)
+  - [1. 全量构建金字塔](#1-全量构建金字塔)
+  - [2. 瓦片读取与服务接入](#2-瓦片读取与服务接入)
+  - [3. 增量更新与局部空间刷新](#3-增量更新与局部空间刷新)
+  - [4. 按层级细节控制（LOD 与 buildRules）](#4-按层级细节控制lod-与-buildrules)
+  - [5. 超大数据集构建性能调优](#5-超大数据集构建性能调优)
+  - [6. 金字塔维护与生命周期管理](#6-金字塔维护与生命周期管理)
+  - [7. 数据库版本平滑升级（0.1.0 -> 0.1.1）](#7-数据库版本平滑升级010---011)
+- [⚙️ 配置参数完全参考](#️-配置参数完全参考)
+- [🖥️ 本地可视化与端到端验证](#️-本地可视化与端到端验证)
+- [❓ 常见问题与排障指南](#-常见问题与排障指南)
+- [🔒 安全与权限边界](#-安全与权限边界)
+- [📄 开源协议与贡献](#-开源协议与贡献)
 
-当前 roadmap 中仍保留 coalesce-densest。
+---
 
-## SQL 接口
+## 💡 简介与核心价值
 
-| 函数 | 用途 |
-|---|---|
-| `ST_BuildPyramid(table, geom, fid, config) -> bool` | 注册并构建一个金字塔。 |
-| `ST_UpdatePyramid(name, where_clause) -> bool` | 刷新与匹配行相交的瓦片；空条件表示完整重建。 |
-| `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid) -> bool` | 从当前源表重新切片 bbox 相交瓦片，可处理删除、移动和跨瓦片更新。 |
-| `ST_DropPyramid(name) -> bool` | 删除金字塔及其瓦片存储表。 |
-| `ST_Pyramid(name) -> jsonb` | 查看金字塔元数据和逐 zoom 构建统计。 |
-| `ST_Tile(name, z, x, y) -> bytea` | 获取 MVT 瓦片；空瓦片、不可用瓦片或未知金字塔返回 `NULL`。 |
-| `ST_Pyramids() -> SETOF (name, source_table, built_at, tile_count)` | 列出所有金字塔。 |
-| `geometry_pyramid_version() -> text` | 查看扩展版本。 |
+`geometry_pyramid` 是一个基于 [pgrx](https://github.com/pgcentralfoundation/pgrx) 构建的 PostgreSQL 原生扩展。它能够直接在 PostGIS 几何空间表上构建、持久化物化并按需动态切片 Mapbox Vector Tile (MVT / PBF) 金字塔。
 
-瓦片 envelope 使用 PostGIS 内置函数 `ST_TileEnvelope(z, x, y)`。
+其 SQL 使用接口启发自阿里云 GanosBase 的 `ganos_geometry_pyramid`。
 
-## 配置项
+### 为什么选择 geometry_pyramid？
 
-`ST_BuildPyramid` 的 `config` 参数是 JSON 文档；传入 `'{}'` 使用默认值。
+1. **物化存储与低延迟读取**：对于海量要素图层，实时对亿级数据进行 `ST_AsMVT` 往往导致数据库 CPU 满载并响应超时。`geometry_pyramid` 预先将各层级瓦片物化在专属存储表中，请求时直接走单行索引查询，返回纳秒至毫秒级的纯二进制 MVT。
+2. **动静结合的弹性切片（Hybrid Slicing）**：
+   - **稠密层物化**：对宏观大范围（如 0～14 级）进行预物化。
+   - **稀疏延迟生成（`splitSize`）**：对要素数量低于阈值的瓦片不预先物化，请求时自动回退为源表实时切片，节省高达 80% 的存储空间。
+   - **大比例尺动态穿透（`dynamicBeyondMaxZoom`）**：超过物化 `maxZoom`（如 15～20 级）的请求自动基于源表空间索引实时切片，无需将数据无限制物化至叶子层。
+3. **细粒度局部刷新，告别全量重跑**：
+   - 支持基于属性过滤（`ST_UpdatePyramid`）的增量刷新。
+   - 支持基于空间范围（`ST_UpdatePyramidByExtent`）的瓦片重切，完美解决要素**删除**、**位移**以及**跨瓦片变更**的脏瓦片清理问题。
+4. **精细化多级细节控制（LOD）**：提供类似 Tippecanoe 的逐级控制能力，包括 SQL 过滤、输出属性裁剪、确定性哈希抽样（Sample）以及基于屏幕像素桶的点网格聚类（Point Grid）。
+5. **极简运维与标准 SQL**：纯数据库内运行，无需引入外部切片中间件（如 tegola, tippecanoe），完全通过标准 SQL 驱动，天然适配数据库事务与备份生态。
 
-| Key | 默认值 | 说明 |
-|---|---|---|
-| `name` | 源表名 | 金字塔名称；允许同一源表构建多个金字塔。 |
-| `sourceSRS` | `4326` | 源 geometry 列的 SRID。 |
-| `tileSRS` | `3857` | 瓦片坐标系，目前仅支持 Web Mercator（`3857`），其他值会被拒绝。 |
-| `tileSize` | `4096` | MVT extent，必须大于 0。 |
-| `tileExtend` | `8` | 瓦片边缘 buffer，用于减少边界裁剪问题。 |
-| `minZoom` / `maxZoom` | `0` / `18` | 物化构建的 zoom 范围，含两端。Ganos 配置可用 `maxLevel` 代替 `maxZoom`，同时传入两者会报错。 |
-| `dynamicBeyondMaxZoom` | `true` | z > maxZoom 时从源表实时切片；设为 `false` 时严格返回 `NULL`。 |
-| `parallel` | `1` | 包含协调端的最大构建槽位数，上限为 32。扩展根据源数据和预计工作量决定是否启动后台 worker。 |
-| `preparedBuild` | `false` | 预先投影源几何。串行使用会话临时表，满足并行条件时使用受管的共享工作表。 |
-| `featureMajorPoints` | `false` | 纯 `POINT` 源的实验性稀疏路径；需要 `preparedBuild=true`、`parallel=1`、`tileSRS=3857`。 |
-| `featureMajorMinZoom` | `13` | `featureMajorPoints` 启用的最小 `maxZoom`；设为 `0` 表示符合条件就启用。 |
-| `featureDrivenEnum` | `false` | 从要素包围盒枚举候选瓦片。需要 `preparedBuild=true` 和 `tileSRS=3857`。构建器会估算稀疏格网的成本，也可在单进程构建少量瓦片时复用跨瓦片复杂几何的简化结果。 |
-| `attributes` | `[]` | 写入 MVT feature 的非几何字段。 |
-| `simplifyPixels` | `1.0` | 按瓦片像素计算的 DP 简化容差；`0` 表示关闭。 |
-| `minFeatureSizePixels` | `0.0` | 丢弃低于该像素大小的 polygon/line；`0` 表示关闭。 |
-| `dropRate` | `1.0` | tippecanoe 风格点保留率：`dropRate^(maxZoom - z)`；`1.0` 表示关闭。 |
-| `tileSizeBudgetBytes` | `0` | 单瓦片未压缩 MVT 的目标字节数。超出后收紧参数并重建该 zoom；用完重试仍超出时发出警告。`0` 表示关闭。 |
-| `maxTileSizeAttempts` | `5` | 追逐瓦片大小预算时，每个 zoom 的最大重试次数。 |
-| `buildTimeoutMs` | `0` | 每个并行 zoom 及共享源预处理的等待上限（毫秒）；`0` 表示不限时。超时或取消查询时，会先停止 worker 再返回。 |
-| `splitSize` | `0` | `0` 表示物化所有非空瓦片；大于 0 时，低于该要素数的瓦片延迟到请求时实时切片。 |
-| `buildRules` | `[]` | 按 zoom 的 LOD 规则，形如 `{minZoom, maxZoom, filter?, attrFields?, sample?, pointGrid?}`。 |
+---
 
-## 快速使用
+## 🏗️ 架构与切片机制
 
-### 1. 启用扩展
+```mermaid
+flowchart TD
+    subgraph Client ["客户端请求"]
+        Req["HTTP GET /tiles/{name}/{z}/{x}/{y}.pbf"]
+    end
 
-每个数据库执行一次：
+    subgraph DB ["PostgreSQL / geometry_pyramid"]
+        ST_Tile{"ST_Tile(name, z, x, y)"}
+        Meta[("元数据 Catalog<br/>geometry_pyramid_catalog")]
+        TileTable[("物化瓦片表<br/>_gp_tiles_{name}")]
+        LiveSlice["实时切片引擎<br/>(ST_TileEnvelope + ST_AsMVT)"]
+        SourceTable[("源业务空间表<br/>(GiST 空间索引)")]
+    end
+
+    Req --> ST_Tile
+    ST_Tile --> Meta
+    ST_Tile -->|z <= maxZoom 且命中物化| TileTable
+    TileTable -->|返回 MVT bytea| Req
+    ST_Tile -->|未命中 且 满足 splitSize / z > maxZoom| LiveSlice
+    LiveSlice --> SourceTable
+    LiveSlice -->|返回实时生成 MVT| Req
+```
+
+- **存储隔离**：每个金字塔均拥有内部统一管理的元数据，以及独立的物理存储表 `_gp_tiles_<name>`。全量重建在单一事务内以临时行替换，保证发布表 OID、访问权限和依赖视图零中断。
+- **投影体系**：瓦片输出严格遵循 Web Mercator（`EPSG:3857`），源数据支持 `EPSG:4326` 或任意有效 SRID（通过 `sourceSRS` 声明）。
+
+---
+
+## ⚡ 快速上手（5分钟）
+
+只需几行 SQL 即可创建并体验你的第一张矢量瓦片：
 
 ```sql
+-- 1. 启用扩展
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS geometry_pyramid;
-```
 
-### 2. 准备源表
-
-源表需要 geometry 列和稳定的要素 ID。EPSG:3857 和常规 EPSG:4326 数据可使用源几何的 GiST 索引。其他投影可为 `ST_Transform(geom,3857)` 建立表达式 GiST 索引，供原表构建、局部刷新和动态切片使用。
-
-```sql
-CREATE TABLE buildings (
-    gid  serial PRIMARY KEY,
+-- 2. 准备测试数据（以 EPSG:4326 点要素为例）
+CREATE TABLE gp_quickstart (
+    gid integer PRIMARY KEY,
     name text,
-    geom geometry(Polygon, 4326)
+    geom geometry(Point, 4326)
 );
 
-CREATE INDEX ON buildings USING gist (geom);
+INSERT INTO gp_quickstart VALUES 
+    (1, 'Central Point', ST_SetSRID(ST_MakePoint(116.4074, 39.9042), 4326)),
+    (2, 'Sub Point',     ST_SetSRID(ST_MakePoint(116.4174, 39.9142), 4326));
+
+-- 强烈建议在几何列上建立 GiST 空间索引
+CREATE INDEX gp_quickstart_geom_idx ON gp_quickstart USING gist (geom);
+
+-- 3. 构建金字塔（构建 0~5 级）
+SELECT ST_BuildPyramid(
+    'gp_quickstart',                      -- 源表名称
+    'geom',                               -- 几何字段名
+    'gid',                                -- 唯一要素主键名
+    '{"name": "gp_quickstart", "maxZoom": 5, "attributes": ["name"]}'
+);
+
+-- 4. 读取瓦片（检查 0 级根瓦片是否有内容）
+SELECT octet_length(ST_Tile('gp_quickstart', 0, 0, 0)) AS tile_bytes;
+
+-- 5. 查看金字塔统计信息
+SELECT ST_Pyramid('gp_quickstart');
+
+-- 6. 清理资源
+SELECT ST_DropPyramid('gp_quickstart');
+DROP TABLE gp_quickstart;
 ```
 
-### 3. 构建金字塔
+---
 
-`ST_BuildPyramid(table, geom, fid, config)` 的前三个参数分别是源表名、geometry
-列名和稳定要素 id 列名。
+## 🛠️ 安装与构建
+
+### 系统与依赖前置要求
+
+- **操作系统**：Linux (如 Ubuntu 20.04/22.04/24.04, RHEL/Rocky 8/9), macOS
+- **PostgreSQL**：13, 14, 15, 16, 17, 18（推荐并默认启用 17）
+- **PostGIS**：3.0 及以上版本
+- **编译工具链**：
+  - Rust 1.75+（通过 rustup 安装）
+  - `cargo-pgrx` 0.18.0（`cargo install --locked cargo-pgrx --version 0.18.0`）
+  - LLVM / Clang（pgrx 编译依赖）及对应 PG 的开发头文件（`libpq-dev`, `postgresql-server-dev-17` 等）
+
+### 方式一：开发调试模式（一键启动沙箱）
+
+适合本地开发或快速功能验证：
+
+```bash
+git clone https://github.com/mapseekai/geometry_pyramid.git
+cd geometry_pyramid
+
+# 初始化 pgrx 并绑定系统中的 pg_config（以 PG17 为例）
+cargo pgrx init --pg17 $(which pg_config)
+
+# 编译并启动测试 PostgreSQL 实例并自动进入 psql
+cargo pgrx run pg17
+```
+
+### 方式二：生产编译打包安装
+
+将编译好的扩展产物分发至已有生产实例：
+
+```bash
+# 1. 运行自动化单元与回归测试
+cargo pgrx test pg17
+
+# 2. 编译并输出标准化安装包
+cargo pgrx package --pg-config /usr/lib/postgresql/17/bin/pg_config --out-dir ./dist
+
+# 3. 将产物安装到 PostgreSQL 系统目录（需要 root / sudo 权限）
+sudo cp -r ./dist/* /
+```
+
+在数据库中验证安装版本：
+```sql
+CREATE EXTENSION geometry_pyramid;
+SELECT geometry_pyramid_version(); -- 返回 0.1.1
+```
+
+---
+
+## 📚 操作说明与最佳实践
+
+### 1. 全量构建金字塔
+
+调用 `ST_BuildPyramid` 创建金字塔。若对已存在的金字塔重新执行，扩展会在**独立事务中自动安全全量重建**：
 
 ```sql
 SELECT ST_BuildPyramid(
-    'buildings',
-    'geom',
-    'gid',
+    'osm_roads',                  -- 源表名（必须是裸标识符，不支持 schema 前缀）
+    'geom',                       -- 几何字段名
+    'id',                         -- 唯一主键字段名（强烈建议 bigint / integer）
     '{
-       "name":       "buildings",
-       "sourceSRS":  4326,
-       "tileSRS":    3857,
-       "minZoom":    0,
-       "maxZoom":    14,
-       "attributes": ["name"]
-     }'
+        "name": "osm_roads_pyr",
+        "sourceSRS": 4326,
+        "minZoom": 0,
+        "maxZoom": 14,
+        "attributes": ["name", "highway", "oneway"],
+        "tileSize": 4096,
+        "tileExtend": 64,
+        "parallel": 4,
+        "preparedBuild": true
+    }'
 );
 ```
 
-`sourceSRS` 必须与源表 geometry 的 SRID 一致。`attributes` 指定写入 MVT 的
-非几何字段。重复执行 `ST_BuildPyramid` 会原地重建同名金字塔。
+> **操作提示**：
+> - 空间数据导入或大量更新后，请先 `VACUUM ANALYZE <source_table>;` 再执行金字塔构建。
+> - 几何字段必须建有 **GiST 索引**（`CREATE INDEX ON osm_roads USING gist(geom);`）。
+> - 表名、字段名和金字塔名最长支持 45 字节 ASCII 字符。
 
-首次构建会绑定源表和输出表的数据库对象身份。显式事务、已有未提交写入、切换角色、RLS、视图、SQL 过滤、输出表触发器、DDL 命令开始或结束事件触发器和依赖会话设置的字段均在调用者连接中构建。普通已提交表在具备 SHARE 锁权限且工作量足够时可使用后台 worker，构建期间持有源表 SHARE 锁。遇到活跃写入或小任务则在本连接执行。物化结果反映构建者可见的数据，分别对外服务的租户应使用独立的金字塔名称与读取授权。
+---
 
-### 4. 获取瓦片
+### 2. 瓦片读取与服务接入
+
+通过 `ST_Tile(name, z, x, y)` 获取指定瓦片的 MVT 二进制数据（`bytea`）。
 
 ```sql
-SELECT ST_Tile('buildings', 14, 13488, 6210);
+-- 查询 z=12, x=3371, y=1551 的瓦片
+SELECT ST_Tile('osm_roads_pyr', 12, 3371, 1551);
 ```
 
-返回值是 MVT `bytea`。空瓦片、不可用瓦片或未知金字塔返回 `NULL`。
-`maxZoom` 以内的瓦片来自物化存储；当 `dynamicBeyondMaxZoom=true` 时，超过
-`maxZoom` 的请求会从源表实时切片。
+#### 返回值规范：
+- **`bytea`（二进制字节流）**：瓦片包含有效几何要素，直接返回 MVT 编码。
+- **`NULL`**：空瓦片、超出范围、层级低于 `minZoom` 或金字塔不存在。在 HTTP 服务层应转换为 `HTTP 204 No Content`。
 
-### 5. 查看状态
+#### 生产 HTTP 服务接入示例（Node.js / Express / pg）：
+
+```javascript
+app.get('/tiles/:name/:z/:x/:y.pbf', async (req, res) => {
+  const { name, z, x, y } = req.params;
+  try {
+    const query = 'SELECT ST_Tile($1, $2, $3, $4) AS mvt';
+    const result = await db.query(query, [name, parseInt(z), parseInt(x), parseInt(y)]);
+    const tile = result.rows[0]?.mvt;
+
+    if (!tile || tile.length === 0) {
+      return res.status(204).end();
+    }
+
+    res.setHeader('Content-Type', 'application/x-protobuf');
+    res.setHeader('Content-Encoding', 'gzip'); // 若外部配置压缩
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.status(200).send(tile);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+```
+
+---
+
+### 3. 增量更新与局部空间刷新
+
+当源数据发生变化时，无需每一次都全量重构金字塔，利用增量刷新可以在毫秒至秒级更新受影响瓦片。
+
+#### 场景 A：已知要素主键/属性发生修改（要素未发生大范围位移）
+使用 `ST_UpdatePyramid` 并传入合法的 SQL WHERE 条件：
 
 ```sql
-SELECT ST_Pyramid('buildings');
+-- 仅刷新指定 ID 对应要素所跨越的瓦片
+SELECT ST_UpdatePyramid('osm_roads_pyr', 'id IN (1001, 1002, 1003)');
+
+-- 刷新某行政区内的修改
+SELECT ST_UpdatePyramid('osm_roads_pyr', "city = 'Beijing'");
+
+-- 若传入空字符串 ''，则执行全量瓦片无缝重建
+SELECT ST_UpdatePyramid('osm_roads_pyr', '');
+```
+
+#### 场景 B：要素发生删除、位移或跨瓦片大范围变更（强烈推荐）
+当要素被 `DELETE` 时，源表中已不存在旧要素，单纯通过属性条件无法定位“旧位置”上的瓦片。此时使用 `ST_UpdatePyramidByExtent` 按空间包围盒精准重切：
+
+```sql
+-- 格式：ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid)
+-- 示例：刷新北京核心区（包含旧位置和新位置的 BBOX）
+SELECT ST_UpdatePyramidByExtent(
+    'osm_roads_pyr',
+    116.35, 39.85, 116.45, 39.95, 4326
+);
+```
+
+> **操作提示**：
+> - 几何发生位移（Move/Update geometry）时，BBOX 必须同时包络**变更前位置**与**变更后位置**。
+> - 空间刷新在独立事务中完成脏瓦片替换，刷新期间读请求平滑不阻塞。
+
+---
+
+### 4. 按层级细节控制（LOD 与 buildRules）
+
+在低缩放层级（如 0~6 级），若展示全部要素会导致单瓦片体积膨胀、浏览器卡顿。通过 `buildRules` 实现类似制图规则的精细化抽稀与过滤：
+
+```json
+{
+  "name": "poi_pyramid",
+  "minZoom": 0,
+  "maxZoom": 16,
+  "attributes": ["name", "category", "rating"],
+  "buildRules": [
+    {
+      "minZoom": 0,
+      "maxZoom": 5,
+      "filter": "rating >= 4.8",
+      "attrFields": ["name"],
+      "sample": { "rate": 20, "key": ["gid"] }
+    },
+    {
+      "minZoom": 6,
+      "maxZoom": 10,
+      "filter": "rating >= 4.0",
+      "pointGrid": { "cellPixels": 64, "keepField": "is_landmark" }
+    }
+  ]
+}
+```
+
+- **`filter`**：针对源字段的 SQL 过滤条件表达式（仅限受信任管理员配置）。
+- **`attrFields`**：按层级动态裁剪 MVT 携带的属性字段，有效缩减低级别瓦片尺寸。
+- **`sample`**：确定性哈希抽样（0~100 百分比）。基于 `key` 字段进行确定性哈希，确保同一要素在不同缩放层级显示具有连贯性，避免缩放抖动。
+- **`pointGrid`**：屏幕像素网格聚合。在每个 `cellPixels`（如 64x64 像素）网格内仅保留优先级最高的点，若存在 `keepField` 标记为 true 的关键要素，则优先保留。
+
+---
+
+### 5. 超大数据集构建性能调优
+
+针对数千万至数亿级空间数据，推荐启用以下组合配置以获得最佳构建吞吐：
+
+```json
+{
+  "name": "large_scale_layer",
+  "minZoom": 0,
+  "maxZoom": 14,
+  "parallel": 8,
+  "preparedBuild": true,
+  "splitSize": 100,
+  "featureDrivenEnum": true,
+  "simplifyPixels": 1.0,
+  "minFeatureSizePixels": 0.5
+}
+```
+
+1. **`parallel: 4 ~ 16`**：启用 PostgreSQL 后台 Worker 进行并发分层切片，充分利用多核 CPU。
+2. **`preparedBuild: true`**：构建开始前预先将源数据按 Web Mercator（3857）转换并投影物化，避免每一层每个瓦片重复进行昂贵的高斯/墨卡托坐标投影换算。
+3. **`splitSize: 50 ~ 200`**：稀疏延迟切片门槛。对于野外、沙漠等要素密度极低的边缘瓦片，不进行物理写入，由前端命中时走实时切片，大幅减少存储占用与 I/O 开销。
+4. **`featureDrivenEnum: true`**：直接由要素空间包围盒枚举命中的有效瓦片网格，而非遍历整网格空间做相交检测，对空间分布不均匀的数据集提速尤为显著。
+
+---
+
+### 6. 金字塔维护与生命周期管理
+
+#### 巡检已注册金字塔
+```sql
+-- 列出当前库内所有已构建金字塔元数据
 SELECT * FROM ST_Pyramids();
+
+-- 查看单个金字塔的详细配置、逐层瓦片统计、存储字节数与构建耗时
+SELECT jsonb_pretty(ST_Pyramid('osm_roads_pyr'));
 ```
 
-`ST_Pyramid` 返回 `jsonb`，包含配置、总瓦片数和逐 zoom 构建统计。
-
-### 6. 更新源数据后刷新
-
-按条件刷新：
-
+#### 销毁金字塔与回收存储
 ```sql
-SELECT ST_UpdatePyramid('buildings', 'name = ''City Hall''');
+-- 彻底删除指定金字塔及其内部物化瓦片表 _gp_tiles_{name}
+SELECT ST_DropPyramid('osm_roads_pyr');
 ```
 
-完整重建：
+> **注意事项**：
+> - 在对源业务表执行 `DROP TABLE` 前，**务必先调用 `ST_DropPyramid`** 清理金字塔关系。
 
-```sql
-SELECT ST_UpdatePyramid('buildings', '');
-```
+---
 
-按范围刷新：
+### 7. 数据库版本平滑升级（0.1.0 -> 0.1.1）
 
-```sql
-SELECT ST_UpdatePyramidByExtent('buildings', 116.30, 39.90, 116.42, 39.99, 4326);
-```
-
-`ST_UpdatePyramid(name, where_clause)` 只重建与匹配行相交的瓦片。如果要处理
-删除、移动或需要覆盖旧位置的更新，优先使用 `ST_UpdatePyramidByExtent`，它会
-从当前源表重新切片整个 bbox 区域。
-
-### 7. 删除金字塔
-
-```sql
-SELECT ST_DropPyramid('buildings');
-```
-
-## 从 0.1.0 升级
-
-安装 0.1.1 包后，在同一事务里升级扩展并绑定每个已有金字塔的源表和瓦片表。旧目录只存裸表名，需要维护者确认实际 schema。以下以 `buildings` 为例。
+从 `0.1.0` 升级至 `0.1.1` 时，扩展增强了元数据中对源表与存储表的物理关系对象绑定（`regclass`），避免跨 schema 或 `search_path` 污染风险。请在维护窗口内按事务执行：
 
 ```sql
 BEGIN;
+
+-- 1. 更新扩展定义
 ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.1';
+
+-- 2. 补齐物理对象绑定（将 schema 与表名替换为实际值）
 UPDATE public.geometry_pyramid_catalog
-SET source_rel = 'data.buildings'::regclass,
-    storage_rel = 'tiles._gp_tiles_buildings'::regclass
-WHERE pyramid_name = 'buildings';
--- 对每个已核实的金字塔重复以上 UPDATE。
-DO $$ BEGIN
-    IF EXISTS (SELECT FROM public.geometry_pyramid_catalog
-               WHERE source_rel IS NULL OR storage_rel IS NULL) THEN
-        RAISE EXCEPTION 'unbound pyramids remain';
+SET source_rel = 'public.osm_roads'::regclass,
+    storage_rel = 'public._gp_tiles_osm_roads_pyr'::regclass
+WHERE pyramid_name = 'osm_roads_pyr';
+
+-- 3. 安全断言校验（确保无遗漏孤儿记录）
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM public.geometry_pyramid_catalog 
+        WHERE source_rel IS NULL OR storage_rel IS NULL
+    ) THEN
+        RAISE EXCEPTION '升级失败：存在未完成物理关系绑定的金字塔，已自动回滚';
     END IF;
 END $$;
+
 COMMIT;
 ```
 
-使用字节预算的旧金字塔可先全量刷新一次，记录各层最终生效的抽稀与简化参数。对曾经重试过的旧层，动态读取延迟生成的瓦片时会提示先刷新。局部刷新会复用这些参数并补齐统计。缺少旧参数、刷新后重新超出预算，或更新范围使用非线性投影、跨越日期变更线时，会在本连接全量重建。
+---
 
-## 使用注意
+## ⚙️ 配置参数完全参考
 
-金字塔名、表名和列名限制为 **45 个字符**，以确保派生表名不会超过
-PostgreSQL 的 63 字节标识符限制。
+调用 `ST_BuildPyramid(table, geom, fid, config_json)` 时，`config_json` 支持如下参数：
 
-每个金字塔的瓦片存储在 `_gp_tiles_<name>` 表中，字段包括：
-`id bigserial, z smallint, x integer, y integer, format text, srid integer,
-mvt bytea`，主键为 `(z, x, y)`。`format` 当前固定为 `'pbf'`，`srid` 是瓦片
-坐标系。业务可以直接读取该表；`ST_Tile` 只返回 `mvt` 列。
+| 参数名 | 类型 | 默认值 | 取值范围 | 说明 |
+|---|---|---:|---|---|
+| `name` | string | 源表名 | ≤45 ASCII 字符 | 金字塔唯一标识及物理存储表命名后缀 |
+| `sourceSRS` | integer | `4326` | 任意有效 EPSG | 源几何坐标系 SRID，需与源表实际定义一致 |
+| `tileSRS` | integer | `3857` | 仅 `3857` | 目标瓦片坐标系，当前仅支持 Web Mercator |
+| `minZoom` | integer | `0` | 0 ~ 24 | 金字塔物化起始层级（包含） |
+| `maxZoom` | integer | `18` | 0 ~ 24 | 金字塔物化终止层级（包含）；别名 `maxLevel` |
+| `tileSize` | integer | `4096` | 1 ~ 16384 | MVT 内部矢量坐标网格大小（Extent） |
+| `tileExtend` | integer | `8` | 0 ~ tileSize | 瓦片四周外扩 Buffer 像素大小，防止切片接缝处图标与注记被裁剪 |
+| `attributes` | string[] | `[]` | 数组 | 写入 MVT Feature 属性表的源表字段名列表 |
+| `dynamicBeyondMaxZoom` | boolean | `true` | true / false | 请求层级超出 `maxZoom` 时是否允许实时切片兜底 |
+| `splitSize` | integer | `0` | ≥ 0 | 稀疏瓦片延迟切片阈值。0 表示物化所有非空瓦片；>0 时要素数低于该值的瓦片改为请求时实时生成 |
+| `parallel` | integer | `1` | 0 ~ 32 | 构建并发度。1 为单进程串行；0 为系统自动判定；>1 启动后台 Worker 并发构建 |
+| `preparedBuild` | boolean | `false` | true / false | 切片前是否预先投影并物化源数据，推荐大数据集开启 |
+| `featureDrivenEnum` | boolean | `false` | true / false | 是否启用基于要素包围盒的瓦片网格枚举（需 `preparedBuild: true`） |
+| `featureMajorPoints` | boolean | `false` | true / false | 针对海量纯 POINT 图层的稀疏按要素切片路径 |
+| `simplifyPixels` | float | `1.0` | ≥ 0.0 | 几何抽稀容差像素值。0 表示关闭简化 |
+| `minFeatureSizePixels`| float | `0.0` | ≥ 0.0 | 过滤过小线段与微小多边形的像素阈值 |
+| `dropRate` | float | `1.0` | 0.0 ~ 1.0 | 基础点抽稀保留率（1.0 为保留 100%） |
+| `tileSizeBudgetBytes` | integer | `0` | ≥ 0 | 单瓦片未压缩体积预算上限（字节），超出时触发自适应抽稀重试（不可与 `parallel > 1` 共用） |
+| `buildRules` | object[]| `[]` | 规则数组 | 逐层级精细化过滤、采样与网格控制规则（见操作说明第4节） |
 
-`splitSize=0` 是默认值，会物化 `maxZoom` 内所有非空瓦片。对有几何 GiST 索引、无行级策略的稀疏 EPSG:3857 或 EPSG:4326 普通表，构建可跳过没有候选要素的区域。
-如果设置 `splitSize > 0`，逐瓦片构建会在普通无行级策略的源表或已准备的数据上检查带缓冲的候选要素数量，低于阈值的区域直接跳过裁剪。最终是否物化取决于裁剪和 LOD 处理后实际写入的要素数。物化表内未命中的瓦片会在每次请求时从源表切片。
+---
 
-`buildRules.filter` 是原始 SQL 布尔表达式，会以 `ST_BuildPyramid` 调用者的
-权限执行，定位类似受信任管理员编写的视图定义。扩展会拒绝语句分隔符 `;`，
-但这只是防御性检查，不等同于完整 SQL 表达式沙箱。
+## 🖥️ 本地可视化与端到端验证
 
-粗层密集点可在 `buildRules` 加入 `{"minZoom":0,"maxZoom":5,"pointGrid":{"cellPixels":64,"keepField":"important"}}`。
-`cellPixels` 使用 MVT 瓦片坐标单位，范围为 1 到 `tileSize`。在过滤和裁剪后，每个有点的网格保留 ID 最小的点；若格内有可选布尔字段 `keepField` 标记的点，则保留该格所有标记点。请使用稳定且唯一的要素 ID。多点、线和面不受网格影响。启用网格的层在构建、刷新和按需读取时使用同一逐瓦片处理，其他层仍可按要素枚举。
-
-## 构建和测试
+仓库内置了基于 Python 与 MapLibre GL 的轻量端到端预览环境（位于 `demo/` 目录）：
 
 ```bash
-cargo check
+# 1. 运行 pgrx 环境
 cargo pgrx run pg17
-cargo pgrx test
-cargo pgrx package
+
+# 2. 在另一个终端执行 demo 数据注入（自动构建点数据集与金字塔）
+export DATABASE_URL="host=localhost port=28817 dbname=geometry_pyramid"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f demo/seed.sql
+
+# 3. 启动本地瓦片服务
+python3 -m venv .venv && source .venv/bin/activate
+pip install "psycopg[binary]"
+python3 demo/server.py
+
+# 4. 浏览器访问验收
+open http://127.0.0.1:8989
 ```
 
-**Verify and release** 工作流在 PR 或手动触发时构建 Ubuntu 24.04 PG17 安装包，验证全新安装和从 `v0.1.0` 源码标签构建的旧版升级，并附上通过验证的包。发布标签在验证通过后上传同一个包。
+详细操作说明与前后端联调可直接查阅：[本地演示操作说明 (demo/README.zh-CN.md)](demo/README.zh-CN.md)。
 
-进入 psql 后：
+---
 
-```sql
-CREATE EXTENSION postgis;
-CREATE EXTENSION geometry_pyramid;
-SELECT ST_BuildPyramid('buildings', 'geom', 'gid', '{"maxZoom":14}');
-SELECT ST_Pyramid('buildings');
-```
+## ❓ 常见问题与排障指南
 
-## Roadmap
+| 常见症状 | 根本原因分析 | 推荐解决方案 |
+|---|---|---|
+| `CREATE EXTENSION` 提示找不到库文件 | 编译架构或 PG 主版本不匹配 | 检查 `pg_config` 路径，确保使用与目标 PostgreSQL 主版本一致的环境重新 `cargo pgrx package` 并安装。 |
+| 构建提示 `identifier is too long or contains invalid characters` | 名称超过 45 字节或含非法字符 | 检查表名、几何列名或金字塔名称，仅允许使用 ASCII 字母、数字和下划线，暂不支持带 schema 的源表名。 |
+| `ST_Tile` 始终返回 `NULL` | 瓦片为空、未物化且未开启实时切片 | 1. 检查坐标范围是否与实际数据重叠；<br/>2. 确认请求 zoom 是否在 `[minZoom, maxZoom]` 内；<br/>3. 若 z > maxZoom，确认是否未设置 `dynamicBeyondMaxZoom: false`。 |
+| 数据更新/删除后地图上仍存在旧瓦片 | 瓦片未被刷新或仅按未匹配的属性条件刷新 | 对涉及变动的空间矩形范围执行 `ST_UpdatePyramidByExtent(name, xmin, ymin, xmax, ymax, srid)`，确保包含旧要素位置。 |
+| 并行构建报错 `tileSizeBudgetBytes cannot be used with parallel > 1` | 机制约束 | 字节预算迭代机制要求确定性重试，请将 `parallel` 设为 `1` 或将 `tileSizeBudgetBytes` 设为 `0`。 |
+| 实时动态切片查询较慢 | 源表缺少空间索引或并发压力大 | 1. 确保源表创建了 `GIST(geom)` 索引；<br/>2. 调大 `maxZoom` 预物化更多层级；<br/>3. 设置 `splitSize: 0` 减少延迟切片。 |
 
-1. ~~Bootstrap：元数据 catalog、SQL 接口、配置解析。~~ ✅
-2. ~~Tile codec：通过 PostGIS `ST_AsMVTGeom` / `ST_AsMVT` 输出 MVT。~~ ✅
-3. ~~Build pipeline：按 zoom 写入每个金字塔的瓦片存储表。~~ ✅
-4. ~~Catalog views：`ST_Pyramids()`。~~ ✅
-5. ~~Tippecanoe 风格策略：逐 zoom 简化、最小要素尺寸、点抽稀。~~ ✅
-6. ~~Tile-size budget：类似 `--drop-densest-as-needed` 的几何收紧重试。~~ ✅
-7. **Coalesce-densest**：低 zoom 合并相邻小面（`ST_Union` / `ST_Buffer(0)`）。
-8. ~~Parallelism：支持 `parallel` 配置，使用 PostgreSQL background worker。~~ ✅
-9. ~~Incremental updates：`ST_UpdatePyramid(name, where_clause)` 增量刷新。~~ ✅
-10. ~~Statistics：`ST_Pyramid()` 输出逐 zoom 行数、字节数和构建耗时。~~ ✅
-11. ~~On-demand slicing beyond maxZoom：超过 `maxZoom` 时按需实时切片。~~ ✅
-12. ~~splitSize：低密度瓦片延迟到请求时实时切片。~~ ✅
-13. ~~buildRules：逐级 LOD 过滤、属性字段覆盖和采样。~~ ✅
+---
 
-[ganos]: https://www.alibabacloud.com/help/en/polardb/polardb-for-postgresql/vector-pyramid
+## 🔒 安全与权限边界
 
-## License
+1. **SQL 注入防范**：`buildRules[].filter` 与 `ST_UpdatePyramid(name, where_clause)` 会直接在数据库内核中以当前调用者的数据库角色权限拼装执行。**严禁直接将前端用户输入的未经脱敏的原始文本传入上述参数**，必须仅作为后台受信任管理员配置。
+2. **对象标识符安全**：源表名、列名和金字塔名会被严格校验为合法的 ASCII 裸标识符，有效阻断通过表名注入的风险。
 
-MIT（见 `LICENSE`）。
+---
+
+## 📄 开源协议与贡献
+
+- **开源许可**：本项目基于 [MIT License](LICENSE) 许可协议开放开源。
+- **问题反馈与贡献**：欢迎提交 Issue、功能建议与 Pull Request 至 [GitHub 仓库](https://github.com/mapseekai/geometry_pyramid)。

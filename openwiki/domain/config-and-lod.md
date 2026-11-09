@@ -28,7 +28,7 @@ Validation enforces `minZoom <= maxZoom`, `maxZoom <= 24`, `0 < tileSize <= 1638
 }
 ```
 
-Semantics from `README.md`, `src/config.rs`, and `src/build.rs`:
+Semantics from `../usage.md`, `src/config.rs`, and `src/build.rs`:
 
 - A rule covers the inclusive zoom band `[minZoom, maxZoom]`.
 - `filter` is a raw SQL boolean expression evaluated against source columns.
@@ -37,7 +37,7 @@ Semantics from `README.md`, `src/config.rs`, and `src/build.rs`:
 - Multiple rules covering the same zoom are combined by AND for filtering/sampling. If multiple covering rules set `attrFields`, they must agree for that zoom.
 - Zooms not covered by any rule use all source features and the global `attributes` list.
 
-The extension intentionally does **not** implement a second Ganos-native `level` / `value` rule shape. Historical Ganos comparison docs may mention missing LOD features; prefer current `README.md` and `src/config.rs` when they conflict.
+The extension intentionally does **not** implement a second Ganos-native `level` / `value` rule shape. Historical Ganos comparison docs may mention missing LOD features; prefer the current [usage guide](../usage.md) and `src/config.rs` when they conflict.
 
 ## Where LOD rules apply
 
