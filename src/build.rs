@@ -1032,6 +1032,19 @@ pub(crate) fn effective_attributes_for_zoom(cfg: &PyramidConfig, z: u8) -> &[Str
     cfg.attributes.as_slice()
 }
 
+fn is_projectable_attribute(col: &str) -> bool {
+    let valid = !col.is_empty() && col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // The standalone Rust test executable has no PostgreSQL backend to emit a notice.
+    #[cfg(not(test))]
+    if !valid {
+        notice!(
+            "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
+            col
+        );
+    }
+    valid
+}
+
 fn append_attribute_projection(
     inner: &mut String,
     outer: &mut String,
@@ -1039,11 +1052,7 @@ fn append_attribute_projection(
     outer_alias: &str,
     col: &str,
 ) {
-    if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        notice!(
-            "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
-            col
-        );
+    if !is_projectable_attribute(col) {
         return;
     }
     write!(inner, r#", {inner_alias}."{col}" AS "{col}""#).expect("write to String");
@@ -1083,11 +1092,7 @@ pub(crate) fn prepared_attribute_projections(cfg: &PyramidConfig, src_alias: &st
 
     let mut s = String::new();
     for col in cols {
-        if col.is_empty() || !col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            notice!(
-                "geometry_pyramid: attribute column {:?} is empty or has invalid characters; skipped",
-                col
-            );
+        if !is_projectable_attribute(col) {
             continue;
         }
         write!(&mut s, r#", {src_alias}."{col}" AS "{col}""#).expect("write to String");
@@ -1884,7 +1889,7 @@ mod tests {
     #[test]
     fn attribute_projections_can_target_aliases() {
         let cfg = PyramidConfig {
-            attributes: vec!["kind".into()],
+            attributes: vec!["kind".into(), "".into(), "invalid-name".into()],
             ..Default::default()
         };
 
@@ -2137,13 +2142,12 @@ mod tests {
     #[test]
     fn prepared_attribute_projection_includes_global_and_rule_attrs() {
         let cfg = PyramidConfig::parse(
-            r#"{"attributes":["detail"],
+            r#"{"attributes":["detail","","invalid-name"],
                 "buildRules":[{"minZoom":0,"maxZoom":4,"attrFields":["kind"]}]}"#,
         )
         .unwrap();
         let inner = prepared_attribute_projections(&cfg, "src");
-        assert!(inner.contains(r#"src."detail" AS "detail""#));
-        assert!(inner.contains(r#"src."kind" AS "kind""#));
+        assert_eq!(inner, r#", src."detail" AS "detail", src."kind" AS "kind""#);
     }
 
     #[test]
