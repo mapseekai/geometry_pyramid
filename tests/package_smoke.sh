@@ -13,7 +13,8 @@ libdir=$("$pg_config" --pkglibdir)
 extdir=$("$pg_config" --sharedir)/extension
 test_dir=$(dirname "${BASH_SOURCE[0]}")
 suffix=so
-if [[ $(uname -s) == Darwin ]]; then
+pg_major=$("$pg_config" --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')
+if [[ $(uname -s) == Darwin ]] && (( pg_major >= 16 )); then
     suffix=dylib
 fi
 

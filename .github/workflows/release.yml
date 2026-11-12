@@ -3,140 +3,204 @@ name: Verify and release
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Build all platforms or one platform/architecture
+        type: choice
+        default: all
+        options:
+          - all
+          - ubuntu-24.04-x86_64
+          - ubuntu-24.04-aarch64
+          - macos-15-x86_64
+          - macos-15-aarch64
+          - windows-2022-x86_64
+      postgres:
+        description: PostgreSQL major version (all builds 13 through 18)
+        type: choice
+        default: all
+        options: [all, '13', '14', '15', '16', '17', '18']
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: read
 
 concurrency:
   group: package-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  verify:
-    name: Package PostgreSQL 17 extension
+  plan:
+    name: Validate packaging and select targets
     runs-on: ubuntu-24.04
-    env:
-      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      archive: ${{ steps.archive.outputs.archive }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      version: ${{ steps.matrix.outputs.version }}
+      tag: ${{ steps.matrix.outputs.tag }}
+      pgrx: ${{ steps.matrix.outputs.pgrx }}
+      count: ${{ steps.matrix.outputs.count }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Check packaging scripts
+        run: python -m unittest discover -s tests -p 'test_packaging_*.py' -v
+      - name: Select and validate the build matrix
+        id: matrix
+        env:
+          GP_PLATFORM_FILTER: ${{ inputs.platform || 'all' }}
+          GP_POSTGRES_FILTER: ${{ inputs.postgres || 'all' }}
+        run: python scripts/ci/matrix.py
 
+  verify:
+    name: PG${{ matrix.pg }} / ${{ matrix.platform }} / ${{ matrix.arch }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      GP_PG_MAJOR: ${{ matrix.pg }}
+      GP_PLATFORM: ${{ matrix.platform }}
+      GP_ARCH: ${{ matrix.arch }}
+      PGRX_VERSION: ${{ needs.plan.outputs.pgrx }}
+      RUST_BACKTRACE: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
     steps:
       - name: Check out the candidate
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
       - name: Check out the v0.1.0 upgrade baseline
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: 846e1a420567d3cec8ae5b61d2f7bc5df14c3e41 # v0.1.0
           path: upgrade-baseline
           persist-credentials: false
-
-      - name: Install the stable Rust toolchain
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-
-      - name: Determine the package version and check release tags
-        id: version
-        env:
-          TAG: ${{ github.ref_name }}
-          IS_RELEASE: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+      - name: Install Linux compiler dependencies
+        if: runner.os == 'Linux'
         run: |
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "geometry_pyramid") | .version')"
-          expected_tag="v${cargo_version}"
-
-          if [ "${IS_RELEASE}" = "true" ] && [ "${TAG}" != "${expected_tag}" ]; then
-            echo "Tag ${TAG} does not match Cargo.toml version ${cargo_version}; expected ${expected_tag}." >&2
-            exit 1
-          fi
-
-          printf 'tag=%s\n' "${expected_tag}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install PostgreSQL 17 development files
-        run: |
-          sudo install -d -m 0755 /etc/apt/keyrings
-          curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /tmp/postgresql.asc
-          sudo gpg --dearmor --yes --output /etc/apt/keyrings/postgresql.gpg /tmp/postgresql.asc
-          printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update
-          sudo apt-get install --yes postgresql-17 postgresql-server-dev-17 postgresql-17-postgis-3
-
-      - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx --version 0.18.0
-
-      - name: Initialize cargo-pgrx for PostgreSQL 17
-        run: cargo pgrx init --pg17 "${PG_CONFIG}"
-
-      - name: Run Rust and PostGIS regressions
+          sudo apt-get install --yes build-essential clang libclang-dev llvm-dev libssl-dev pkg-config
+      - name: Locate Windows libclang
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          sudo chown "$(id -u)" "$("${PG_CONFIG}" --pkglibdir)" "$("${PG_CONFIG}" --sharedir)/extension"
-          cargo pgrx test pg17
-
-      - name: Build the PostgreSQL 17 package
-        run: cargo pgrx package --pg-config "${PG_CONFIG}" --out-dir package
-
-      - name: Build the v0.1.0 package
-        working-directory: upgrade-baseline
-        run: cargo pgrx package --pg-config "${PG_CONFIG}" --out-dir "${GITHUB_WORKSPACE}/legacy-package"
-
-      - name: Verify the candidate package on fresh and upgraded databases
-        run: bash tests/package_smoke.sh package legacy-package
-
-      - name: Create a release archive and checksum
-        id: archive
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
+          $clang = 'C:\Program Files\LLVM\bin'
+          if (!(Test-Path (Join-Path $clang 'libclang.dll'))) { throw 'libclang.dll is required' }
+          "LIBCLANG_PATH=$clang" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Cache cargo-pgrx and crate downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: pgrx-${{ needs.plan.outputs.pgrx }}-${{ matrix.platform }}-${{ matrix.arch }}-v1
+      - name: Install matching cargo-pgrx
+        shell: bash
         run: |
-          mkdir -p dist
-          archive="geometry_pyramid-${TAG}-pg17-ubuntu-24.04-x86_64.tar.gz"
-          tar --directory package --create --gzip --file "dist/${archive}" .
-          (
-            cd dist
-            sha256sum "${archive}" > "${archive}.sha256"
-          )
-          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
-
-      - name: Upload the verified archive
+          if ! cargo pgrx --version 2>/dev/null | grep -Fxq "cargo-pgrx ${PGRX_VERSION}"; then
+            cargo install --locked cargo-pgrx --version "${PGRX_VERSION}" --force
+          fi
+      - name: Set up PostgreSQL and PostGIS (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/ci/setup-postgres.sh
+      - name: Set up PostgreSQL and PostGIS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/setup-postgres.ps1
+      - name: Test, package and verify installation and upgrade
+        run: python scripts/ci/build.py
+      - name: Upload the verified package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: geometry-pyramid-pg17
+          name: geometry-pyramid-pg${{ matrix.pg }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 14
+
+  assemble:
+    name: Verify the complete artifact set
+    needs: [plan, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Download all verified packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: geometry-pyramid-pg*
+          path: dist
+          merge-multiple: true
+      - name: Check completeness and checksums
+        env:
+          GP_EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+          GP_EXTENSION_VERSION: ${{ needs.plan.outputs.version }}
+          GP_EXPECTED_COMMIT: ${{ github.sha }}
+        run: python scripts/ci/verify-release.py --directory dist
+      - name: Upload the release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: geometry-pyramid-release-set
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
   publish:
+    name: Publish verified release assets
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: verify
+    needs: [plan, assemble]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download the verified archive
+      - name: Download the complete release set
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: geometry-pyramid-pg17
+          name: geometry-pyramid-release-set
           path: dist
-
-      - name: Create or update the GitHub Release
+      - name: Publish release assets
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.verify.outputs.tag }}
-          ARCHIVE: ${{ needs.verify.outputs.archive }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          checksum="${ARCHIVE}.sha256"
-          sha256sum --check "${checksum}"
+          sha256sum --check SHA256SUMS
+          mapfile -t assets < <(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for artifact in json.loads(Path('release-manifest.json').read_text())['artifacts']:
+              print(artifact['file'])
+              print(artifact['file'] + '.sha256')
+          PY
+          )
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" "${ARCHIVE}" "${checksum}" --clobber
+            gh release upload "${TAG}" "${assets[@]}" release-manifest.json SHA256SUMS --clobber
           else
-            gh release create "${TAG}" --verify-tag --title "geometry_pyramid ${TAG}" --generate-notes "${ARCHIVE}" "${checksum}"
+            gh release create "${TAG}" --verify-tag --title "geometry_pyramid ${TAG}" --generate-notes "${assets[@]}" release-manifest.json SHA256SUMS
           fi

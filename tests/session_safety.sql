@@ -1,4 +1,4 @@
--- Run with psql -X -v ON_ERROR_STOP=1 in a disposable, trust-authenticated PG17
+-- Run with psql -X -v ON_ERROR_STOP=1 in a disposable, trust-authenticated PostgreSQL
 -- database with the extension installed. These tests require real connections.
 SELECT current_user AS admin \gset
 CREATE ROLE gp_gate_login LOGIN;
