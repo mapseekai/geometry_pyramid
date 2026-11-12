@@ -7,6 +7,7 @@ Database data is created in a separate temporary cluster and removed afterwards.
 """
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -17,9 +18,31 @@ import socket
 import subprocess
 import tarfile
 import tempfile
+import uuid
 import zipfile
 
 TESTS = Path(__file__).resolve().parent
+
+
+@contextmanager
+def cluster_directory():
+    if os.name == "nt":
+        # tempfile.mkdtemp uses mode 0700, which recent CPython versions map
+        # to a protected Windows DACL. PostgreSQL initdb deliberately drops
+        # administrator SIDs, so that child cannot traverse the private DACL.
+        # A new directory in the runner-owned temp area inherits its normal
+        # ACL; keep PostgreSQL's restricted-token behavior unchanged.
+        parent = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+        directory = parent / f"gp-smoke-{uuid.uuid4().hex}"
+        directory.mkdir(mode=0o755)
+        try:
+            yield directory
+        finally:
+            shutil.rmtree(directory)
+    else:
+        # A short socket path also fits macOS's 104-byte Unix socket limit.
+        with tempfile.TemporaryDirectory(prefix="gp-smoke-", dir="/tmp") as directory:
+            yield Path(directory)
 
 
 def command(args, env=None):
@@ -99,9 +122,7 @@ def main():
     executable_suffix = ".exe" if windows else ""
     executable = lambda name: bindir / (name + executable_suffix)
     suffix = ".dll" if windows else (".dylib" if os.uname().sysname == "Darwin" and major >= 16 else ".so")
-    # A short Unix socket path also works within macOS's 104-byte limit.
-    with tempfile.TemporaryDirectory(prefix="gp-smoke-", dir=None if windows else "/tmp") as temporary:
-        cluster = Path(temporary)
+    with cluster_directory() as cluster:
         bundle_dir = cluster / "bundle"
         bundle_dir.mkdir()
         bundle = unpack(args.archive.resolve(), bundle_dir)

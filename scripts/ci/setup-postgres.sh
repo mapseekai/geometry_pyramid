@@ -66,7 +66,7 @@ setup_macos() {
     # Homebrew's postgis formula targets selected PostgreSQL majors. Build the
     # same PostGIS release against pgrx's selected PG13-PG18 installation instead.
     local formula prefix pkg_paths= include_flags= library_flags=
-    local pg_root postgis_work source_archive jobs
+    local pg_root postgis_work source_archive
     local postgis_version=3.6.4
     # OSGeo source checksum recorded by Homebrew/homebrew-core commit
     # 2569dfb36eb87666972474bbf5054aa5742f683a, Formula/p/postgis.rb.
@@ -108,7 +108,6 @@ setup_macos() {
         --output "$source_archive"
     printf '%s  %s\n' "$postgis_sha256" "$source_archive" | shasum -a 256 --check
     tar -xzf "$source_archive" -C "$postgis_work"
-    jobs=$(sysctl -n hw.ncpu)
     (
         cd "$postgis_work/postgis-$postgis_version"
         # The same prefix as PostgreSQL also gives Darwin's bundle loader the
@@ -127,7 +126,9 @@ setup_macos() {
             echo "PostGIS was configured without the protobuf-c support required for MVT." >&2
             exit 1
         fi
-        make -j "$jobs"
+        # PostGIS's recursive SQL-generation targets share temporary filenames.
+        # Serialize the top-level build to avoid competing writers/deletions.
+        make -j1
         make install
     )
     rm -rf -- "$postgis_work"
