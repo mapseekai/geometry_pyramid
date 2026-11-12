@@ -140,15 +140,22 @@ DROP TABLE gp_quickstart;
 
 ## 🛠️ 安装与构建
 
+发布工作流为 PostgreSQL **13–18** 提供 **30 个原生构建组合**：Ubuntu 24.04
+（x86_64 / ARM64）、macOS 15（Intel / Apple Silicon）和 Windows Server 2022
+（x86_64）。每个作业验证安装包、首次启用和从 0.1.0 升级，再汇总发布产物。
+构建矩阵、手动筛选、包名和通过目标 `pg_config` 安装的步骤见
+[跨平台打包与安装](docs/packaging.md)。
+
 ### 系统与依赖前置要求
 
-- **操作系统**：Linux (如 Ubuntu 20.04/22.04/24.04, RHEL/Rocky 8/9), macOS
+- **原生安装包目标**：Ubuntu 24.04、macOS 15、Windows Server 2022；CPU 架构见上方构建矩阵
 - **PostgreSQL**：13, 14, 15, 16, 17, 18（推荐并默认启用 17）
 - **PostGIS**：3.0 及以上版本
 - **编译工具链**：
-  - Rust 1.75+（通过 rustup 安装）
+  - Rust stable（通过 rustup 安装，版本通道见 `rust-toolchain.toml`）
   - `cargo-pgrx` 0.18.0（`cargo install --locked cargo-pgrx --version 0.18.0`）
   - LLVM / Clang（pgrx 编译依赖）及对应 PG 的开发头文件（`libpq-dev`, `postgresql-server-dev-17` 等）
+  - Windows 原生编译使用 MSVC 工具链，安装包脚本使用 PowerShell 7+
 
 ### 方式一：开发调试模式（一键启动沙箱）
 

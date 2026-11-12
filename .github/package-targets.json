@@ -1,0 +1,10 @@
+{
+  "postgres": [13, 14, 15, 16, 17, 18],
+  "platforms": [
+    {"platform": "ubuntu-24.04", "arch": "x86_64", "runner": "ubuntu-24.04"},
+    {"platform": "ubuntu-24.04", "arch": "aarch64", "runner": "ubuntu-24.04-arm"},
+    {"platform": "macos-15", "arch": "x86_64", "runner": "macos-15-intel"},
+    {"platform": "macos-15", "arch": "aarch64", "runner": "macos-15"},
+    {"platform": "windows-2022", "arch": "x86_64", "runner": "windows-2022"}
+  ]
+}

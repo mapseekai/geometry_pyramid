@@ -1,4 +1,8 @@
 /target
+/dist
+/package
+/legacy-package
+/upgrade-baseline
 **/*.rs.bk
 *.iml
 .idea/

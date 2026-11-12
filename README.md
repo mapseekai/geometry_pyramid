@@ -140,15 +140,23 @@ DROP TABLE gp_quickstart;
 
 ## 🛠️ Installation & Building
 
+The release workflow builds **30 native packages**: PostgreSQL **13–18** on
+Ubuntu 24.04 (x86_64 and ARM64), macOS 15 (Intel and Apple Silicon), and Windows
+Server 2022 (x86_64). Each job validates the packaged installer, a fresh database,
+and an upgrade from 0.1.0 before its artifact can be published. See the
+[cross-platform packaging and installation guide](docs/packaging.md) for the
+matrix, manual workflow filters, package names, and `pg_config`-based installers.
+
 ### Prerequisites
 
-- **OS**: Linux (Ubuntu 20.04+, RHEL/Rocky 8+), macOS
+- **Native package targets**: Ubuntu 24.04, macOS 15, Windows Server 2022; see the platform/architecture matrix above
 - **PostgreSQL**: 13, 14, 15, 16, 17, 18 (PostgreSQL 17 is the default)
 - **PostGIS**: 3.0 or later
 - **Toolchain**:
-  - Rust 1.75+ (installed via rustup)
+  - Rust stable (installed via rustup; see `rust-toolchain.toml`)
   - `cargo-pgrx` 0.18.0 (`cargo install --locked cargo-pgrx --version 0.18.0`)
   - LLVM / Clang and PostgreSQL development headers (`postgresql-server-dev-17`, `libpq-dev`)
+  - Native Windows builds also use the MSVC toolchain; Windows bundle installation uses PowerShell 7+
 
 ### Method 1: Development Sandbox Mode
 
