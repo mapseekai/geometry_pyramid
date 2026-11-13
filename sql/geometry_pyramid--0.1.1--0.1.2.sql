@@ -1,0 +1,3 @@
+-- 0.1.2 changes packaging and release verification only. The SQL API, catalog
+-- layout and unversioned module_pathname are unchanged from 0.1.1.
+-- PostgreSQL advances pg_extension.extversion after executing this script.

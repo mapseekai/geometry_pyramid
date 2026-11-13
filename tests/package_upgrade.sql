@@ -1,7 +1,11 @@
 -- Run through package_smoke.sh in its disposable cluster.
+\if :{?baseline_version}
+\else
+\set baseline_version 0.1.0
+\endif
 \if :seed
 CREATE EXTENSION postgis;
-CREATE EXTENSION geometry_pyramid VERSION '0.1.0';
+CREATE EXTENSION geometry_pyramid VERSION :'baseline_version';
 CREATE SCHEMA gp_upgrade_source;
 CREATE SCHEMA gp_upgrade_tiles;
 CREATE ROLE gp_upgrade_reader NOLOGIN;
@@ -19,19 +23,27 @@ CREATE TABLE gp_upgrade_tiles.expected AS
            'gp_upgrade_tiles._gp_tiles_gp_upgrade'::regclass::oid AS storage_oid,
            z,x,y,ST_Tile('gp_upgrade',z,x,y) AS mvt
     FROM gp_upgrade_tiles._gp_tiles_gp_upgrade;
+SELECT geometry_pyramid_version() = :'baseline_version' AS baseline_version_matches \gset
+\if :baseline_version_matches
+\else
+\echo 'The loaded library does not match the historical baseline'
+\quit 1
+\endif
 DO $$ BEGIN
-    IF geometry_pyramid_version() <> '0.1.0' OR
-       (SELECT count(*) FROM gp_upgrade_tiles.expected WHERE octet_length(mvt)>0) <> 2 THEN
-        RAISE EXCEPTION 'expected two readable tiles built with the v0.1.0 package';
+    IF (SELECT count(*) FROM gp_upgrade_tiles.expected WHERE octet_length(mvt)>0) <> 2 THEN
+        RAISE EXCEPTION 'expected two readable tiles built with the historical package';
     END IF;
 END $$;
 \else
 BEGIN;
 ALTER EXTENSION geometry_pyramid UPDATE;
+SELECT :'baseline_version' = '0.1.0' AS needs_relation_binding \gset
+\if :needs_relation_binding
 UPDATE public.geometry_pyramid_catalog
 SET source_rel = 'gp_upgrade_source.points'::regclass,
     storage_rel = 'gp_upgrade_tiles._gp_tiles_gp_upgrade'::regclass
 WHERE pyramid_name = 'gp_upgrade';
+\endif
 DO $$ BEGIN
     IF geometry_pyramid_version() = '0.1.0' OR
        (SELECT extversion FROM pg_extension WHERE extname='geometry_pyramid')

@@ -85,6 +85,12 @@ jobs:
           ref: 846e1a420567d3cec8ae5b61d2f7bc5df14c3e41 # v0.1.0
           path: upgrade-baseline
           persist-credentials: false
+      - name: Check out the v0.1.1 upgrade baseline
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: e26681965bf3303d471cb1dbdb8ec11d80700bf3 # v0.1.1
+          path: upgrade-previous
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -204,3 +210,13 @@ jobs:
           else
             gh release create "${TAG}" --verify-tag --title "geometry_pyramid ${TAG}" --generate-notes "${assets[@]}" release-manifest.json SHA256SUMS
           fi
+      - name: Verify published release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          gh release download "${TAG}" --dir published
+          diff --recursive dist published
+          cd published
+          sha256sum --check SHA256SUMS

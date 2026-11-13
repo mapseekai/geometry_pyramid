@@ -11,6 +11,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,33 @@ def module(name, path):
 
 matrix = module("package_matrix", "scripts/ci/matrix.py")
 release = module("verify_release", "scripts/ci/verify-release.py")
+smoke = module("package_smoke", "tests/package_smoke.py")
+
+
+class UpgradeBaselineTests(unittest.TestCase):
+    def test_smoke_exercises_both_released_baselines(self):
+        arguments = ["package_smoke.py", "--archive", "candidate.tar.gz",
+                     "--legacy-staging", "legacy", "--previous-staging", "previous",
+                     "--pg-config", "pg_config"]
+        with patch.object(sys, "argv", arguments), patch.object(smoke, "smoke") as run:
+            smoke.main()
+        self.assertEqual([(call.args[1], call.args[2]) for call in run.call_args_list],
+                         [(Path("legacy"), "0.1.0"), (Path("previous"), "0.1.1")])
+
+    def test_all_released_versions_have_a_sql_upgrade_path(self):
+        version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+        edges = {}
+        for script in (ROOT / "sql").glob("geometry_pyramid--*--*.sql"):
+            _, before, after = script.stem.split("--")
+            edges.setdefault(before, set()).add(after)
+        for baseline in ("0.1.0", "0.1.1"):
+            pending, visited = [baseline], set()
+            while pending:
+                current = pending.pop()
+                if current not in visited:
+                    visited.add(current)
+                    pending.extend(edges.get(current, set()) - visited)
+            self.assertIn(version, visited, f"No upgrade from {baseline} to {version}")
 
 
 class MatrixTests(unittest.TestCase):

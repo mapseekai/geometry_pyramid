@@ -14,7 +14,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/PostgreSQL-13%20|%2014%20|%2015%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
-  <img src="https://img.shields.io/badge/PostGIS-3.0+-green.svg" alt="PostGIS Support" />
+  <img src="https://img.shields.io/badge/PostGIS-3.1+-green.svg" alt="PostGIS Support" />
   <img src="https://img.shields.io/badge/Rust-pgrx%200.18.0-orange.svg" alt="pgrx Version" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License" />
 </p>
@@ -34,7 +34,7 @@
   - [4. 按层级细节控制（LOD 与 buildRules）](#4-按层级细节控制lod-与-buildrules)
   - [5. 超大数据集构建性能调优](#5-超大数据集构建性能调优)
   - [6. 金字塔维护与生命周期管理](#6-金字塔维护与生命周期管理)
-  - [7. 数据库版本平滑升级（0.1.0 -> 0.1.1）](#7-数据库版本平滑升级010---011)
+  - [7. 数据库版本升级](#7-数据库版本升级)
 - [⚙️ 配置参数完全参考](#️-配置参数完全参考)
 - [🖥️ 本地可视化与端到端验证](#️-本地可视化与端到端验证)
 - [❓ 常见问题与排障指南](#-常见问题与排障指南)
@@ -150,7 +150,7 @@ DROP TABLE gp_quickstart;
 
 - **原生安装包目标**：Ubuntu 24.04、macOS 15、Windows Server 2022；CPU 架构见上方构建矩阵
 - **PostgreSQL**：13, 14, 15, 16, 17, 18（推荐并默认启用 17）
-- **PostGIS**：3.0 及以上版本
+- **PostGIS**：3.1 及以上版本，构建时启用 MVT/protobuf 支持
 - **编译工具链**：
   - Rust stable（通过 rustup 安装，版本通道见 `rust-toolchain.toml`）
   - `cargo-pgrx` 0.18.0（`cargo install --locked cargo-pgrx --version 0.18.0`）
@@ -190,7 +190,7 @@ sudo cp -r ./dist/* /
 在数据库中验证安装版本：
 ```sql
 CREATE EXTENSION geometry_pyramid;
-SELECT geometry_pyramid_version(); -- 返回 0.1.1
+SELECT geometry_pyramid_version(); -- 返回 0.1.2
 ```
 
 ---
@@ -384,15 +384,24 @@ SELECT ST_DropPyramid('osm_roads_pyr');
 
 ---
 
-### 7. 数据库版本平滑升级（0.1.0 -> 0.1.1）
+### 7. 数据库版本升级
 
-从 `0.1.0` 升级至 `0.1.1` 时，扩展增强了元数据中对源表与存储表的物理关系对象绑定（`regclass`），避免跨 schema 或 `search_path` 污染风险。请在维护窗口内按事务执行：
+先停止正在执行的扩展任务，安装匹配的 0.1.2 安装包并重新建立数据库连接，再分别升级各业务库。Windows 下替换已加载的 DLL 前需停止 PostgreSQL 服务。
+
+已有 **0.1.1** 数据库无需补写元数据或重建瓦片：
+
+```sql
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
+SELECT geometry_pyramid_version(); -- 返回 0.1.2
+```
+
+从 **0.1.0** 升级至 0.1.2 时，会依次执行 0.1.1 和 0.1.2 的升级脚本。0.1.1 增强了元数据中对源表与存储表的物理关系对象绑定（`regclass`），避免跨 schema 或 `search_path` 污染风险。请在维护窗口内按事务执行：
 
 ```sql
 BEGIN;
 
 -- 1. 更新扩展定义
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.1';
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
 
 -- 2. 补齐物理对象绑定（将 schema 与表名替换为实际值）
 UPDATE public.geometry_pyramid_catalog

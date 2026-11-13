@@ -1,6 +1,6 @@
 [package]
 name = "geometry_pyramid"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "PostgreSQL extension that builds vector tile pyramids over geometry tables, inspired by Alibaba GanosBase ganos_geometry_pyramid."

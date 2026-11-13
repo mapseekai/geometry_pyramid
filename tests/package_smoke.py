@@ -2,7 +2,7 @@
 """Verify a real release bundle in a disposable PostgreSQL installation.
 
 The selected PostgreSQL installation must be dedicated to this test: its extension
-files are replaced first by the v0.1.0 baseline and then by the candidate bundle.
+files are replaced first by each historical baseline and then by the candidate bundle.
 Database data is created in a separate temporary cluster and removed afterwards.
 """
 
@@ -83,7 +83,7 @@ def atomic_copy(source, destination):
         temporary.unlink(missing_ok=True)
 
 
-def install_legacy(staging, library_dir, extension_dir, suffix):
+def install_legacy(staging, library_dir, extension_dir, suffix, baseline_version):
     if os.name == "nt":
         source_library = staging / "lib"
         source_extensions = staging / "share/extension"
@@ -99,16 +99,11 @@ def install_legacy(staging, library_dir, extension_dir, suffix):
     for path in sorted(source_extensions.glob("geometry_pyramid*")):
         if path.is_file():
             atomic_copy(path, extension_dir / path.name)
-    if not (extension_dir / "geometry_pyramid--0.1.0.sql").is_file():
-        raise ValueError("The baseline package must contain the genuine 0.1.0 install SQL")
+    if not (extension_dir / f"geometry_pyramid--{baseline_version}.sql").is_file():
+        raise ValueError(f"The baseline package must contain the genuine {baseline_version} install SQL")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=True)
-    parser.add_argument("--legacy-staging", type=Path, required=True)
-    parser.add_argument("--pg-config", type=Path, required=True)
-    args = parser.parse_args()
+def smoke(args, baseline_staging, baseline_version):
     pg_config = args.pg_config.resolve()
     bindir = Path(pg_value(pg_config, "--bindir"))
     libdir = Path(pg_value(pg_config, "--pkglibdir"))
@@ -151,8 +146,9 @@ def main():
             command([executable("pg_ctl"), "-D", data, "-l", log, "-o", server_options, "-w", "start"], environment)
             started = True
             command([executable("createdb"), "gp_upgrade"], environment)
-            install_legacy(args.legacy_staging.resolve(), libdir, extdir, suffix)
-            psql = [executable("psql"), "-X", "-v", "ON_ERROR_STOP=1"]
+            install_legacy(baseline_staging.resolve(), libdir, extdir, suffix, baseline_version)
+            psql = [executable("psql"), "-X", "-v", "ON_ERROR_STOP=1",
+                    "-v", f"baseline_version={baseline_version}"]
             command([*psql, "-d", "gp_upgrade", "-v", "seed=true", "-f", TESTS / "package_upgrade.sql"], environment)
             # Every psql process has exited before replacing the native library.
             # Windows additionally locks mapped DLLs until backend exit; stop
@@ -180,7 +176,19 @@ def main():
         finally:
             if started or (data / "postmaster.pid").exists():
                 command([executable("pg_ctl"), "-D", data, "-m", "fast", "-w", "stop"], environment)
-    print(f"Packaged installation and v0.1.0 upgrade passed: {args.archive.name}")
+    print(f"Packaged installation and v{baseline_version} upgrade passed: {args.archive.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--legacy-staging", type=Path, required=True)
+    parser.add_argument("--previous-staging", type=Path)
+    parser.add_argument("--pg-config", type=Path, required=True)
+    args = parser.parse_args()
+    smoke(args, args.legacy_staging, "0.1.0")
+    if args.previous_staging:
+        smoke(args, args.previous_staging, "0.1.1")
 
 
 if __name__ == "__main__":
