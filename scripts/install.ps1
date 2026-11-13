@@ -36,6 +36,7 @@ foreach ($line in $checksums) {
 $manifest = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'manifest.json') | ConvertFrom-Json
 if ($manifest.format -ne 1 -or $manifest.extension -ne 'geometry_pyramid' -or $manifest.target.system -ne 'windows') { throw 'Unrecognized Windows bundle.' }
 if ($manifest.library -ne 'lib/geometry_pyramid.dll' -or $manifest.version -notmatch '^[A-Za-z0-9][A-Za-z0-9.+-]*$') { throw 'Invalid package metadata.' }
+if ([int]$manifest.postgresql.major -notin @(15, 16, 17, 18)) { throw "Unsupported PostgreSQL major: $($manifest.postgresql.major); this release supports 15 through 18." }
 foreach ($required in @('manifest.json', 'install.ps1', 'lib/geometry_pyramid.dll', 'extension/geometry_pyramid.control', "extension/geometry_pyramid--$($manifest.version).sql")) {
     if (-not $seen.ContainsKey($required)) { throw "Artifact missing from SHA256SUMS: $required" }
 }

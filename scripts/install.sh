@@ -69,6 +69,10 @@ while IFS='=' read -r key value; do
 done < "$bundle/package.metadata"
 [[ $format == 1 && $extension == geometry_pyramid ]] || die 'Unrecognized bundle format.'
 [[ $version =~ ^[A-Za-z0-9][A-Za-z0-9.+-]*$ && $postgres_major =~ ^[1-9][0-9]+$ ]] || die 'Invalid package version.'
+case "$postgres_major" in
+    15|16|17|18) ;;
+    *) die "Unsupported PostgreSQL major: $postgres_major; this release supports 15 through 18." ;;
+esac
 [[ $platform =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die 'Invalid platform label.'
 [[ $architecture == x86_64 || $architecture == aarch64 ]] || die 'Invalid package architecture.'
 

@@ -1,0 +1,3 @@
+-- 0.1.3 limits supported PostgreSQL builds to majors 15 through 18.
+-- The SQL API, catalog layout and module pathname are unchanged from 0.1.2.
+-- PostgreSQL advances pg_extension.extversion after this no-op migration.

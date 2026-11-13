@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/PostgreSQL-13%20|%2014%20|%2015%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
+  <img src="https://img.shields.io/badge/PostgreSQL-15%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
   <img src="https://img.shields.io/badge/PostGIS-3.1+-green.svg" alt="PostGIS Support" />
   <img src="https://img.shields.io/badge/Rust-pgrx%200.18.0-orange.svg" alt="pgrx Version" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License" />
@@ -140,16 +140,18 @@ DROP TABLE gp_quickstart;
 
 ## 🛠️ 安装与构建
 
-发布工作流为 PostgreSQL **13–18** 提供 **30 个原生构建组合**：Ubuntu 24.04
+发布工作流为 PostgreSQL **15–18** 提供 **20 个原生构建组合**：Ubuntu 24.04
 （x86_64 / ARM64）、macOS 15（Intel / Apple Silicon）和 Windows Server 2022
-（x86_64）。每个作业验证安装包、首次启用和从 0.1.0 升级，再汇总发布产物。
+（x86_64）。每个作业验证安装包、首次启用以及从 0.1.0、0.1.2 升级，再汇总发布产物。
 构建矩阵、手动筛选、包名和通过目标 `pg_config` 安装的步骤见
 [跨平台打包与安装](docs/packaging.md)。
+
+从 **0.1.3** 起不再支持 PostgreSQL 13、14，也不再为它们生成新包。[v0.1.2 原有资产](https://github.com/mapseekai/geometry_pyramid/releases/tag/v0.1.2)保持不变，仅作为历史版本保留，不代表当前支持。旧 PostgreSQL 服务器需先升级到 15–18，再安装 0.1.3。
 
 ### 系统与依赖前置要求
 
 - **原生安装包目标**：Ubuntu 24.04、macOS 15、Windows Server 2022；CPU 架构见上方构建矩阵
-- **PostgreSQL**：13, 14, 15, 16, 17, 18（推荐并默认启用 17）
+- **PostgreSQL**：15, 16, 17, 18（推荐并默认启用 17）
 - **PostGIS**：3.1 及以上版本，构建时启用 MVT/protobuf 支持
 - **编译工具链**：
   - Rust stable（通过 rustup 安装，版本通道见 `rust-toolchain.toml`）
@@ -190,7 +192,7 @@ sudo cp -r ./dist/* /
 在数据库中验证安装版本：
 ```sql
 CREATE EXTENSION geometry_pyramid;
-SELECT geometry_pyramid_version(); -- 返回 0.1.2
+SELECT geometry_pyramid_version(); -- 返回 0.1.3
 ```
 
 ---
@@ -386,22 +388,22 @@ SELECT ST_DropPyramid('osm_roads_pyr');
 
 ### 7. 数据库版本升级
 
-先停止正在执行的扩展任务，安装匹配的 0.1.2 安装包并重新建立数据库连接，再分别升级各业务库。Windows 下替换已加载的 DLL 前需停止 PostgreSQL 服务。
+先停止正在执行的扩展任务，安装匹配的 0.1.3 安装包并重新建立数据库连接，再分别升级各业务库。Windows 下替换已加载的 DLL 前需停止 PostgreSQL 服务。
 
-已有 **0.1.1** 数据库无需补写元数据或重建瓦片：
+在 PostgreSQL 15–18 上，已有 **0.1.1 或 0.1.2** 数据库无需补写元数据或重建瓦片：
 
 ```sql
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
-SELECT geometry_pyramid_version(); -- 返回 0.1.2
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.3';
+SELECT geometry_pyramid_version(); -- 返回 0.1.3
 ```
 
-从 **0.1.0** 升级至 0.1.2 时，会依次执行 0.1.1 和 0.1.2 的升级脚本。0.1.1 增强了元数据中对源表与存储表的物理关系对象绑定（`regclass`），避免跨 schema 或 `search_path` 污染风险。请在维护窗口内按事务执行：
+从 **0.1.0** 升级至 0.1.3 时，会依次执行 0.1.1、0.1.2、0.1.3 的升级脚本。0.1.1 增强了元数据中对源表与存储表的物理关系对象绑定（`regclass`），避免跨 schema 或 `search_path` 污染风险。请在维护窗口内按事务执行：
 
 ```sql
 BEGIN;
 
 -- 1. 更新扩展定义
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.3';
 
 -- 2. 补齐物理对象绑定（将 schema 与表名替换为实际值）
 UPDATE public.geometry_pyramid_catalog

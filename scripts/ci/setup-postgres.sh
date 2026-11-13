@@ -4,7 +4,7 @@ set -euo pipefail
 
 pg_major=${GP_PG_MAJOR:?Set GP_PG_MAJOR to a PostgreSQL major version}
 case "$pg_major" in
-    13|14|15|16|17|18) ;;
+    15|16|17|18) ;;
     *) echo "Unsupported PostgreSQL major version: $pg_major" >&2; exit 2 ;;
 esac
 
@@ -64,7 +64,7 @@ setup_linux() {
 
 setup_macos() {
     # Homebrew's postgis formula targets selected PostgreSQL majors. Build the
-    # same PostGIS release against pgrx's selected PG13-PG18 installation instead.
+    # same PostGIS release against pgrx's selected PG15-PG18 installation instead.
     local formula prefix pkg_paths= include_flags= library_flags=
     local pg_root postgis_work source_archive
     local postgis_version=3.6.4

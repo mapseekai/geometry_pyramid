@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,7 @@ class UpgradeBaselineTests(unittest.TestCase):
         with patch.object(sys, "argv", arguments), patch.object(smoke, "smoke") as run:
             smoke.main()
         self.assertEqual([(call.args[1], call.args[2]) for call in run.call_args_list],
-                         [(Path("legacy"), "0.1.0"), (Path("previous"), "0.1.1")])
+                         [(Path("legacy"), "0.1.0"), (Path("previous"), "0.1.2")])
 
     def test_all_released_versions_have_a_sql_upgrade_path(self):
         version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
@@ -45,7 +46,7 @@ class UpgradeBaselineTests(unittest.TestCase):
         for script in (ROOT / "sql").glob("geometry_pyramid--*--*.sql"):
             _, before, after = script.stem.split("--")
             edges.setdefault(before, set()).add(after)
-        for baseline in ("0.1.0", "0.1.1"):
+        for baseline in ("0.1.0", "0.1.1", "0.1.2"):
             pending, visited = [baseline], set()
             while pending:
                 current = pending.pop()
@@ -62,13 +63,47 @@ class MatrixTests(unittest.TestCase):
 
     def test_every_declared_pg_has_every_native_platform(self):
         targets = matrix.select_matrix(self.config, self.manifest)["include"]
-        self.assertEqual(len(targets), 30)
-        for pg in range(13, 19):
+        self.assertEqual(len(targets), 20)
+        self.assertEqual({target["pg"] for target in targets}, {15, 16, 17, 18})
+        for pg in range(15, 19):
             self.assertEqual(len([target for target in targets if target["pg"] == pg]), 5)
 
     def test_single_target_dispatch(self):
-        targets = matrix.select_matrix(self.config, self.manifest, "windows-2022-x86_64", "13")["include"]
-        self.assertEqual(targets, [{"platform": "windows-2022", "arch": "x86_64", "runner": "windows-2022", "pg": 13}])
+        targets = matrix.select_matrix(self.config, self.manifest, "windows-2022-x86_64", "15")["include"]
+        self.assertEqual(targets, [{"platform": "windows-2022", "arch": "x86_64", "runner": "windows-2022", "pg": 15}])
+
+    def test_removed_versions_cannot_be_reintroduced_in_matrix_and_cargo(self):
+        for pg in (13, 14):
+            with self.subTest(pg=pg):
+                config, manifest = copy.deepcopy(self.config), copy.deepcopy(self.manifest)
+                config["postgres"] = sorted([pg, *config["postgres"]])
+                manifest["features"][f"pg{pg}"] = []
+                with self.assertRaisesRegex(ValueError, "Only PostgreSQL 15 through 18"):
+                    matrix.select_matrix(config, manifest)
+
+    def test_manual_build_rejects_unsupported_pg_before_setup(self):
+        for pg in (13, 14, 19):
+            with self.subTest(pg=pg):
+                environment = dict(os.environ, GP_PG_MAJOR=str(pg))
+                environment.pop("PG_CONFIG", None)
+                result = subprocess.run([sys.executable, ROOT / "scripts/ci/build.py"],
+                                        env=environment, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Unsupported PostgreSQL major: {pg}", result.stderr)
+
+    @unittest.skipUnless(sys.platform in ("linux", "darwin") and shutil.which("bash"),
+                         "native Unix and Bash are required for Unix setup")
+    def test_unix_setup_rejects_unsupported_pg_before_environment_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "must-not-be-created"
+            for pg in (13, 14, 19):
+                with self.subTest(pg=pg):
+                    environment = dict(os.environ, GP_PG_MAJOR=str(pg), RUNNER_TEMP=str(destination))
+                    result = subprocess.run(["bash", ROOT / "scripts/ci/setup-postgres.sh"],
+                                            env=environment, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"Unsupported PostgreSQL major version: {pg}", result.stderr)
+                    self.assertFalse(destination.exists())
 
     def test_new_cargo_pg_feature_cannot_silently_miss_release(self):
         self.manifest["features"]["pg19"] = []
@@ -76,7 +111,7 @@ class MatrixTests(unittest.TestCase):
             matrix.select_matrix(self.config, self.manifest)
 
     def test_unknown_filters_and_duplicate_platforms_fail(self):
-        for platform, postgres in [("windows-2022-arm64", "all"), ("all", "19")]:
+        for platform, postgres in [("windows-2022-arm64", "all"), ("all", "13"), ("all", "14"), ("all", "19")]:
             with self.assertRaises(ValueError):
                 matrix.select_matrix(self.config, self.manifest, platform, postgres)
         self.config["platforms"].append(copy.deepcopy(self.config["platforms"][0]))
@@ -87,11 +122,11 @@ class MatrixTests(unittest.TestCase):
         version = self.manifest["package"]["version"]
         environment = dict(os.environ, GITHUB_EVENT_NAME="push", GITHUB_REF_TYPE="tag",
                            GITHUB_REF_NAME=f"v{version}", GP_PLATFORM_FILTER="windows-2022-x86_64",
-                           GP_POSTGRES_FILTER="13")
+                           GP_POSTGRES_FILTER="15")
         environment.pop("GITHUB_OUTPUT", None)
         result = subprocess.run([sys.executable, ROOT / "scripts/ci/matrix.py"],
                                 env=environment, check=True, capture_output=True, text=True)
-        self.assertEqual(json.loads(result.stdout)["count"], "30")
+        self.assertEqual(json.loads(result.stdout)["count"], "20")
         environment["GITHUB_REF_NAME"] = "v999.0.0"
         result = subprocess.run([sys.executable, ROOT / "scripts/ci/matrix.py"],
                                 env=environment, capture_output=True, text=True)
@@ -128,6 +163,15 @@ class ReleaseVerificationTests(unittest.TestCase):
         self.matrix["include"].append({**self.target, "pg": 18})
         with self.assertRaisesRegex(ValueError, "missing="):
             release.verify(self.directory, self.matrix, "0.1.1")
+
+    def test_unsupported_pg_target_cannot_be_published(self):
+        for pg in (13, 14, 19):
+            with self.subTest(pg=pg):
+                self.matrix["include"][0] = {**self.target, "pg": pg}
+                with self.assertRaisesRegex(ValueError, "PostgreSQL 15 through 18"):
+                    release.verify(self.directory, self.matrix, "0.1.1")
+                self.assertFalse((self.directory / "release-manifest.json").exists())
+                self.assertFalse((self.directory / "SHA256SUMS").exists())
 
     def test_corrupted_archive_is_release_failure(self):
         path = self.directory / release.archive_name("0.1.1", self.target)

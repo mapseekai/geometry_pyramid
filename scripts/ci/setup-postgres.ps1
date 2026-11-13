@@ -3,7 +3,7 @@
 Prepare a runner-owned EDB PostgreSQL installation and the matching PostGIS
 bundle for a Windows release job. cargo-pgrx must already be installed.
 
-Inputs: GP_PG_MAJOR (13..18), RUNNER_TEMP; GITHUB_ENV/GITHUB_PATH are optional
+Inputs: GP_PG_MAJOR (15..18), RUNNER_TEMP; GITHUB_ENV/GITHUB_PATH are optional
 when running this script interactively. Upstream package inventory:
 https://postgis.net/documentation/getting_started/install_windows/released_versions/
 https://download.osgeo.org/postgis/windows/
@@ -40,8 +40,8 @@ if (-not $IsWindows) {
 if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'X64') {
     throw 'The EDB and PostGIS bundles used by this script target Windows x64.'
 }
-if ($env:GP_PG_MAJOR -notmatch '^(13|14|15|16|17|18)$') {
-    throw 'GP_PG_MAJOR must be a PostgreSQL major version from 13 through 18.'
+if ($env:GP_PG_MAJOR -notmatch '^(15|16|17|18)$') {
+    throw 'GP_PG_MAJOR must be a PostgreSQL major version from 15 through 18.'
 }
 if (-not $env:RUNNER_TEMP) {
     throw 'RUNNER_TEMP must point to a writable temporary directory.'
@@ -53,8 +53,6 @@ Export-CiEnvironment 'PG_PG_MAJOR' $pgMajor
 # Versions and vendor-published MD5 sums were checked on 2026-11-12. OSGeo
 # publishes MD5 sidecars for these bundles; SHA256 is also recorded below.
 $postgisBundles = @{
-    '13' = @{ Version = '3.6.2'; Md5 = '7c3396e34b616f2db76f02595d8ec6ad' }
-    '14' = @{ Version = '3.6.1'; Md5 = '2db3dd19c82c6174c7f485339e66684e' }
     '15' = @{ Version = '3.6.2'; Md5 = 'aa4810d34833d7831ec806dd70ba6c3d' }
     '16' = @{ Version = '3.6.2'; Md5 = '6730107131c29b7ff9a36702f736007b' }
     '17' = @{ Version = '3.6.2'; Md5 = 'faca768cc580c4ab2eef621be05b408e' }

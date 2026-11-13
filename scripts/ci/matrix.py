@@ -14,6 +14,8 @@ def select_matrix(config, manifest, platform_filter="all", postgres_filter="all"
     declared = sorted(int(name[2:]) for name in manifest["features"] if re.fullmatch(r"pg\d+", name))
     if config["postgres"] != declared:
         raise ValueError(f"Packaging PostgreSQL versions {config['postgres']} differ from Cargo features {declared}")
+    if declared != [15, 16, 17, 18]:
+        raise ValueError("Only PostgreSQL 15 through 18 are supported by this release")
     platforms = config["platforms"]
     keys = [f"{item['platform']}-{item['arch']}" for item in platforms]
     if len(keys) != len(set(keys)):

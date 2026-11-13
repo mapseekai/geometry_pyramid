@@ -2,7 +2,13 @@
 
 All notable changes to `geometry_pyramid` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project targets pgrx 0.18
-/ PostgreSQL 13–18 / PostGIS 3.1+ with MVT support.
+/ PostgreSQL 15–18 / PostGIS 3.1+ with MVT support.
+
+## [0.1.3] - 2026-11-13
+
+- Support PostgreSQL 15–18 only. Remove PostgreSQL 13/14 Cargo features, manual CI selections and build targets; reject unsupported major versions in the packager, installers and release-set verifier.
+- Publish 20 native packages across the unchanged five OS/architecture targets. The existing v0.1.2 assets are retained unchanged as historical releases, not current PostgreSQL 13/14 support.
+- Keep the SQL API and catalog unchanged from 0.1.2 and add a no-op `0.1.2 → 0.1.3` upgrade. Verify genuine `0.1.0 → 0.1.3` and `0.1.2 → 0.1.3` upgrades on every supported target, including the complete historical migration chain.
 
 ## [0.1.2] - 2026-11-13
 
