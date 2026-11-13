@@ -6,29 +6,29 @@
 
 ## 构建矩阵
 
-矩阵由 [package-targets.json](../.github/package-targets.json) 管理，PostgreSQL 版本同时与 [Cargo.toml](../Cargo.toml) 的 `pgNN` feature 校验。完整运行包含 30 个独立作业。
+矩阵由 [package-targets.json](../.github/package-targets.json) 管理，PostgreSQL 版本同时与 [Cargo.toml](../Cargo.toml) 的 `pgNN` feature 校验。完整运行包含 20 个独立作业。
 
 | 构建系统 | CPU 架构 | PostgreSQL 主版本 | 安装包 |
 | --- | --- | --- | --- |
-| Ubuntu 24.04 | x86_64 | 13、14、15、16、17、18 | `.tar.gz` |
-| Ubuntu 24.04 | aarch64 / ARM64 | 13、14、15、16、17、18 | `.tar.gz` |
-| macOS 15 | x86_64 / Intel | 13、14、15、16、17、18 | `.tar.gz` |
-| macOS 15 | aarch64 / Apple Silicon | 13、14、15、16、17、18 | `.tar.gz` |
-| Windows Server 2022 | x86_64 | 13、14、15、16、17、18 | `.zip` |
+| Ubuntu 24.04 | x86_64 | 15、16、17、18 | `.tar.gz` |
+| Ubuntu 24.04 | aarch64 / ARM64 | 15、16、17、18 | `.tar.gz` |
+| macOS 15 | x86_64 / Intel | 15、16、17、18 | `.tar.gz` |
+| macOS 15 | aarch64 / Apple Silicon | 15、16、17、18 | `.tar.gz` |
+| Windows Server 2022 | x86_64 | 15、16、17、18 | `.zip` |
 
 系统名称表示实际构建和验证环境。选择安装包时，应匹配 PostgreSQL **服务器**的主版本、操作系统和 CPU 架构；同一个主版本的不同小版本也需要满足平台与运行库兼容条件。Linux 包记录构建产物所需的最低 glibc 版本，安装器会检查目标机器。其他 Linux 发行版应增加独立的原生构建与安装验证目标。
 
-截至 2026-11-13，PG13 和 PG14 已分别于 2025-11-13、2026-11-12 结束 PostgreSQL 官方维护。这两个版本的安装包仅用于旧环境兼容，不表示上游仍提供安全更新。新部署请选择仍受维护的 PG15–18；PG19 尚未纳入本项目依赖和验收矩阵。参见 [PostgreSQL 版本支持政策](https://www.postgresql.org/support/versioning/)。
+从 `0.1.3` 起仅支持 PG15–18：移除 PG13、PG14 的 Cargo feature、CI 手动选项和构建目标，新打包工具与安装器也会拒绝这些主版本。[v0.1.2 的 30 份历史安装包及校验文件](https://github.com/mapseekai/geometry_pyramid/releases/tag/v0.1.2)保持原样，但 PG13、PG14 不再属于当前支持范围。旧服务器需先按 PostgreSQL 自身的升级流程迁移到 15–18，不能将其他主版本的扩展库直接复制过去。PG19 尚未纳入本项目依赖和验收矩阵。
 
 PostGIS 至少需要 3.1，并且构建时启用 MVT/protobuf 支持。安装包不捆绑 PostgreSQL、PostGIS 或它们的运行库。
 
-Windows 包用于原生 Windows PostgreSQL。macOS 的 PG13–15 动态库名为 `geometry_pyramid.so`，PG16–18 为 `geometry_pyramid.dylib`；安装器按包内信息选择正确文件。
+Windows 包用于原生 Windows PostgreSQL。macOS 的 PG15 动态库名为 `geometry_pyramid.so`，PG16–18 为 `geometry_pyramid.dylib`；安装器按包内信息选择正确文件。
 
 ## 触发构建与获取产物
 
 在 GitHub 的 **Actions → Verify and release** 页面运行工作流：
 
-1. `platform=all`、`postgres=all`：构建全部 30 个组合。
+1. `platform=all`、`postgres=all`：构建全部 20 个组合。
 2. 指定一个平台或一个 PG 主版本：仅验证所选组合，适合调试单个平台。
 3. 每个成功作业提供独立的 `geometry-pyramid-pgN-<platform>-<arch>` Artifact。
 4. 所有选择的组合成功后，`geometry-pyramid-release-set` Artifact 汇总安装包、`release-manifest.json` 和总校验文件 `SHA256SUMS`。
@@ -42,7 +42,7 @@ geometry_pyramid-v<VERSION>-pg<MAJOR>-<PLATFORM>-<ARCH>.tar.gz
 geometry_pyramid-v<VERSION>-pg<MAJOR>-windows-2022-x86_64.zip
 ```
 
-每份包对应一个同名 `.sha256` 文件。`release-manifest.json` 记录全部产物的文件名、大小、SHA-256、构建环境、PG 主版本和源代码提交。汇总步骤同时检查是否缺包、包名与包内元数据是否一致、全部产物是否来自同一个提交。
+完整发布包含 20 份安装包、20 份对应的 `.sha256` 文件，以及 `release-manifest.json`、`SHA256SUMS`，共 42 个资产。每份包对应一个同名 `.sha256` 文件。`release-manifest.json` 记录全部产物的文件名、大小、SHA-256、构建环境、PG 主版本和源代码提交。汇总步骤同时检查是否缺包、包名与包内元数据是否一致、全部产物是否来自同一个提交。
 
 ## Linux 与 macOS 安装
 
@@ -95,10 +95,10 @@ SELECT geometry_pyramid_version();
 
 已有 `0.1.0` 数据库升级时，按照 [README 中的升级步骤](../README.zh-CN.md) 在同一个事务中执行 `ALTER EXTENSION` 并绑定原有源表与瓦片表；安装新文件本身不会更新数据库内的扩展版本。
 
-已有 `0.1.1` 数据库无需重新绑定或重建瓦片。停止正在执行的扩展任务，安装 `0.1.2` 文件并重新建立数据库连接后执行：
+在 PG15–18 上，已有 `0.1.1`、`0.1.2` 数据库无需重新绑定或重建瓦片。停止正在执行的扩展任务，安装 `0.1.3` 文件并重新建立数据库连接后执行：
 
 ```sql
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.3';
 SELECT geometry_pyramid_version();
 ```
 
@@ -132,9 +132,9 @@ Windows 使用同样的 `cargo pgrx package` 与 Python 打包命令，将 `pg_c
 
 1. 准备匹配的 PostgreSQL 和可生成 MVT 的 PostGIS。
 2. 运行项目 Rust/PostGIS 回归测试。
-3. 构建候选版本与固定提交的真实 `v0.1.0`、`v0.1.1` 基线安装文件。
+3. 构建候选版本与固定提交的真实 `v0.1.0`、`v0.1.2` 基线安装文件。
 4. 生成最终安装压缩包，通过包内安装器完成安装。
-5. 在相互独立的临时集群验证 `0.1.0` 和 `0.1.1` 升级、原有瓦片与授权保留；`0.1.1` 升级不补写关系绑定。
+5. 在相互独立的临时集群验证 `0.1.0` 和 `0.1.2` 升级、原有瓦片与授权保留；`0.1.2` 升级不补写关系绑定。
 6. 在空数据库验证首次启用和版本一致性，运行跨会话权限、事务与瓦片检查。
 7. 所有目标通过后汇总产物并校验完整性，再进入标签发布步骤；发布后重新下载，验证实际发布文件与验收产物相同。
 

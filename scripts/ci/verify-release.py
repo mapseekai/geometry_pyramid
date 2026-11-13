@@ -34,6 +34,8 @@ def verify(directory, matrix, version, expected_commit=None):
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version):
         raise ValueError("Invalid release version")
     targets = matrix["include"]
+    if any(target["pg"] not in range(15, 19) for target in targets):
+        raise ValueError("Release targets must use PostgreSQL 15 through 18")
     expected = {archive_name(version, target): target for target in targets}
     if not expected or len(expected) != len(targets):
         raise ValueError("Empty or duplicate release matrix")

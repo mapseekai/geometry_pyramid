@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/PostgreSQL-13%20|%2014%20|%2015%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
+  <img src="https://img.shields.io/badge/PostgreSQL-15%20|%2016%20|%2017%20|%2018-blue.svg" alt="PostgreSQL Versions" />
   <img src="https://img.shields.io/badge/PostGIS-3.1+-green.svg" alt="PostGIS Support" />
   <img src="https://img.shields.io/badge/Rust-pgrx%200.18.0-orange.svg" alt="pgrx Version" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License" />
@@ -140,17 +140,19 @@ DROP TABLE gp_quickstart;
 
 ## 🛠️ Installation & Building
 
-The release workflow builds **30 native packages**: PostgreSQL **13–18** on
+The release workflow builds **20 native packages**: PostgreSQL **15–18** on
 Ubuntu 24.04 (x86_64 and ARM64), macOS 15 (Intel and Apple Silicon), and Windows
 Server 2022 (x86_64). Each job validates the packaged installer, a fresh database,
-and an upgrade from 0.1.0 before its artifact can be published. See the
+and upgrades from 0.1.0 and 0.1.2 before its artifact can be published. See the
 [cross-platform packaging and installation guide](docs/packaging.md) for the
 matrix, manual workflow filters, package names, and `pg_config`-based installers.
+
+Starting with **0.1.3**, PostgreSQL 13 and 14 are not supported and no new packages are built for them. The [v0.1.2 assets](https://github.com/mapseekai/geometry_pyramid/releases/tag/v0.1.2) remain available as historical releases, not current support. Upgrade an older PostgreSQL server to 15–18 before installing 0.1.3.
 
 ### Prerequisites
 
 - **Native package targets**: Ubuntu 24.04, macOS 15, Windows Server 2022; see the platform/architecture matrix above
-- **PostgreSQL**: 13, 14, 15, 16, 17, 18 (PostgreSQL 17 is the default)
+- **PostgreSQL**: 15, 16, 17, 18 (PostgreSQL 17 is the default)
 - **PostGIS**: 3.1 or later, built with MVT/protobuf support
 - **Toolchain**:
   - Rust stable (installed via rustup; see `rust-toolchain.toml`)
@@ -191,7 +193,7 @@ sudo cp -r ./dist/* /
 Verify in database:
 ```sql
 CREATE EXTENSION geometry_pyramid;
-SELECT geometry_pyramid_version(); -- Returns 0.1.2
+SELECT geometry_pyramid_version(); -- Returns 0.1.3
 ```
 
 ---
@@ -379,21 +381,21 @@ SELECT ST_DropPyramid('osm_roads_pyr');
 
 ### 7. Upgrading existing databases
 
-Stop active extension work, install the matching 0.1.2 package and reconnect database sessions before upgrading each database. On Windows, stop the PostgreSQL service before replacing a loaded DLL.
+Stop active extension work, install the matching 0.1.3 package and reconnect database sessions before upgrading each database. On Windows, stop the PostgreSQL service before replacing a loaded DLL.
 
-For an existing **0.1.1** database, no catalog migration or tile rebuild is needed:
+For an existing **0.1.1 or 0.1.2** database on PostgreSQL 15–18, no catalog migration or tile rebuild is needed:
 
 ```sql
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
-SELECT geometry_pyramid_version(); -- Returns 0.1.2
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.3';
+SELECT geometry_pyramid_version(); -- Returns 0.1.3
 ```
 
-For **0.1.0**, the upgrade to 0.1.2 includes the 0.1.1 migration, which binds source and storage tables to concrete database object references (`regclass`), preventing `search_path` hijacking. Execute this in an atomic transaction:
+For **0.1.0**, the upgrade to 0.1.3 includes the 0.1.1 migration, which binds source and storage tables to concrete database object references (`regclass`), preventing `search_path` hijacking. Execute this in an atomic transaction:
 
 ```sql
 BEGIN;
 
-ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.2';
+ALTER EXTENSION geometry_pyramid UPDATE TO '0.1.3';
 
 -- Update relation bindings (replace with actual schema and table names)
 UPDATE public.geometry_pyramid_catalog

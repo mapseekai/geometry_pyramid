@@ -1,5 +1,5 @@
 {
-  "postgres": [13, 14, 15, 16, 17, 18],
+  "postgres": [15, 16, 17, 18],
   "platforms": [
     {"platform": "ubuntu-24.04", "arch": "x86_64", "runner": "ubuntu-24.04"},
     {"platform": "ubuntu-24.04", "arch": "aarch64", "runner": "ubuntu-24.04-arm"},

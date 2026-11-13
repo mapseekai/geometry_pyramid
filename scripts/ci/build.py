@@ -16,7 +16,7 @@ def run(arguments, cwd=ROOT):
 
 def main():
     major = os.environ["GP_PG_MAJOR"]
-    if major not in {str(v) for v in range(13, 19)}:
+    if major not in {str(v) for v in range(15, 19)}:
         raise ValueError(f"Unsupported PostgreSQL major: {major}")
     pg_config = Path(os.environ["PG_CONFIG"]).resolve()
     os.environ["CARGO_TARGET_DIR"] = str(ROOT / "target")
@@ -41,7 +41,7 @@ def main():
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
             stream.write(f"### Verified `{archives[0].name}`\n\n")
-            stream.write("Rust/PostGIS regressions, packaged installation, real v0.1.0 and v0.1.1 upgrades, "
+            stream.write("Rust/PostGIS regressions, packaged installation, real v0.1.0 and v0.1.2 upgrades, "
                          "and separate-session permission checks passed.\n")
 
 

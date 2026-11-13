@@ -113,6 +113,8 @@ def smoke(args, baseline_staging, baseline_version):
     if not major_match:
         raise ValueError(f"Unrecognized PostgreSQL version: {version}")
     major = int(major_match.group(1))
+    if major not in range(15, 19):
+        raise ValueError(f"Unsupported PostgreSQL major: {major}; expected 15 through 18")
     windows = os.name == "nt"
     executable_suffix = ".exe" if windows else ""
     executable = lambda name: bindir / (name + executable_suffix)
@@ -188,7 +190,7 @@ def main():
     args = parser.parse_args()
     smoke(args, args.legacy_staging, "0.1.0")
     if args.previous_staging:
-        smoke(args, args.previous_staging, "0.1.1")
+        smoke(args, args.previous_staging, "0.1.2")
 
 
 if __name__ == "__main__":

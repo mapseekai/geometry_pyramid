@@ -100,8 +100,8 @@ def make_bundle(args: argparse.Namespace) -> Path:
     architecture = ARCHITECTURES[args.arch]
     postgres_version = pg_value(args.pg_config, "--version")
     match = re.match(r"PostgreSQL\s+(\d+)(?:\.|\b)", postgres_version)
-    if not match or int(match.group(1)) < 10:
-        raise ValueError(f"unexpected pg_config version: {postgres_version}")
+    if not match or int(match.group(1)) not in range(15, 19):
+        raise ValueError(f"only PostgreSQL 15 through 18 are supported: {postgres_version}")
     major = int(match.group(1))
     if system == "windows":
         libdir = args.staging / "lib"

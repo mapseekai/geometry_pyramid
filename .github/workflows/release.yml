@@ -16,10 +16,10 @@ on:
           - macos-15-aarch64
           - windows-2022-x86_64
       postgres:
-        description: PostgreSQL major version (all builds 13 through 18)
+        description: PostgreSQL major version (all builds 15 through 18)
         type: choice
         default: all
-        options: [all, '13', '14', '15', '16', '17', '18']
+        options: [all, '15', '16', '17', '18']
   push:
     tags:
       - 'v*'
@@ -85,15 +85,18 @@ jobs:
           ref: 846e1a420567d3cec8ae5b61d2f7bc5df14c3e41 # v0.1.0
           path: upgrade-baseline
           persist-credentials: false
-      - name: Check out the v0.1.1 upgrade baseline
+      - name: Check out the v0.1.2 upgrade baseline
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: e26681965bf3303d471cb1dbdb8ec11d80700bf3 # v0.1.1
+          ref: 3b789b57a2e0af4beb9346505fa1adc60365af37 # v0.1.2
           path: upgrade-previous
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
+      - name: Test native PowerShell packaging guards
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tests -p 'test_packaging_*.py' -v
       - name: Install Rust
         shell: bash
         run: |

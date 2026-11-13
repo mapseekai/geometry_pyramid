@@ -270,7 +270,7 @@ pub extern "C-unwind" fn gp_worker_main(_arg: pg_sys::Datum) {
         }
         // SET ROLE may select a NOLOGIN role. The coordinator already runs as
         // this role; allow its internal connection without granting extra SQL
-        // privileges. PG13-16 have no bypass flag: initialize with the original
+        // privileges. PG15-16 have no bypass flag: initialize with the original
         // authenticated role, then narrow the session before executing job SQL.
         #[cfg(any(feature = "pg17", feature = "pg18"))]
         let flags = pg_sys::BGWORKER_BYPASS_ROLELOGINCHECK;

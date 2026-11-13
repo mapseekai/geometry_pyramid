@@ -97,6 +97,14 @@ class BundleFixture(unittest.TestCase):
             source.extractall(extraction, filter="data")
         return extraction / archive.name.removesuffix(".tar.gz")
 
+    @staticmethod
+    def refresh_checksums(bundle: Path) -> None:
+        files = sorted(path for path in bundle.rglob("*")
+                       if path.is_file() and path.name != "SHA256SUMS")
+        (bundle / "SHA256SUMS").write_text("".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(bundle).as_posix()}\n"
+            for path in files), encoding="ascii")
+
 class BundleTests(BundleFixture):
     def test_archive_contains_verified_payload_without_builder_paths(self) -> None:
         args, _, values = self.prepare()
@@ -129,12 +137,20 @@ class BundleTests(BundleFixture):
             self.package(args, values)
 
     def test_macos_uses_the_postgresql_version_specific_library_suffix(self) -> None:
-        for major, suffix in [(13, ".so"), (15, ".so"), (16, ".dylib"), (18, ".dylib")]:
+        for major, suffix in [(15, ".so"), (16, ".dylib"), (17, ".dylib"), (18, ".dylib")]:
             with self.subTest(major=major):
                 args, _, values = self.prepare("macos", major, "aarch64")
                 bundle = self.extract(self.package(args, values))
                 self.assertTrue((bundle / "lib" / ("geometry_pyramid" + suffix)).is_file())
                 self.assertTrue((bundle / "install.sh").is_file())
+
+    def test_unsupported_postgres_cannot_be_packaged(self) -> None:
+        for major in (13, 14, 19):
+            with self.subTest(major=major):
+                args, _, values = self.prepare(major=major)
+                with self.assertRaisesRegex(ValueError, "only PostgreSQL 15 through 18"):
+                    self.package(args, values)
+                self.assertFalse(self.output.exists())
 
     def test_windows_zip_uses_pgrx_windows_staging_and_powershell(self) -> None:
         args, _, values = self.prepare("windows", 18)
@@ -235,6 +251,24 @@ class InstallerTests(BundleFixture):
         self.assertIn("requires PostgreSQL 17", result.stderr)
         self.assertFalse((target / "lib").exists())
 
+    def test_unsupported_bundle_major_is_rejected_before_writes(self) -> None:
+        bundle, pg_config, target, _ = self.installer_fixture()
+        original_metadata = (bundle / "package.metadata").read_text()
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        for major in (13, 14, 19):
+            with self.subTest(major=major):
+                (bundle / "package.metadata").write_text(
+                    original_metadata.replace("postgres_major=17\n", f"postgres_major={major}\n"))
+                manifest["postgresql"]["major"] = major
+                (bundle / "manifest.json").write_text(json.dumps(manifest))
+                self.refresh_checksums(bundle)
+                self.write_pg_config(pg_config, target, major)
+                result = self.install(bundle, pg_config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Unsupported PostgreSQL major: {major}", result.stderr)
+                self.assertFalse((target / "lib").exists())
+                self.assertFalse((target / "share").exists())
+
     def test_failed_second_rename_restores_existing_library(self) -> None:
         bundle, pg_config, target, _ = self.installer_fixture()
         library = target / "lib" / next((bundle / "lib").iterdir()).name
@@ -315,6 +349,42 @@ class InstallerTests(BundleFixture):
         self.assertFalse((target / "lib").exists())
         staged_target = destination_root / str(target).lstrip("/")
         self.assertTrue((staged_target / "share" / "extension" / "geometry_pyramid.control").is_file())
+
+
+@unittest.skipUnless(os.name == "nt" and shutil.which("pwsh")
+                     and platform.machine().lower() in ("amd64", "x86_64"),
+                     "native Windows x64 and PowerShell 7 are required")
+class WindowsVersionGuardTests(BundleFixture):
+    def test_installer_rejects_unsupported_major_before_target_access(self) -> None:
+        args, _, values = self.prepare("windows", 17)
+        bundle = self.extract(self.package(args, values))
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        pg_config = self.path / "pg_config.exe"
+        pg_config.write_bytes(b"must not be executed")
+        destination = self.path / "must not be created"
+        for major in (13, 14, 19):
+            with self.subTest(major=major):
+                manifest["postgresql"]["major"] = major
+                (bundle / "manifest.json").write_text(json.dumps(manifest))
+                self.refresh_checksums(bundle)
+                result = subprocess.run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"),
+                                         "-PgConfig", str(pg_config), "-DestDir", str(destination)],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Unsupported PostgreSQL major: {major}", result.stderr)
+                self.assertFalse(destination.exists())
+
+    def test_setup_rejects_unsupported_major_before_environment_changes(self) -> None:
+        destination = self.path / "runner must not be created"
+        for major in (13, 14, 19):
+            with self.subTest(major=major):
+                environment = dict(os.environ, GP_PG_MAJOR=str(major), RUNNER_TEMP=str(destination))
+                result = subprocess.run(["pwsh", "-NoProfile", "-File",
+                                         str(ROOT / "scripts/ci/setup-postgres.ps1")],
+                                        env=environment, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PostgreSQL major version from 15 through 18", result.stderr)
+                self.assertFalse(destination.exists())
 
 
 class PowerShellSyntaxTests(unittest.TestCase):
