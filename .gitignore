@@ -3,6 +3,8 @@
 /package
 /legacy-package
 /upgrade-baseline
+/upgrade-previous
+/previous-package
 **/*.rs.bk
 *.iml
 .idea/

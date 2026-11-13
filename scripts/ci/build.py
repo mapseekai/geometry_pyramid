@@ -26,6 +26,8 @@ def main():
          "--out-dir", ROOT / "package"])
     run(["cargo", "pgrx", "package", "--pg-config", pg_config, *feature_args,
          "--out-dir", ROOT / "legacy-package"], cwd=ROOT / "upgrade-baseline")
+    run(["cargo", "pgrx", "package", "--pg-config", pg_config, *feature_args,
+         "--out-dir", ROOT / "previous-package"], cwd=ROOT / "upgrade-previous")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     run([sys.executable, ROOT / "scripts/package.py", "--staging", ROOT / "package",
          "--pg-config", pg_config, "--platform", os.environ["GP_PLATFORM"],
@@ -34,11 +36,12 @@ def main():
     if len(archives) != 1:
         raise ValueError(f"Expected exactly one package archive, found {len(archives)}")
     run([sys.executable, ROOT / "tests/package_smoke.py", "--archive", archives[0],
-         "--legacy-staging", ROOT / "legacy-package", "--pg-config", pg_config])
+         "--legacy-staging", ROOT / "legacy-package",
+         "--previous-staging", ROOT / "previous-package", "--pg-config", pg_config])
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
             stream.write(f"### Verified `{archives[0].name}`\n\n")
-            stream.write("Rust/PostGIS regressions, packaged installation, real v0.1.0 upgrade, "
+            stream.write("Rust/PostGIS regressions, packaged installation, real v0.1.0 and v0.1.1 upgrades, "
                          "and separate-session permission checks passed.\n")
 
 

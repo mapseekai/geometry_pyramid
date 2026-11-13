@@ -2,7 +2,14 @@
 
 All notable changes to `geometry_pyramid` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project targets pgrx 0.18
-/ PostgreSQL 17 / PostGIS 3.6.
+/ PostgreSQL 13–18 / PostGIS 3.1+ with MVT support.
+
+## [0.1.2] - 2026-11-13
+
+- Publish 30 native PostgreSQL 13–18 packages through GitHub Actions: Ubuntu 24.04 x86_64/ARM64, macOS 15 Intel/Apple Silicon, and Windows Server 2022 x86_64. PostgreSQL 13 and 14 packages are legacy compatibility builds; those server versions are end-of-life upstream.
+- Include platform-aware installers, per-file and archive SHA-256 checksums, and a complete release manifest. Re-download published assets and verify they match the tested release set byte-for-byte.
+- Test every final archive with fresh installation, real `0.1.0 → 0.1.2` and `0.1.1 → 0.1.2` upgrades, tile/grant preservation, and separate-session regression checks.
+- Keep the SQL API and catalog unchanged from 0.1.1, with a no-op upgrade script for existing 0.1.1 databases. Correct the documented PostGIS minimum to 3.1 because tile buffering uses `ST_TileEnvelope`'s `margin` parameter.
 
 ## [0.1.1] - 2026-11-09
 
